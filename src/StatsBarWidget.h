@@ -8,7 +8,7 @@
 
 #include <systemstats/SensorInfo.h>
 
-class QLabel;
+class ClockPillWidget;
 class QNetworkAccessManager;
 class QNetworkReply;
 class QPaintEvent;
@@ -22,10 +22,11 @@ class DBusInterface;
 /**
  * Visual single-row telemetry bar (`40px`) mounted directly above the terminal tabs.
  *
- * Renders Union/Solar-Forge rounded telemetry cards with 1Hz scrolling sparklines,
- * progress gauges, thermal/load color thresholds, private & public IPv4 readout,
- * glowing VPN status badge, click-to-copy IPs, and a 1-second local clock fed by
- * KDE `org.kde.ksystemstats1` + QNetworkInterface + async public IPv4 lookup.
+ * Renders full-width Union/Solar-Forge rounded telemetry cards across all 6 bar items
+ * (`CPU`, `RAM`, `RTX`, `NET`, `VPN`, `ClockPill`) with equal `±Δpx` growth/shrinkage,
+ * 1Hz scrolling sparklines, progress gauges, thermal/load color thresholds, private &
+ * public IPv4 readout, glowing VPN status badge, click-to-copy IPs, and a 1-second
+ * local clock fed by KDE `org.kde.ksystemstats1` + QNetworkInterface + async public IPv4 lookup.
  */
 class StatsBarWidget final : public QWidget {
     Q_OBJECT
@@ -81,9 +82,7 @@ private:
     StatsCardWidget *m_gpuCard = nullptr;
     StatsCardWidget *m_netCard = nullptr;
     StatsCardWidget *m_vpnCard = nullptr;
-    QWidget *m_clockPill = nullptr;
-    QLabel *m_dateLabel = nullptr;
-    QLabel *m_timeLabel = nullptr;
+    ClockPillWidget *m_clockPill = nullptr;
     QTimer *m_clockTimer = nullptr;
 
     QNetworkAccessManager *m_netAccess = nullptr;
