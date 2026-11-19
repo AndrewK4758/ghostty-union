@@ -15,6 +15,7 @@
 #include <ghostty/vt.h>
 
 class QClipboard;
+class QEvent;
 class QShowEvent;
 class QSocketNotifier;
 
@@ -40,6 +41,7 @@ public:
     void feedVtBytes(const QByteArray &bytes);
     QSize cellSize() const { return QSize(m_cellWidth, m_cellHeight); }
     static constexpr QPoint viewportOffset() { return QPoint(kPadX, kPadY); }
+    GhosttyTerminalScrollbar scrollbarState() const { return m_scrollbar; }
 
     void copySelection();
     void pasteClipboard(bool selectionOnly = false);
@@ -63,6 +65,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
+    void leaveEvent(QEvent *event) override;
     void focusInEvent(QFocusEvent *event) override;
     void focusOutEvent(QFocusEvent *event) override;
     bool focusNextPrevChild(bool next) override;
@@ -102,6 +105,11 @@ private:
     void handleSelectionMouseRelease(QMouseEvent *event);
     void updatePrimaryClipboardFromSelection();
     bool cellPointAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const;
+    bool hasScrollbar() const;
+    bool isInScrollbarZone(const QPointF &pos) const;
+    bool computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const;
+    void scrollViewportToThumbTop(qreal desiredThumbTop);
+    void updateScrollbarHoverState(const QPointF &pos);
     void applyTerminalPalette();
 
     // libghostty-vt C callbacks
@@ -149,6 +157,9 @@ private:
     uint16_t m_rows = 24;
     static constexpr int kPadX = 6;
     static constexpr int kPadY = 4;
+    static constexpr int kPadRight = 12;
+    static constexpr int kScrollbarHitWidth = 14;
+    static constexpr int kScrollbarMarginY = 4;
 
     bool m_renderHeld = false;
     QTimer m_renderHoldTimer;
@@ -162,6 +173,9 @@ private:
     GhosttyRenderStateCursor m_cursor = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
     GhosttyRenderStateColors m_colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
     GhosttyTerminalScrollbar m_scrollbar{};
+    bool m_scrollbarHovered = false;
+    bool m_scrollbarDragging = false;
+    qreal m_scrollbarDragGrabOffset = 0.0;
 
     QString m_title = QStringLiteral("zsh");
     QString m_pwd;
