@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QPointer>
 #include <QStringList>
 #include <QVariant>
 #include <QWidget>
@@ -8,6 +9,8 @@
 #include <systemstats/SensorInfo.h>
 
 class QLabel;
+class QNetworkAccessManager;
+class QNetworkReply;
 class QPaintEvent;
 class QTimer;
 class StatsCardWidget;
@@ -20,8 +23,9 @@ class DBusInterface;
  * Visual single-row telemetry bar (`40px`) mounted directly above the terminal tabs.
  *
  * Renders Union/Solar-Forge rounded telemetry cards with 1Hz scrolling sparklines,
- * progress gauges, thermal/load color thresholds, glowing VPN status badge, click-to-copy
- * IPs, and a 1-second local clock fed by KDE `org.kde.ksystemstats1` + QNetworkInterface.
+ * progress gauges, thermal/load color thresholds, private & public IPv4 readout,
+ * glowing VPN status badge, click-to-copy IPs, and a 1-second local clock fed by
+ * KDE `org.kde.ksystemstats1` + QNetworkInterface + async public IPv4 lookup.
  */
 class StatsBarWidget final : public QWidget {
     Q_OBJECT
@@ -39,6 +43,14 @@ public:
     /// Current number of recorded 1Hz sparkline history samples.
     int historySampleCount() const;
 
+    QString privateIp() const { return m_lastPrivateIp; }
+    QString publicIp() const { return m_lastPublicIp; }
+    void setPublicIpForTesting(const QString &ip);
+
+    static QString parsePublicIpv4Response(const QByteArray &body);
+    static QString queryPrimaryPrivateIpv4();
+    static bool isVirtualOrTunnelInterface(const QString &ifName);
+
 protected:
     void paintEvent(QPaintEvent *event) override;
 
@@ -46,10 +58,14 @@ private Q_SLOTS:
     void onNewSensorData(const KSysGuard::SensorDataList &updates);
     void refreshDisplay();
     void refreshVpnAndClock();
+    void refreshPublicIp();
 
 private:
     void buildUi();
     void pushHistorySample();
+    void requestPublicIpEndpoint(int endpointIndex);
+    void schedulePublicIpRefresh();
+    void updateNetToolTip();
     QString formatPercentValue(const QString &sensorId) const;
     QString formatTempValue(const QString &sensorId) const;
     QString formatRateCompact(const QString &sensorId) const;
@@ -70,6 +86,14 @@ private:
     QLabel *m_timeLabel = nullptr;
     QTimer *m_clockTimer = nullptr;
 
-    QString m_lastWlanIp;
+    QNetworkAccessManager *m_netAccess = nullptr;
+    QPointer<QNetworkReply> m_publicIpReply;
+    QTimer *m_publicIpTimer = nullptr;
+    QTimer *m_publicIpDebounceTimer = nullptr;
+
+    QString m_lastPrivateIp;
+    QString m_lastPublicIp;
     QString m_lastVpnIp;
+    QString m_prevPublicIpTriggerPrivate;
+    QString m_prevPublicIpTriggerVpn;
 };
