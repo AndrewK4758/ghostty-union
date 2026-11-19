@@ -1,0 +1,20 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Ghostty Union
+GenericName=Terminal Emulator
+Comment=Union-styled KDE terminal powered by libghostty-vt with mounted system monitor bar
+TryExec=ghostty-union
+Exec=ghostty-union
+Icon=com.mitchellh.ghostty
+Categories=System;TerminalEmulator;Qt;KDE;
+Keywords=terminal;tty;pty;shell;ghostty;union;
+StartupNotify=true
+StartupWMClass=ghostty-union
+Terminal=false
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Icon=com.mitchellh.ghostty
+Exec=ghostty-union
