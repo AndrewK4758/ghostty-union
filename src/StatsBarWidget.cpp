@@ -14,8 +14,8 @@
 #include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QHostAddress>
-#include <QLabel>
 #include <QLinearGradient>
+#include <QMargins>
 #include <QMouseEvent>
 #include <QNetworkAccessManager>
 #include <QNetworkAddressEntry>
@@ -26,6 +26,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QSizePolicy>
 #include <QTimer>
 #include <QUrl>
 
@@ -34,12 +35,17 @@
 #include <deque>
 #include <functional>
 #include <iterator>
+#include <vector>
 
 namespace {
 
 constexpr size_t kMaxSamples = 28;
 constexpr int kBarHeightPx = 40;
 constexpr int kCardHeightPx = 32;
+constexpr int kMinItemWidthPx = 72;
+constexpr int kGaugeBaseSparkWidthPx = 46;
+constexpr int kNetBaseSparkWidthPx = 50;
+constexpr int kMinSparkWidthPx = 18;
 constexpr int kPublicIpPollMs = 300000;
 constexpr int kPublicIpDebounceMs = 1500;
 constexpr int kPublicIpTimeoutMs = 4000;
@@ -91,6 +97,221 @@ void pushBoundedSample(std::deque<double> &buf, double value) {
 } // namespace
 
 /**
+ * Horizontal row layout that distributes surplus or deficit width equally (`±Δpx`)
+ * across all visible items relative to their `sizeHint().width()`, clamping at
+ * each item's `minimumSize().width()` when shrinking unless the row is narrower
+ * than the combined floor.
+ */
+class EvenDeltaRowLayout final : public QHBoxLayout {
+public:
+    explicit EvenDeltaRowLayout(QWidget *parent = nullptr)
+        : QHBoxLayout(parent) {}
+
+    QSize minimumSize() const override {
+        int active = 0;
+        for (int i = 0; i < count(); ++i) {
+            if (const QLayoutItem *it = itemAt(i); it && !it->isEmpty()) {
+                ++active;
+            }
+        }
+        const QMargins m = contentsMargins();
+        const int gap = std::max(0, spacing());
+        const int minW = m.left() + m.right() + (active > 0 ? gap * (active - 1) + active * 24 : 0);
+        return QSize(minW, kBarHeightPx);
+    }
+
+    void setGeometry(const QRect &rect) override {
+        QLayout::setGeometry(rect);
+
+        std::vector<QLayoutItem *> items;
+        items.reserve(static_cast<size_t>(count()));
+        for (int i = 0; i < count(); ++i) {
+            QLayoutItem *it = itemAt(i);
+            if (it && !it->isEmpty()) {
+                items.push_back(it);
+            }
+        }
+        const int n = static_cast<int>(items.size());
+        if (n == 0) {
+            return;
+        }
+
+        const QMargins m = contentsMargins();
+        const int gap = std::max(0, spacing());
+        const int availW = std::max(0, rect.width() - m.left() - m.right() - gap * (n - 1));
+
+        std::vector<int> base(n, 0);
+        std::vector<int> rawFloor(n, 0);
+        int sumBase = 0;
+        int sumFloor = 0;
+        for (int i = 0; i < n; ++i) {
+            base[i] = std::max(0, items[i]->sizeHint().width());
+            rawFloor[i] = std::clamp(items[i]->minimumSize().width(), 0, base[i]);
+            sumBase += base[i];
+            sumFloor += rawFloor[i];
+        }
+
+        std::vector<int> w(n, 0);
+        if (availW < sumFloor) {
+            const int q = availW / n;
+            const int r = availW % n;
+            for (int i = 0; i < n; ++i) {
+                w[i] = q + (i < r ? 1 : 0);
+            }
+        } else {
+            w = base;
+            int diff = availW - sumBase;
+            if (diff > 0) {
+                const int q = diff / n;
+                int r = diff % n;
+                for (int i = 0; i < n; ++i) {
+                    w[i] += q + (r-- > 0 ? 1 : 0);
+                }
+            } else if (diff < 0) {
+                std::vector<bool> frozen(n, false);
+                int active = n;
+                while (diff < 0 && active > 0) {
+                    const int deficit = -diff;
+                    const int q = deficit / active;
+                    int r = deficit % active;
+                    bool anyClamped = false;
+                    int totalClampedCut = 0;
+                    std::vector<int> stepCut(n, 0);
+                    for (int i = 0; i < n; ++i) {
+                        if (frozen[i]) {
+                            continue;
+                        }
+                        const int cut = q + (r-- > 0 ? 1 : 0);
+                        stepCut[i] = cut;
+                        if (w[i] - cut <= rawFloor[i]) {
+                            const int actualCut = w[i] - rawFloor[i];
+                            w[i] = rawFloor[i];
+                            frozen[i] = true;
+                            --active;
+                            anyClamped = true;
+                            totalClampedCut += actualCut;
+                        }
+                    }
+                    if (anyClamped) {
+                        diff += totalClampedCut;
+                    } else {
+                        for (int i = 0; i < n; ++i) {
+                            if (!frozen[i]) {
+                                w[i] -= stepCut[i];
+                            }
+                        }
+                        diff = 0;
+                    }
+                }
+            }
+        }
+
+        int x = rect.left() + m.left();
+        const int contentTop = rect.top() + m.top();
+        const int contentH = std::max(0, rect.height() - m.top() - m.bottom());
+        for (int i = 0; i < n; ++i) {
+            const int itemH = std::min(contentH, items[i]->maximumSize().height());
+            const int y = contentTop + (contentH - itemH) / 2;
+            items[i]->setGeometry(QRect(x, y, w[i], itemH));
+            x += w[i] + gap;
+        }
+    }
+};
+
+/**
+ * Custom-painted rounded clock pill centering the local date and 1s clock inside a flexible width.
+ */
+class ClockPillWidget final : public QWidget {
+public:
+    ClockPillWidget(const QFont &dateFont, const QFont &timeFont, QWidget *parent = nullptr)
+        : QWidget(parent)
+        , m_dateFont(dateFont)
+        , m_timeFont(timeFont) {
+        setObjectName(QStringLiteral("ClockPill"));
+        setFixedHeight(kCardHeightPx);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setFocusPolicy(Qt::NoFocus);
+
+        const QFontMetrics fmDate(m_dateFont);
+        const QFontMetrics fmTime(m_timeFont);
+        m_preferredWidth = 10 + fmDate.horizontalAdvance(QStringLiteral("Wed Sep 30"))
+                           + 8 + fmTime.horizontalAdvance(QStringLiteral("23:59:59")) + 10;
+    }
+
+    void setDateTimeText(const QString &dateText, const QString &timeText) {
+        if (m_dateText == dateText && m_timeText == timeText) {
+            return;
+        }
+        m_dateText = dateText;
+        m_timeText = timeText;
+        update();
+    }
+
+    QSize sizeHint() const override {
+        return QSize(m_preferredWidth, kCardHeightPx);
+    }
+
+    QSize minimumSizeHint() const override {
+        return QSize(std::min(kMinItemWidthPx, m_preferredWidth), kCardHeightPx);
+    }
+
+protected:
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const QRectF cardRect = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+        p.setBrush(QColor(0, 0, 0, 65));
+        p.setPen(QPen(QColor(GhosttyUnionTheme::kDividerHex), 1.0));
+        p.drawRoundedRect(cardRect, 6.0, 6.0);
+
+        const int avail = std::max(0, width() - 20);
+        if (avail <= 0) {
+            return;
+        }
+
+        const QFontMetrics fmDate(m_dateFont);
+        const QFontMetrics fmTime(m_timeFont);
+        const int dateW = fmDate.horizontalAdvance(m_dateText);
+        const int timeW = fmTime.horizontalAdvance(m_timeText);
+
+        if (avail >= dateW + 8 + timeW) {
+            const int startX = 10 + (avail - (dateW + 8 + timeW)) / 2;
+            p.setFont(m_dateFont);
+            p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
+            p.drawText(QRect(startX, 0, dateW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_dateText);
+
+            p.setFont(m_timeFont);
+            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
+            p.drawText(QRect(startX + dateW + 8, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
+        } else if (avail > timeW + 20) {
+            const QString elidedDate = fmDate.elidedText(m_dateText, Qt::ElideRight, avail - timeW - 8);
+            const int edW = fmDate.horizontalAdvance(elidedDate);
+            const int startX = 10 + (avail - (edW + 8 + timeW)) / 2;
+            p.setFont(m_dateFont);
+            p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
+            p.drawText(QRect(startX, 0, edW, height()), Qt::AlignVCenter | Qt::AlignLeft, elidedDate);
+
+            p.setFont(m_timeFont);
+            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
+            p.drawText(QRect(startX + edW + 8, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
+        } else {
+            p.setFont(m_timeFont);
+            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
+            const QString elidedTime = fmTime.elidedText(m_timeText, Qt::ElideRight, avail);
+            p.drawText(QRect(10, 0, avail, height()), Qt::AlignCenter, elidedTime);
+        }
+    }
+
+private:
+    QFont m_dateFont;
+    QFont m_timeFont;
+    QString m_dateText;
+    QString m_timeText;
+    int m_preferredWidth = kMinItemWidthPx;
+};
+
+/**
  * Custom-painted rounded telemetry card supporting GaugeSpark, NetDualSpark, and VpnStatus modes.
  */
 class StatsCardWidget final : public QWidget {
@@ -111,6 +332,7 @@ public:
         , m_tagFont(tagFont) {
         m_compactFont.setPointSizeF(7.8);
         setFixedHeight(kCardHeightPx);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setMouseTracking(true);
         setFocusPolicy(Qt::NoFocus);
 
@@ -132,22 +354,26 @@ public:
         const QFontMetrics fmTag(m_tagFont);
         const int padLeft = (m_mode == Mode::VpnStatus) ? 24 : 9;
         const int tagW = m_tag.isEmpty() ? 0 : (fmTag.horizontalAdvance(m_tag) + 6);
-        const int valW = fmVal.horizontalAdvance(sampleValueText);
-        int sparkW = 0;
-        if (m_mode == Mode::GaugeSpark) {
-            sparkW = 46 + 8;
-        } else if (m_mode == Mode::NetDualSpark) {
-            sparkW = 50 + 8;
-        }
-        setFixedWidth(padLeft + tagW + valW + sparkW + 9);
+        m_sampleValWidth = fmVal.horizontalAdvance(sampleValueText);
+        const int sparkW = (m_mode == Mode::GaugeSpark) ? (kGaugeBaseSparkWidthPx + 8) : 0;
+        m_preferredWidth = padLeft + tagW + m_sampleValWidth + sparkW + 9;
+        updateGeometry();
     }
 
     void setNetWidthSample(const QString &ipSample, const QString &rateSample) {
         const QFontMetrics fmCompact(m_compactFont);
         m_ipColWidth = fmCompact.horizontalAdvance(ipSample);
-        const int rateColW = fmCompact.horizontalAdvance(rateSample);
-        const int sparkW = 50 + 8;
-        setFixedWidth(9 + m_ipColWidth + 10 + rateColW + sparkW + 9);
+        m_rateColWidth = fmCompact.horizontalAdvance(rateSample);
+        m_preferredWidth = 9 + m_ipColWidth + 10 + m_rateColWidth + 8 + kNetBaseSparkWidthPx + 9;
+        updateGeometry();
+    }
+
+    QSize sizeHint() const override {
+        return QSize(m_preferredWidth, kCardHeightPx);
+    }
+
+    QSize minimumSizeHint() const override {
+        return QSize(std::min(kMinItemWidthPx, m_preferredWidth), kCardHeightPx);
     }
 
     void setGaugeData(const QString &valueText, double percent, const QColor &accent) {
@@ -307,55 +533,135 @@ private:
     }
 
     void paintGaugeSpark(QPainter &p) {
-        const QRectF sparkBox(width() - 9 - 46, 5.0, 46.0, 18.0);
-        const int textRight = static_cast<int>(sparkBox.left()) - 6;
-
-        int x = 9;
+        const int leftPad = 9;
+        const int rightEdge = width() - 9;
         const int textTop = 3;
         const int textH = height() - 10;
 
-        p.setFont(m_tagFont);
         const QFontMetrics fmTag(m_tagFont);
+        const QFontMetrics fmVal(m_valueFont);
         const int tagW = fmTag.horizontalAdvance(m_tag);
-        p.setPen(m_accent);
-        p.drawText(QRect(x, textTop, tagW, textH), Qt::AlignVCenter | Qt::AlignLeft, m_tag);
-        x += tagW + 6;
+        const int actualValW = fmVal.horizontalAdvance(m_valueText);
 
-        p.setFont(m_valueFont);
-        p.setPen(palette().color(QPalette::WindowText));
-        p.drawText(QRect(x, textTop, std::max(10, textRight - x), textH),
-                   Qt::AlignVCenter | Qt::AlignLeft, m_valueText);
+        int sparkLeft = 0;
+        int sparkW = 0;
+        if (width() >= m_preferredWidth) {
+            sparkLeft = leftPad + tagW + 6 + std::max(m_sampleValWidth, actualValW) + 8;
+            sparkW = std::max(0, rightEdge - sparkLeft);
+        } else {
+            const int minSparkLeft = leftPad + tagW + 6 + actualValW + 6;
+            const int candidateSparkW = rightEdge - minSparkLeft;
+            if (candidateSparkW >= kMinSparkWidthPx) {
+                sparkW = std::min(kGaugeBaseSparkWidthPx, candidateSparkW);
+                sparkLeft = rightEdge - sparkW;
+            }
+        }
+        if (sparkW < kMinSparkWidthPx) {
+            sparkW = 0;
+        }
 
-        drawSparkSeries(p, sparkBox, m_primaryHistory, 100.0, m_accent, true);
+        const int textRight = (sparkW > 0) ? (sparkLeft - 6) : rightEdge;
+        int x = leftPad;
+
+        if (textRight > x) {
+            p.setFont(m_tagFont);
+            p.setPen(m_accent);
+            const int availTagW = std::max(0, textRight - x);
+            const QString tagText = (availTagW < tagW)
+                                        ? fmTag.elidedText(m_tag, Qt::ElideRight, availTagW)
+                                        : m_tag;
+            const int drawnTagW = std::min(tagW, availTagW);
+            p.drawText(QRect(x, textTop, drawnTagW, textH), Qt::AlignVCenter | Qt::AlignLeft, tagText);
+            x += drawnTagW + 6;
+        }
+
+        if (textRight > x) {
+            p.setFont(m_valueFont);
+            p.setPen(palette().color(QPalette::WindowText));
+            const int availValW = textRight - x;
+            const QString valText = fmVal.elidedText(m_valueText, Qt::ElideRight, availValW);
+            p.drawText(QRect(x, textTop, availValW, textH), Qt::AlignVCenter | Qt::AlignLeft, valText);
+        }
+
+        if (sparkW >= kMinSparkWidthPx) {
+            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 5.0, static_cast<qreal>(sparkW), 18.0);
+            drawSparkSeries(p, sparkBox, m_primaryHistory, 100.0, m_accent, true);
+        }
 
         // Bottom inset progress gauge
-        const QRectF trackRect(7.0, height() - 4.5, width() - 14.0, 2.5);
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(255, 255, 255, 24));
-        p.drawRoundedRect(trackRect, 1.25, 1.25);
+        const qreal trackW = std::max(0.0, static_cast<qreal>(width()) - 14.0);
+        if (trackW > 0.0) {
+            const QRectF trackRect(7.0, height() - 4.5, trackW, 2.5);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(255, 255, 255, 24));
+            p.drawRoundedRect(trackRect, 1.25, 1.25);
 
-        if (m_percent > 0.0) {
-            const qreal fillW = std::max(3.0, trackRect.width() * (m_percent / 100.0));
-            const QRectF fillRect(trackRect.left(), trackRect.top(),
-                                  std::min(trackRect.width(), fillW), trackRect.height());
-            p.setBrush(m_accent);
-            p.drawRoundedRect(fillRect, 1.25, 1.25);
+            if (m_percent > 0.0) {
+                const qreal fillW = std::max(3.0, trackRect.width() * (m_percent / 100.0));
+                const QRectF fillRect(trackRect.left(), trackRect.top(),
+                                      std::min(trackRect.width(), fillW), trackRect.height());
+                p.setBrush(m_accent);
+                p.drawRoundedRect(fillRect, 1.25, 1.25);
+            }
         }
     }
 
     void paintNetDualSpark(QPainter &p) {
-        const QRectF sparkBox(width() - 9 - 50, 6.0, 50.0, 20.0);
-        const int textRight = static_cast<int>(sparkBox.left()) - 8;
+        const int leftPad = 9;
+        const int rightEdge = width() - 9;
+
+        const QFontMetrics fm(m_compactFont);
+        const int actualIpW = std::max(
+            fm.horizontalAdvance(QStringLiteral("PRI ") + m_privateIpText),
+            fm.horizontalAdvance(QStringLiteral("PUB ") + m_publicIpText));
+        const int actualRateW = std::max(
+            fm.horizontalAdvance(m_downText),
+            fm.horizontalAdvance(m_upText));
+
+        const int steadyIpW = std::max(m_ipColWidth, actualIpW);
+        const int steadyRateW = std::max(m_rateColWidth, actualRateW);
+
+        int ipColW = steadyIpW;
+        int rateColW = steadyRateW;
+        int colGap = 10;
+        int sparkLeft = 0;
+        int sparkW = 0;
+
+        if (width() >= m_preferredWidth) {
+            sparkLeft = leftPad + ipColW + colGap + rateColW + 8;
+            sparkW = std::max(0, rightEdge - sparkLeft);
+        } else if (leftPad + steadyIpW + 10 + steadyRateW + 8 + kNetBaseSparkWidthPx <= rightEdge) {
+            sparkLeft = leftPad + steadyIpW + 10 + steadyRateW + 8;
+            sparkW = std::max(0, rightEdge - sparkLeft);
+        } else {
+            ipColW = actualIpW;
+            rateColW = actualRateW;
+            colGap = 8;
+            const int minSparkLeft = leftPad + ipColW + colGap + rateColW + 6;
+            const int candidateSparkW = rightEdge - minSparkLeft;
+            if (candidateSparkW >= kMinSparkWidthPx) {
+                sparkW = std::min(kNetBaseSparkWidthPx, candidateSparkW);
+                sparkLeft = rightEdge - sparkW;
+            }
+        }
+        if (sparkW < kMinSparkWidthPx) {
+            sparkW = 0;
+        }
+
+        const int textRight = (sparkW > 0) ? (sparkLeft - 6) : rightEdge;
 
         if (m_copiedFlash) {
+            const QFontMetrics fmVal(m_valueFont);
             p.setFont(m_valueFont);
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            p.drawText(QRect(9, 0, std::max(10, textRight - 9), height()),
-                       Qt::AlignVCenter | Qt::AlignLeft, m_copiedMessage);
+            const int availFlashW = std::max(0, textRight - leftPad);
+            const QString flashText = fmVal.elidedText(m_copiedMessage, Qt::ElideRight, availFlashW);
+            p.drawText(QRect(leftPad, 0, availFlashW, height()),
+                       Qt::AlignVCenter | Qt::AlignLeft, flashText);
         } else {
-            const int ipX = 9;
-            const int ipW = std::min(m_ipColWidth, std::max(0, textRight - ipX));
-            const int rateX = ipX + m_ipColWidth + 10;
+            const int ipX = leftPad;
+            const int ipW = std::min(ipColW, std::max(0, textRight - ipX));
+            const int rateX = ipX + ipW + colGap;
             const int rateW = std::max(0, textRight - rateX);
             const QRect topIpRect(ipX, 2, ipW, 14);
             const QRect botIpRect(ipX, 16, ipW, 14);
@@ -371,7 +677,6 @@ private:
             }
 
             p.setFont(m_compactFont);
-            const QFontMetrics fm(m_compactFont);
 
             auto drawLabeledIpRow = [&](const QRect &rowRect, const QString &label,
                                         const QString &ipVal, const QColor &valColor) {
@@ -379,16 +684,20 @@ private:
                     return;
                 }
                 const int labelW = fm.horizontalAdvance(label);
+                const int drawnLabelW = std::min(labelW, rowRect.width());
                 p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
-                p.drawText(QRect(rowRect.left(), rowRect.top(),
-                                 std::min(labelW, rowRect.width()), rowRect.height()),
-                           Qt::AlignVCenter | Qt::AlignLeft, label);
-                const int valX = rowRect.left() + labelW;
+                p.drawText(QRect(rowRect.left(), rowRect.top(), drawnLabelW, rowRect.height()),
+                           Qt::AlignVCenter | Qt::AlignLeft,
+                           (drawnLabelW < labelW)
+                               ? fm.elidedText(label, Qt::ElideRight, drawnLabelW)
+                               : label);
+                const int valX = rowRect.left() + drawnLabelW;
                 const int valW = rowRect.right() - valX + 1;
                 if (valW > 0) {
                     p.setPen(valColor);
                     p.drawText(QRect(valX, rowRect.top(), valW, rowRect.height()),
-                               Qt::AlignVCenter | Qt::AlignLeft, ipVal);
+                               Qt::AlignVCenter | Qt::AlignLeft,
+                               fm.elidedText(ipVal, Qt::ElideRight, valW));
                 }
             };
 
@@ -402,23 +711,28 @@ private:
             drawLabeledIpRow(topIpRect, QStringLiteral("PRI "), m_privateIpText, priCol);
             drawLabeledIpRow(botIpRect, QStringLiteral("PUB "), m_publicIpText, pubCol);
 
-            if (rateW > 0) {
+            if (rateW >= fm.horizontalAdvance(QStringLiteral("↓0B"))) {
                 p.setPen(QColor(GhosttyUnionTheme::kGreenHex));
-                p.drawText(QRect(rateX, 2, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft, m_downText);
+                p.drawText(QRect(rateX, 2, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft,
+                           fm.elidedText(m_downText, Qt::ElideRight, rateW));
                 p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-                p.drawText(QRect(rateX, 16, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft, m_upText);
+                p.drawText(QRect(rateX, 16, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft,
+                           fm.elidedText(m_upText, Qt::ElideRight, rateW));
             }
         }
 
-        double peak = 65536.0;
-        for (double v : m_primaryHistory) {
-            peak = std::max(peak, v);
+        if (sparkW >= kMinSparkWidthPx) {
+            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 6.0, static_cast<qreal>(sparkW), 20.0);
+            double peak = 65536.0;
+            for (double v : m_primaryHistory) {
+                peak = std::max(peak, v);
+            }
+            for (double v : m_secondaryHistory) {
+                peak = std::max(peak, v);
+            }
+            drawSparkSeries(p, sparkBox, m_primaryHistory, peak, QColor(GhosttyUnionTheme::kGreenHex), true);
+            drawSparkSeries(p, sparkBox, m_secondaryHistory, peak, QColor(GhosttyUnionTheme::kCyanHex), false);
         }
-        for (double v : m_secondaryHistory) {
-            peak = std::max(peak, v);
-        }
-        drawSparkSeries(p, sparkBox, m_primaryHistory, peak, QColor(GhosttyUnionTheme::kGreenHex), true);
-        drawSparkSeries(p, sparkBox, m_secondaryHistory, peak, QColor(GhosttyUnionTheme::kCyanHex), false);
     }
 
     void paintVpnStatus(QPainter &p) {
@@ -439,10 +753,15 @@ private:
             p.drawEllipse(QPointF(cx, cy), 3.5, 3.5);
         }
 
-        p.setFont(m_valueFont);
-        p.setPen(m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent);
-        const QString display = m_copiedFlash ? m_copiedMessage : m_valueText;
-        p.drawText(QRect(24, 0, width() - 32, height()), Qt::AlignVCenter | Qt::AlignLeft, display);
+        const int textW = std::max(0, width() - 32);
+        if (textW > 0) {
+            p.setFont(m_valueFont);
+            p.setPen(m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent);
+            const QString display = m_copiedFlash ? m_copiedMessage : m_valueText;
+            const QFontMetrics fmVal(m_valueFont);
+            p.drawText(QRect(24, 0, textW, height()), Qt::AlignVCenter | Qt::AlignLeft,
+                       fmVal.elidedText(display, Qt::ElideRight, textW));
+        }
     }
 
     Mode m_mode;
@@ -456,7 +775,10 @@ private:
     QString m_publicIpText;
     QString m_downText;
     QString m_upText;
+    int m_sampleValWidth = 0;
     int m_ipColWidth = 0;
+    int m_rateColWidth = 0;
+    int m_preferredWidth = kMinItemWidthPx;
     double m_percent = 0.0;
     bool m_online = false;
     QColor m_accent{GhosttyUnionTheme::kGoldHex};
@@ -538,7 +860,7 @@ void StatsBarWidget::paintEvent(QPaintEvent *event) {
 }
 
 void StatsBarWidget::buildUi() {
-    auto *layout = new QHBoxLayout(this);
+    auto *layout = new EvenDeltaRowLayout(this);
     layout->setContentsMargins(10, 4, 10, 4);
     layout->setSpacing(8);
 
@@ -604,34 +926,12 @@ void StatsBarWidget::buildUi() {
     layout->addWidget(m_gpuCard);
     layout->addWidget(m_netCard);
     layout->addWidget(m_vpnCard);
-    layout->addStretch(1);
 
-    m_clockPill = new QWidget(this);
-    m_clockPill->setObjectName(QStringLiteral("ClockPill"));
-    m_clockPill->setFixedHeight(kCardHeightPx);
-    m_clockPill->setToolTip(QStringLiteral("Local date & 1s clock"));
-    m_clockPill->setStyleSheet(QStringLiteral(
-        "#ClockPill { background: rgba(0, 0, 0, 65); border: 1px solid %1; border-radius: 6px; }"
-    ).arg(QString::fromLatin1(GhosttyUnionTheme::kDividerHex)));
-
-    auto *clockLayout = new QHBoxLayout(m_clockPill);
-    clockLayout->setContentsMargins(10, 2, 10, 2);
-    clockLayout->setSpacing(8);
-
-    m_dateLabel = new QLabel(m_clockPill);
-    m_dateLabel->setFont(valueFont);
-    m_dateLabel->setStyleSheet(QStringLiteral("color: %1;")
-                                   .arg(QString::fromLatin1(GhosttyUnionTheme::kDimTextHex)));
-
-    m_timeLabel = new QLabel(m_clockPill);
     QFont timeFont = valueFont;
     timeFont.setBold(true);
-    m_timeLabel->setFont(timeFont);
-    m_timeLabel->setStyleSheet(QStringLiteral("color: %1;")
-                                   .arg(QString::fromLatin1(GhosttyUnionTheme::kGoldHex)));
 
-    clockLayout->addWidget(m_dateLabel);
-    clockLayout->addWidget(m_timeLabel);
+    m_clockPill = new ClockPillWidget(valueFont, timeFont, this);
+    m_clockPill->setToolTip(QStringLiteral("Local date & 1s clock"));
     layout->addWidget(m_clockPill);
 }
 
@@ -939,8 +1239,8 @@ void StatsBarWidget::updateNetToolTip() {
 
 void StatsBarWidget::refreshVpnAndClock() {
     const QDateTime now = QDateTime::currentDateTime();
-    m_dateLabel->setText(now.toString(QStringLiteral("ddd MMM d")));
-    m_timeLabel->setText(now.toString(QStringLiteral("HH:mm:ss")));
+    m_clockPill->setDateTimeText(now.toString(QStringLiteral("ddd MMM d")),
+                                 now.toString(QStringLiteral("HH:mm:ss")));
 
     m_lastVpnIp = queryIpv4ForInterface(QStringLiteral("home-lan"));
     if (!m_lastVpnIp.isEmpty()) {
