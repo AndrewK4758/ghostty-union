@@ -14,6 +14,7 @@
 #include <QTabWidget>
 #include <QTest>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <ghostty/vt.h>
 
@@ -250,6 +251,163 @@ private Q_SLOTS:
         QApplication::clipboard()->setText(QStringLiteral("stale"));
         QTest::mouseClick(netCard, Qt::LeftButton, Qt::NoModifier, QPoint(20, 24));
         QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("203.0.113.42"));
+    }
+
+    void testStatsBarFullWidthEvenGrowthAndShrink() {
+        StatsBarWidget bar;
+        bar.resize(1220, 40);
+        bar.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&bar));
+        QVERIFY(bar.layout() != nullptr);
+        QCOMPARE(bar.layout()->count(), 6);
+
+        std::array<QWidget *, 6> items{};
+        std::array<int, 6> hintWidths{};
+        int sumHints = 0;
+        for (int i = 0; i < 6; ++i) {
+            QLayoutItem *li = bar.layout()->itemAt(i);
+            QVERIFY(li != nullptr);
+            items[i] = li->widget();
+            QVERIFY(items[i] != nullptr);
+            hintWidths[i] = li->sizeHint().width();
+            QVERIFY(hintWidths[i] > 0);
+            sumHints += hintWidths[i];
+        }
+        QCOMPARE(items[5]->objectName(), QStringLiteral("ClockPill"));
+
+        auto snapshotWidths = [&](int targetW) -> std::array<int, 6> {
+            bar.resize(targetW, 40);
+            bar.layout()->invalidate();
+            bar.layout()->activate();
+            QApplication::processEvents();
+            std::array<int, 6> widths{};
+            if (bar.width() != targetW) {
+                QTest::qFail(qPrintable(QStringLiteral("bar width %1 != target %2").arg(bar.width()).arg(targetW)),
+                             __FILE__, __LINE__);
+                return widths;
+            }
+            for (int i = 0; i < 6; ++i) {
+                if (items[i]->height() != 32 || items[i]->width() <= 0) {
+                    QTest::qFail("invalid item geometry", __FILE__, __LINE__);
+                    return widths;
+                }
+                widths[i] = items[i]->width();
+            }
+            if (items[0]->x() != 10) {
+                QTest::qFail(qPrintable(QStringLiteral("left margin x=%1").arg(items[0]->x())), __FILE__, __LINE__);
+            }
+            if (items[5]->x() + items[5]->width() != targetW - 10) {
+                QTest::qFail(qPrintable(QStringLiteral("right edge=%1 expected=%2")
+                                            .arg(items[5]->x() + items[5]->width())
+                                            .arg(targetW - 10)),
+                             __FILE__, __LINE__);
+            }
+            for (int i = 0; i < 5; ++i) {
+                const int gap = items[i + 1]->x() - (items[i]->x() + items[i]->width());
+                if (gap != 8) {
+                    QTest::qFail(qPrintable(QStringLiteral("gap[%1]=%2").arg(i).arg(gap)), __FILE__, __LINE__);
+                }
+            }
+            return widths;
+        };
+
+        for (const int w : {360, 600, 900, 1220, 1600, 2200}) {
+            const auto widths = snapshotWidths(w);
+            QVERIFY(widths[0] > 0);
+        }
+
+        const auto w1600 = snapshotWidths(1600);
+        const auto w2200 = snapshotWidths(2200);
+        std::array<int, 6> delta1600{};
+        std::array<int, 6> delta2200{};
+        for (int i = 0; i < 6; ++i) {
+            delta1600[i] = w1600[i] - hintWidths[i];
+            delta2200[i] = w2200[i] - hintWidths[i];
+            QVERIFY(delta1600[i] > 0);
+            QVERIFY(delta2200[i] > 0);
+            QCOMPARE(w2200[i] - w1600[i], 100);
+        }
+        QVERIFY(*std::max_element(delta1600.begin(), delta1600.end()) -
+                    *std::min_element(delta1600.begin(), delta1600.end()) <= 1);
+        QVERIFY(*std::max_element(delta2200.begin(), delta2200.end()) -
+                    *std::min_element(delta2200.begin(), delta2200.end()) <= 1);
+
+        const int shrinkTargetW = 60 + sumHints - 240;
+        const auto wShrink = snapshotWidths(shrinkTargetW);
+        for (int i = 0; i < 6; ++i) {
+            QCOMPARE(wShrink[i] - hintWidths[i], -40);
+        }
+
+        auto assertUnclampedEven = [&](const std::array<int, 6> &widths) {
+            bool hasUnclamped = false;
+            int minDelta = 0;
+            int maxDelta = 0;
+            for (int i = 0; i < 6; ++i) {
+                QVERIFY(widths[i] >= 72);
+                if (widths[i] > 72) {
+                    const int d = widths[i] - hintWidths[i];
+                    if (!hasUnclamped) {
+                        minDelta = maxDelta = d;
+                        hasUnclamped = true;
+                    } else {
+                        minDelta = std::min(minDelta, d);
+                        maxDelta = std::max(maxDelta, d);
+                    }
+                }
+            }
+            QVERIFY(hasUnclamped);
+            QVERIFY(maxDelta - minDelta <= 1);
+        };
+
+        const auto w900 = snapshotWidths(900);
+        const auto w1220 = snapshotWidths(1220);
+        assertUnclampedEven(w900);
+        assertUnclampedEven(w1220);
+
+        bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
+        for (const int w : {900, 1220, 2000}) {
+            bar.resize(w, 40);
+            bar.layout()->invalidate();
+            bar.layout()->activate();
+            QApplication::processEvents();
+            const QImage img = bar.grab().toImage();
+            QVERIFY(!img.isNull());
+            QCOMPARE(img.width(), qRound(w * img.devicePixelRatio()));
+        }
+
+        QApplication::clipboard()->setText(QStringLiteral("stale"));
+        QTest::mouseClick(items[3], Qt::LeftButton, Qt::NoModifier, QPoint(20, 24));
+        QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("203.0.113.42"));
+
+        MainWindow win;
+        win.resize(1000, 600);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+
+        auto *winBar = win.findChild<StatsBarWidget *>();
+        QVERIFY(winBar != nullptr);
+        QCOMPARE(winBar->width(), win.width());
+        QVERIFY(winBar->layout() != nullptr);
+        QCOMPARE(winBar->layout()->count(), 6);
+        winBar->layout()->invalidate();
+        winBar->layout()->activate();
+        QApplication::processEvents();
+
+        std::array<int, 6> winW1000{};
+        for (int i = 0; i < 6; ++i) {
+            winW1000[i] = winBar->layout()->itemAt(i)->widget()->width();
+        }
+
+        win.resize(1600, 700);
+        QTRY_COMPARE(winBar->width(), 1600);
+        winBar->layout()->invalidate();
+        winBar->layout()->activate();
+        QApplication::processEvents();
+
+        for (int i = 0; i < 6; ++i) {
+            const int grown = winBar->layout()->itemAt(i)->widget()->width() - winW1000[i];
+            QCOMPARE(grown, 100);
+        }
     }
 
     void testMainWindowTerminalSplitsAndIo() {
