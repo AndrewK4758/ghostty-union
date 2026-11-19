@@ -7,6 +7,8 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QDir>
+#include <QFile>
 #include <QImage>
 #include <QKeyEvent>
 #include <QLayout>
@@ -14,10 +16,12 @@
 #include <QPushButton>
 #include <QTabBar>
 #include <QTabWidget>
+#include <QTemporaryDir>
 #include <QTest>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <vector>
 #include <ghostty/vt.h>
 
 #ifdef __linux__
@@ -185,13 +189,22 @@ private Q_SLOTS:
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
         QCOMPARE(bar.height(), 40);
 
-        QTRY_VERIFY_WITH_TIMEOUT(bar.summaryTexts().size() == 5, 3000);
+        const QStringList procNvidia = StatsBarWidget::readConnectedNvidiaModelsFromProc();
+        if (!procNvidia.isEmpty()) {
+            QTRY_COMPARE_WITH_TIMEOUT(bar.gpuCardCount(), static_cast<int>(procNvidia.size()), 3000);
+            QVERIFY(!bar.gpuTags().contains(QLatin1String("GPU0")));
+        } else {
+            QVERIFY(bar.gpuCardCount() >= 1);
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(bar.summaryTexts().size() == 4 + bar.gpuCardCount(), 3000);
         QTRY_VERIFY_WITH_TIMEOUT(!bar.summaryTexts()[0].contains(QLatin1String("--%")), 3000);
         QTRY_VERIFY_WITH_TIMEOUT(!bar.summaryTexts()[1].contains(QLatin1String("--%")), 3000);
         QTRY_VERIFY_WITH_TIMEOUT(bar.summaryTexts()[1].contains(QLatin1Char('G')), 3000);
         QTRY_VERIFY_WITH_TIMEOUT(bar.historySampleCount() >= 1, 3000);
 
-        qInfo() << "StatsBar sample:" << bar.summaryTexts() << "samples=" << bar.historySampleCount();
+        qInfo() << "StatsBar GPUs:" << bar.gpuTags()
+                << "sample:" << bar.summaryTexts()
+                << "samples=" << bar.historySampleCount();
 
         bar.setSensorsEnabled(false);
         bar.setSensorsEnabled(true);
@@ -232,13 +245,16 @@ private Q_SLOTS:
         bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
         QCOMPARE(bar.publicIp(), QStringLiteral("203.0.113.42"));
 
+        const int gpuCount = bar.gpuCardCount();
+        QVERIFY(gpuCount >= 1);
         const QStringList summaries = bar.summaryTexts();
-        QCOMPARE(summaries.size(), 5);
-        QVERIFY(summaries[3].contains(QLatin1String("PRI ")));
-        QVERIFY(summaries[3].contains(QLatin1String("PUB 203.0.113.42")));
+        QCOMPARE(summaries.size(), 4 + gpuCount);
+        const int netIdx = 2 + gpuCount;
+        QVERIFY(summaries[netIdx].contains(QLatin1String("PRI ")));
+        QVERIFY(summaries[netIdx].contains(QLatin1String("PUB 203.0.113.42")));
 
         QVERIFY(bar.layout() != nullptr);
-        QWidget *netCard = bar.layout()->itemAt(3) ? bar.layout()->itemAt(3)->widget() : nullptr;
+        QWidget *netCard = bar.layout()->itemAt(netIdx) ? bar.layout()->itemAt(netIdx)->widget() : nullptr;
         QVERIFY(netCard != nullptr);
         QCOMPARE(netCard->height(), 32);
 
@@ -247,7 +263,7 @@ private Q_SLOTS:
             QTest::mouseClick(netCard, Qt::LeftButton, Qt::NoModifier, QPoint(20, 6));
             QCOMPARE(QApplication::clipboard()->text(), bar.privateIp());
         } else {
-            QVERIFY(summaries[3].contains(QLatin1String("PRI offline")));
+            QVERIFY(summaries[netIdx].contains(QLatin1String("PRI offline")));
         }
 
         QApplication::clipboard()->setText(QStringLiteral("stale"));
@@ -260,52 +276,63 @@ private Q_SLOTS:
         bar.resize(1220, 40);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
+        bar.setGpusForTesting({
+            {QStringLiteral("gpu/gpu0"), QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU"), {}, true},
+            {QStringLiteral("gpu/gpu1"), QStringLiteral("NVIDIA GeForce RTX 5080"), {}, true},
+        });
         QVERIFY(bar.layout() != nullptr);
-        QCOMPARE(bar.layout()->count(), 6);
+        const int itemCount = bar.layout()->count();
+        QCOMPARE(itemCount, 7);
 
-        std::array<QWidget *, 6> items{};
-        std::array<int, 6> hintWidths{};
+        std::vector<int> hintWidths(static_cast<size_t>(itemCount), 0);
         int sumHints = 0;
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < itemCount; ++i) {
             QLayoutItem *li = bar.layout()->itemAt(i);
             QVERIFY(li != nullptr);
-            items[i] = li->widget();
-            QVERIFY(items[i] != nullptr);
-            hintWidths[i] = li->sizeHint().width();
-            QVERIFY(hintWidths[i] > 0);
-            sumHints += hintWidths[i];
+            QVERIFY(li->widget() != nullptr);
+            hintWidths[static_cast<size_t>(i)] = li->sizeHint().width();
+            QVERIFY(hintWidths[static_cast<size_t>(i)] > 0);
+            sumHints += hintWidths[static_cast<size_t>(i)];
         }
-        QCOMPARE(items[5]->objectName(), QStringLiteral("ClockPill"));
+        QCOMPARE(bar.layout()->itemAt(itemCount - 1)->widget()->objectName(), QStringLiteral("ClockPill"));
 
-        auto snapshotWidths = [&](int targetW) -> std::array<int, 6> {
+        auto snapshotWidths = [&](int targetW) -> std::vector<int> {
             bar.resize(targetW, 40);
             bar.layout()->invalidate();
             bar.layout()->activate();
             QApplication::processEvents();
-            std::array<int, 6> widths{};
+            std::vector<int> widths(static_cast<size_t>(itemCount), 0);
             if (bar.width() != targetW) {
                 QTest::qFail(qPrintable(QStringLiteral("bar width %1 != target %2").arg(bar.width()).arg(targetW)),
                              __FILE__, __LINE__);
                 return widths;
             }
-            for (int i = 0; i < 6; ++i) {
-                if (items[i]->height() != 32 || items[i]->width() <= 0) {
+            if (bar.layout()->count() != itemCount) {
+                QTest::qFail("unexpected layout item count", __FILE__, __LINE__);
+                return widths;
+            }
+            std::vector<QWidget *> cur(static_cast<size_t>(itemCount), nullptr);
+            for (int i = 0; i < itemCount; ++i) {
+                QWidget *w = bar.layout()->itemAt(i)->widget();
+                if (!w || w->height() != 32 || w->width() <= 0) {
                     QTest::qFail("invalid item geometry", __FILE__, __LINE__);
                     return widths;
                 }
-                widths[i] = items[i]->width();
+                cur[static_cast<size_t>(i)] = w;
+                widths[static_cast<size_t>(i)] = w->width();
             }
-            if (items[0]->x() != 10) {
-                QTest::qFail(qPrintable(QStringLiteral("left margin x=%1").arg(items[0]->x())), __FILE__, __LINE__);
+            if (cur.front()->x() != 10) {
+                QTest::qFail(qPrintable(QStringLiteral("left margin x=%1").arg(cur.front()->x())), __FILE__, __LINE__);
             }
-            if (items[5]->x() + items[5]->width() != targetW - 10) {
+            if (cur.back()->x() + cur.back()->width() != targetW - 10) {
                 QTest::qFail(qPrintable(QStringLiteral("right edge=%1 expected=%2")
-                                            .arg(items[5]->x() + items[5]->width())
+                                            .arg(cur.back()->x() + cur.back()->width())
                                             .arg(targetW - 10)),
                              __FILE__, __LINE__);
             }
-            for (int i = 0; i < 5; ++i) {
-                const int gap = items[i + 1]->x() - (items[i]->x() + items[i]->width());
+            for (int i = 0; i < itemCount - 1; ++i) {
+                const int gap = cur[static_cast<size_t>(i + 1)]->x() -
+                                (cur[static_cast<size_t>(i)]->x() + cur[static_cast<size_t>(i)]->width());
                 if (gap != 8) {
                     QTest::qFail(qPrintable(QStringLiteral("gap[%1]=%2").arg(i).arg(gap)), __FILE__, __LINE__);
                 }
@@ -318,36 +345,41 @@ private Q_SLOTS:
             QVERIFY(widths[0] > 0);
         }
 
+        const int growBaseW = 20 + 8 * (itemCount - 1) + sumHints + 17;
+        const auto wGrowBase = snapshotWidths(growBaseW);
+        const auto wGrown = snapshotWidths(growBaseW + itemCount * 100);
+        std::vector<int> delta1600;
+        std::vector<int> delta2200;
         const auto w1600 = snapshotWidths(1600);
         const auto w2200 = snapshotWidths(2200);
-        std::array<int, 6> delta1600{};
-        std::array<int, 6> delta2200{};
-        for (int i = 0; i < 6; ++i) {
-            delta1600[i] = w1600[i] - hintWidths[i];
-            delta2200[i] = w2200[i] - hintWidths[i];
-            QVERIFY(delta1600[i] > 0);
-            QVERIFY(delta2200[i] > 0);
-            QCOMPARE(w2200[i] - w1600[i], 100);
+        for (int i = 0; i < itemCount; ++i) {
+            const size_t idx = static_cast<size_t>(i);
+            QCOMPARE(wGrown[idx] - wGrowBase[idx], 100);
+            delta1600.push_back(w1600[idx] - hintWidths[idx]);
+            delta2200.push_back(w2200[idx] - hintWidths[idx]);
+            QVERIFY(delta2200.back() > 0);
         }
         QVERIFY(*std::max_element(delta1600.begin(), delta1600.end()) -
                     *std::min_element(delta1600.begin(), delta1600.end()) <= 1);
         QVERIFY(*std::max_element(delta2200.begin(), delta2200.end()) -
                     *std::min_element(delta2200.begin(), delta2200.end()) <= 1);
 
-        const int shrinkTargetW = 60 + sumHints - 240;
+        const int shrinkTargetW = 20 + 8 * (itemCount - 1) + sumHints - itemCount * 40;
         const auto wShrink = snapshotWidths(shrinkTargetW);
-        for (int i = 0; i < 6; ++i) {
-            QCOMPARE(wShrink[i] - hintWidths[i], -40);
+        for (int i = 0; i < itemCount; ++i) {
+            const size_t idx = static_cast<size_t>(i);
+            QCOMPARE(wShrink[idx] - hintWidths[idx], -40);
         }
 
-        auto assertUnclampedEven = [&](const std::array<int, 6> &widths) {
+        auto assertUnclampedEven = [&](const std::vector<int> &widths) {
             bool hasUnclamped = false;
             int minDelta = 0;
             int maxDelta = 0;
-            for (int i = 0; i < 6; ++i) {
-                QVERIFY(widths[i] >= 72);
-                if (widths[i] > 72) {
-                    const int d = widths[i] - hintWidths[i];
+            for (int i = 0; i < itemCount; ++i) {
+                const size_t idx = static_cast<size_t>(i);
+                QVERIFY(widths[idx] >= 72);
+                if (widths[idx] > 72) {
+                    const int d = widths[idx] - hintWidths[idx];
                     if (!hasUnclamped) {
                         minDelta = maxDelta = d;
                         hasUnclamped = true;
@@ -378,11 +410,12 @@ private Q_SLOTS:
         }
 
         QApplication::clipboard()->setText(QStringLiteral("stale"));
-        QTest::mouseClick(items[3], Qt::LeftButton, Qt::NoModifier, QPoint(20, 24));
+        QTest::mouseClick(bar.layout()->itemAt(2 + bar.gpuCardCount())->widget(),
+                          Qt::LeftButton, Qt::NoModifier, QPoint(20, 24));
         QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("203.0.113.42"));
 
         MainWindow win;
-        win.resize(1000, 600);
+        win.resize(1100, 600);
         win.show();
         QVERIFY(QTest::qWaitForWindowExposed(&win));
 
@@ -390,26 +423,137 @@ private Q_SLOTS:
         QVERIFY(winBar != nullptr);
         QCOMPARE(winBar->width(), win.width());
         QVERIFY(winBar->layout() != nullptr);
-        QCOMPARE(winBar->layout()->count(), 6);
+        const int winCount = winBar->layout()->count();
+        QCOMPARE(winCount, 5 + winBar->gpuCardCount());
         winBar->layout()->invalidate();
         winBar->layout()->activate();
         QApplication::processEvents();
 
-        std::array<int, 6> winW1000{};
-        for (int i = 0; i < 6; ++i) {
-            winW1000[i] = winBar->layout()->itemAt(i)->widget()->width();
+        std::vector<int> winW1100(static_cast<size_t>(winCount), 0);
+        for (int i = 0; i < winCount; ++i) {
+            winW1100[static_cast<size_t>(i)] = winBar->layout()->itemAt(i)->widget()->width();
         }
 
-        win.resize(1600, 700);
-        QTRY_COMPARE(winBar->width(), 1600);
+        const int grownWinW = 1100 + winCount * 100;
+        win.resize(grownWinW, 700);
+        QTRY_COMPARE(winBar->width(), grownWinW);
         winBar->layout()->invalidate();
         winBar->layout()->activate();
         QApplication::processEvents();
 
-        for (int i = 0; i < 6; ++i) {
-            const int grown = winBar->layout()->itemAt(i)->widget()->width() - winW1000[i];
-            QCOMPARE(grown, 100);
+        for (int i = 0; i < winCount; ++i) {
+            const int grown = winBar->layout()->itemAt(i)->widget()->width() - winW1100[static_cast<size_t>(i)];
+            QVERIFY(std::abs(grown - 100) <= 1);
         }
+    }
+
+    void testStatsBarMultiGpuEnumerationAndHotplug() {
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU")),
+                 QStringLiteral("5070Ti"));
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("NVIDIA GeForce RTX 5080")),
+                 QStringLiteral("5080"));
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("NVIDIA GeForce RTX 4090 SUPER")),
+                 QStringLiteral("4090S"));
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("AMD Radeon RX 7900 XTX")),
+                 QStringLiteral("7900XTX"));
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("Intel(R) Arc(TM) A770 Graphics")),
+                 QStringLiteral("A770"));
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("Granite Ridge [Radeon 610M]")),
+                 QStringLiteral("610M"));
+        QCOMPARE(StatsBarWidget::formatGpuShortTag(QString(), 2), QStringLiteral("GPU2"));
+
+        QVERIFY(!StatsBarWidget::isIntegratedGpuName(QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU")));
+        QVERIFY(!StatsBarWidget::isIntegratedGpuName(QStringLiteral("NVIDIA GeForce RTX 5080")));
+        QVERIFY(!StatsBarWidget::isIntegratedGpuName(QStringLiteral("AMD Radeon RX 7900 XTX")));
+        QVERIFY(!StatsBarWidget::isIntegratedGpuName(QStringLiteral("Intel(R) Arc(TM) A770 Graphics")));
+        QVERIFY(StatsBarWidget::isIntegratedGpuName(QStringLiteral("Granite Ridge [Radeon 610M]")));
+        QVERIFY(StatsBarWidget::isIntegratedGpuName(QStringLiteral("AMD Radeon 780M Graphics")));
+        QVERIFY(StatsBarWidget::isIntegratedGpuName(QStringLiteral("Intel(R) UHD Graphics")));
+
+        QTemporaryDir tmpProc;
+        QVERIFY(tmpProc.isValid());
+        auto writeProcGpu = [&](const QString &busId, const QString &modelName) {
+            const QString busDir = tmpProc.filePath(busId);
+            QVERIFY(QDir().mkpath(busDir));
+            QFile f(busDir + QStringLiteral("/information"));
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Text));
+            f.write(QStringLiteral("Model: \t\t %1\nIRQ: \t\t 100\n").arg(modelName).toUtf8());
+        };
+        writeProcGpu(QStringLiteral("0000:01:00.0"), QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU"));
+
+        const QList<StatsBarWidget::GpuDescriptor> mixedCandidates{
+            {QStringLiteral("gpu/gpu0"), QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU"), {}, true},
+            {QStringLiteral("gpu/gpu1"), QStringLiteral("NVIDIA GeForce RTX 5080"), {}, true},
+            {QStringLiteral("gpu/gpu2"), QStringLiteral("Granite Ridge [Radeon 610M]"), {}, false},
+        };
+
+        // Unplugged RTX 5080 and integrated Radeon 610M are both filtered out
+        const QStringList procSingle = StatsBarWidget::readConnectedNvidiaModelsFromProc(tmpProc.path());
+        QCOMPARE(procSingle, QStringList{QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU")});
+        const auto activeSingle = StatsBarWidget::selectActiveGpus(mixedCandidates, procSingle, true);
+        QCOMPARE(activeSingle.size(), 1);
+        QCOMPARE(activeSingle[0].tag, QStringLiteral("5070Ti"));
+
+        // Docked RTX 5080 appears alongside RTX 5070 Ti while Radeon 610M stays hidden
+        writeProcGpu(QStringLiteral("0000:09:00.0"), QStringLiteral("NVIDIA GeForce RTX 5080"));
+        const QStringList procDual = StatsBarWidget::readConnectedNvidiaModelsFromProc(tmpProc.path());
+        QCOMPARE(procDual.size(), 2);
+        const auto activeDual = StatsBarWidget::selectActiveGpus(mixedCandidates, procDual, true);
+        QCOMPARE(activeDual.size(), 2);
+        QCOMPARE(activeDual[0].tag, QStringLiteral("5070Ti"));
+        QCOMPARE(activeDual[1].tag, QStringLiteral("5080"));
+
+        // iGPU-only fallback & duplicate model disambiguation
+        const auto activeIgpuOnly = StatsBarWidget::selectActiveGpus(
+            {{QStringLiteral("gpu/gpu0"), QStringLiteral("Granite Ridge [Radeon 610M]"), {}, false}},
+            {}, false);
+        QCOMPARE(activeIgpuOnly.size(), 1);
+        QCOMPARE(activeIgpuOnly[0].tag, QStringLiteral("610M"));
+
+        const auto activeDup = StatsBarWidget::selectActiveGpus(
+            {{QStringLiteral("gpu/gpu0"), QStringLiteral("NVIDIA GeForce RTX 5090"), {}, true},
+             {QStringLiteral("gpu/gpu1"), QStringLiteral("NVIDIA GeForce RTX 5090"), {}, true}},
+            {}, false);
+        QCOMPARE(activeDup.size(), 2);
+        QCOMPARE(activeDup[0].tag, QStringLiteral("5090#0"));
+        QCOMPARE(activeDup[1].tag, QStringLiteral("5090#1"));
+
+        // Live UI reconciliation across 1 -> 2 -> 3 -> 1 GPUs
+        StatsBarWidget bar;
+        bar.resize(1600, 40);
+        bar.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&bar));
+
+        auto verifyBarCount = [&](int expectedGpus, const QStringList &expectedTags) {
+            QCOMPARE(bar.gpuCardCount(), expectedGpus);
+            QCOMPARE(bar.gpuTags(), expectedTags);
+            QCOMPARE(bar.layout()->count(), 5 + expectedGpus);
+            QCOMPARE(bar.summaryTexts().size(), 4 + expectedGpus);
+            bar.layout()->invalidate();
+            bar.layout()->activate();
+            QApplication::processEvents();
+            QWidget *last = bar.layout()->itemAt(bar.layout()->count() - 1)->widget();
+            QVERIFY(last != nullptr);
+            QCOMPARE(last->objectName(), QStringLiteral("ClockPill"));
+            QCOMPARE(last->x() + last->width(), bar.width() - 10);
+            QVERIFY(!bar.grab().toImage().isNull());
+        };
+
+        bar.setGpusForTesting({mixedCandidates[0]});
+        verifyBarCount(1, {QStringLiteral("5070Ti")});
+
+        bar.setGpusForTesting({mixedCandidates[0], mixedCandidates[1]});
+        verifyBarCount(2, {QStringLiteral("5070Ti"), QStringLiteral("5080")});
+
+        bar.setGpusForTesting({
+            mixedCandidates[0],
+            mixedCandidates[1],
+            {QStringLiteral("gpu/gpu2"), QStringLiteral("AMD Radeon RX 7900 XTX"), {}, true},
+        });
+        verifyBarCount(3, {QStringLiteral("5070Ti"), QStringLiteral("5080"), QStringLiteral("7900XTX")});
+
+        bar.setGpusForTesting({mixedCandidates[0]});
+        verifyBarCount(1, {QStringLiteral("5070Ti")});
     }
 
     void testMainWindowTerminalSplitsAndIo() {
