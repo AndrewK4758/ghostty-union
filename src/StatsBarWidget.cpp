@@ -17,24 +17,39 @@
 #include <QLabel>
 #include <QLinearGradient>
 #include <QMouseEvent>
+#include <QNetworkAccessManager>
 #include <QNetworkAddressEntry>
 #include <QNetworkInterface>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
 #include <QTimer>
+#include <QUrl>
 
 #include <algorithm>
 #include <cmath>
 #include <deque>
 #include <functional>
+#include <iterator>
 
 namespace {
 
 constexpr size_t kMaxSamples = 28;
 constexpr int kBarHeightPx = 40;
 constexpr int kCardHeightPx = 32;
+constexpr int kPublicIpPollMs = 300000;
+constexpr int kPublicIpDebounceMs = 1500;
+constexpr int kPublicIpTimeoutMs = 4000;
+
+constexpr const char *kPublicIpEndpoints[] = {
+    "https://api4.ipify.org",
+    "https://ipv4.icanhazip.com",
+    "https://ifconfig.me/ip",
+};
+constexpr int kNumPublicIpEndpoints = static_cast<int>(std::size(kPublicIpEndpoints));
 
 const QString kCpuUsageId = QStringLiteral("cpu/all/usage");
 const QString kCpuTempId = QStringLiteral("cpu/all/maximumTemperature");
@@ -92,7 +107,9 @@ public:
         , m_mode(mode)
         , m_tag(tag)
         , m_valueFont(valueFont)
+        , m_compactFont(valueFont)
         , m_tagFont(tagFont) {
+        m_compactFont.setPointSizeF(7.8);
         setFixedHeight(kCardHeightPx);
         setMouseTracking(true);
         setFocusPolicy(Qt::NoFocus);
@@ -105,7 +122,7 @@ public:
         });
     }
 
-    void setOnClick(std::function<bool()> cb) {
+    void setOnClick(std::function<QString(const QPoint &)> cb) {
         m_onClick = std::move(cb);
         setCursor(m_onClick ? Qt::PointingHandCursor : Qt::ArrowCursor);
     }
@@ -125,6 +142,14 @@ public:
         setFixedWidth(padLeft + tagW + valW + sparkW + 9);
     }
 
+    void setNetWidthSample(const QString &ipSample, const QString &rateSample) {
+        const QFontMetrics fmCompact(m_compactFont);
+        m_ipColWidth = fmCompact.horizontalAdvance(ipSample);
+        const int rateColW = fmCompact.horizontalAdvance(rateSample);
+        const int sparkW = 50 + 8;
+        setFixedWidth(9 + m_ipColWidth + 10 + rateColW + sparkW + 9);
+    }
+
     void setGaugeData(const QString &valueText, double percent, const QColor &accent) {
         m_valueText = valueText;
         m_percent = std::clamp(percent, 0.0, 100.0);
@@ -132,11 +157,14 @@ public:
         update();
     }
 
-    void setNetData(const QString &ipText, const QString &downText, const QString &upText) {
-        m_ipText = ipText;
+    void setNetData(const QString &privateIpText, const QString &publicIpText,
+                    const QString &downText, const QString &upText) {
+        m_privateIpText = privateIpText;
+        m_publicIpText = publicIpText;
         m_downText = downText;
         m_upText = upText;
-        m_valueText = QStringLiteral("%1  %2 %3").arg(ipText, downText, upText);
+        m_valueText = QStringLiteral("PRI %1 | PUB %2  %3 %4")
+                          .arg(privateIpText, publicIpText, downText, upText);
         update();
     }
 
@@ -175,6 +203,7 @@ public:
 protected:
     void enterEvent(QEnterEvent *event) override {
         m_hovered = true;
+        m_hoverPos = event->position().toPoint();
         update();
         QWidget::enterEvent(event);
     }
@@ -185,9 +214,19 @@ protected:
         QWidget::leaveEvent(event);
     }
 
+    void mouseMoveEvent(QMouseEvent *event) override {
+        m_hoverPos = event->pos();
+        if (m_mode == Mode::NetDualSpark && m_hovered) {
+            update();
+        }
+        QWidget::mouseMoveEvent(event);
+    }
+
     void mouseReleaseEvent(QMouseEvent *event) override {
         if (event->button() == Qt::LeftButton && rect().contains(event->pos()) && m_onClick) {
-            if (m_onClick()) {
+            const QString flashMsg = m_onClick(event->pos());
+            if (!flashMsg.isEmpty()) {
+                m_copiedMessage = flashMsg;
                 m_copiedFlash = true;
                 m_copiedTimer.start();
                 update();
@@ -308,34 +347,66 @@ private:
         const QRectF sparkBox(width() - 9 - 50, 6.0, 50.0, 20.0);
         const int textRight = static_cast<int>(sparkBox.left()) - 8;
 
-        int x = 9;
-        const int textH = height();
         if (m_copiedFlash) {
             p.setFont(m_valueFont);
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            p.drawText(QRect(x, 0, std::max(10, textRight - x), textH),
-                       Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("Copied IP!"));
+            p.drawText(QRect(9, 0, std::max(10, textRight - 9), height()),
+                       Qt::AlignVCenter | Qt::AlignLeft, m_copiedMessage);
         } else {
-            p.setFont(m_valueFont);
-            const QFontMetrics fm(m_valueFont);
+            const int ipX = 9;
+            const int ipW = std::min(m_ipColWidth, std::max(0, textRight - ipX));
+            const int rateX = ipX + m_ipColWidth + 10;
+            const int rateW = std::max(0, textRight - rateX);
+            const QRect topIpRect(ipX, 2, ipW, 14);
+            const QRect botIpRect(ipX, 16, ipW, 14);
 
-            p.setPen(QColor(GhosttyUnionTheme::kCyanHex));
-            const int ipW = fm.horizontalAdvance(m_ipText);
-            p.drawText(QRect(x, 0, std::min(ipW, std::max(0, textRight - x)), textH),
-                       Qt::AlignVCenter | Qt::AlignLeft, m_ipText);
-            x += ipW + 8;
-
-            if (x < textRight) {
-                p.setPen(QColor(GhosttyUnionTheme::kGreenHex));
-                const int dlW = fm.horizontalAdvance(m_downText);
-                p.drawText(QRect(x, 0, std::min(dlW, textRight - x), textH),
-                           Qt::AlignVCenter | Qt::AlignLeft, m_downText);
-                x += dlW + 6;
+            if (m_hovered && ipW > 0) {
+                const bool hoverTop = (m_hoverPos.y() < height() / 2);
+                const QRectF hlRect = QRectF(hoverTop ? topIpRect : botIpRect).adjusted(-2.0, 0.0, 2.0, 0.0);
+                p.save();
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(255, 211, 0, 22));
+                p.drawRoundedRect(hlRect, 3.0, 3.0);
+                p.restore();
             }
-            if (x < textRight) {
+
+            p.setFont(m_compactFont);
+            const QFontMetrics fm(m_compactFont);
+
+            auto drawLabeledIpRow = [&](const QRect &rowRect, const QString &label,
+                                        const QString &ipVal, const QColor &valColor) {
+                if (rowRect.width() <= 0) {
+                    return;
+                }
+                const int labelW = fm.horizontalAdvance(label);
+                p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
+                p.drawText(QRect(rowRect.left(), rowRect.top(),
+                                 std::min(labelW, rowRect.width()), rowRect.height()),
+                           Qt::AlignVCenter | Qt::AlignLeft, label);
+                const int valX = rowRect.left() + labelW;
+                const int valW = rowRect.right() - valX + 1;
+                if (valW > 0) {
+                    p.setPen(valColor);
+                    p.drawText(QRect(valX, rowRect.top(), valW, rowRect.height()),
+                               Qt::AlignVCenter | Qt::AlignLeft, ipVal);
+                }
+            };
+
+            const QColor priCol = (m_privateIpText == QLatin1String("offline"))
+                                      ? QColor(GhosttyUnionTheme::kDimTextHex)
+                                      : QColor(GhosttyUnionTheme::kCyanHex);
+            const QColor pubCol = (m_publicIpText == QLatin1String("--"))
+                                      ? QColor(GhosttyUnionTheme::kDimTextHex)
+                                      : QColor(GhosttyUnionTheme::kTealHex);
+
+            drawLabeledIpRow(topIpRect, QStringLiteral("PRI "), m_privateIpText, priCol);
+            drawLabeledIpRow(botIpRect, QStringLiteral("PUB "), m_publicIpText, pubCol);
+
+            if (rateW > 0) {
+                p.setPen(QColor(GhosttyUnionTheme::kGreenHex));
+                p.drawText(QRect(rateX, 2, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft, m_downText);
                 p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-                p.drawText(QRect(x, 0, textRight - x, textH),
-                           Qt::AlignVCenter | Qt::AlignLeft, m_upText);
+                p.drawText(QRect(rateX, 16, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft, m_upText);
             }
         }
 
@@ -370,27 +441,32 @@ private:
 
         p.setFont(m_valueFont);
         p.setPen(m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent);
-        const QString display = m_copiedFlash ? QStringLiteral("Copied VPN IP!") : m_valueText;
+        const QString display = m_copiedFlash ? m_copiedMessage : m_valueText;
         p.drawText(QRect(24, 0, width() - 32, height()), Qt::AlignVCenter | Qt::AlignLeft, display);
     }
 
     Mode m_mode;
     QString m_tag;
     QFont m_valueFont;
+    QFont m_compactFont;
     QFont m_tagFont;
 
     QString m_valueText;
-    QString m_ipText;
+    QString m_privateIpText;
+    QString m_publicIpText;
     QString m_downText;
     QString m_upText;
+    int m_ipColWidth = 0;
     double m_percent = 0.0;
     bool m_online = false;
     QColor m_accent{GhosttyUnionTheme::kGoldHex};
 
     bool m_hovered = false;
+    QPoint m_hoverPos;
     bool m_copiedFlash = false;
+    QString m_copiedMessage;
     QTimer m_copiedTimer;
-    std::function<bool()> m_onClick;
+    std::function<QString(const QPoint &)> m_onClick;
 
     std::deque<double> m_primaryHistory;
     std::deque<double> m_secondaryHistory;
@@ -419,17 +495,33 @@ StatsBarWidget::StatsBarWidget(QWidget *parent)
     connect(m_dbus, &KSysGuard::SystemStats::DBusInterface::newSensorData,
             this, &StatsBarWidget::onNewSensorData);
 
+    m_netAccess = new QNetworkAccessManager(this);
+
     m_clockTimer = new QTimer(this);
     m_clockTimer->setInterval(1000);
     connect(m_clockTimer, &QTimer::timeout, this, &StatsBarWidget::refreshVpnAndClock);
-    m_clockTimer->start();
 
-    setSensorsEnabled(true);
+    m_publicIpTimer = new QTimer(this);
+    m_publicIpTimer->setInterval(kPublicIpPollMs);
+    connect(m_publicIpTimer, &QTimer::timeout, this, &StatsBarWidget::refreshPublicIp);
+
+    m_publicIpDebounceTimer = new QTimer(this);
+    m_publicIpDebounceTimer->setSingleShot(true);
+    m_publicIpDebounceTimer->setInterval(kPublicIpDebounceMs);
+    connect(m_publicIpDebounceTimer, &QTimer::timeout, this, &StatsBarWidget::refreshPublicIp);
+
     refreshVpnAndClock();
     refreshDisplay();
+    setSensorsEnabled(true);
 }
 
 StatsBarWidget::~StatsBarWidget() {
+    if (m_publicIpReply) {
+        m_publicIpReply->disconnect(this);
+        m_publicIpReply->abort();
+        m_publicIpReply->deleteLater();
+        m_publicIpReply.clear();
+    }
     if (m_dbus && m_subscribed) {
         m_dbus->unsubscribe(m_sensorIds);
         m_subscribed = false;
@@ -478,26 +570,33 @@ void StatsBarWidget::buildUi() {
 
     m_netCard = new StatsCardWidget(StatsCardWidget::Mode::NetDualSpark, QString(),
                                     valueFont, tagFont, this);
-    m_netCard->setWidthSample(QStringLiteral("192.168.100.100  ↓999K/s ↑999K/s"));
-    m_netCard->setToolTip(QStringLiteral("wlan0 IPv4 + live DL (green) / UL (cyan) 1Hz sparklines — click to copy IP"));
-    m_netCard->setOnClick([this]() -> bool {
-        if (m_lastWlanIp.isEmpty()) {
-            return false;
+    m_netCard->setNetWidthSample(QStringLiteral("PRI 255.255.255.255"), QStringLiteral("↓999.9M/s"));
+    updateNetToolTip();
+    m_netCard->setOnClick([this](const QPoint &pos) -> QString {
+        if (pos.y() < m_netCard->height() / 2) {
+            if (m_lastPrivateIp.isEmpty()) {
+                return {};
+            }
+            QApplication::clipboard()->setText(m_lastPrivateIp);
+            return QStringLiteral("Copied Private IP!");
         }
-        QApplication::clipboard()->setText(m_lastWlanIp);
-        return true;
+        if (m_lastPublicIp.isEmpty()) {
+            return {};
+        }
+        QApplication::clipboard()->setText(m_lastPublicIp);
+        return QStringLiteral("Copied Public IP!");
     });
 
     m_vpnCard = new StatsCardWidget(StatsCardWidget::Mode::VpnStatus, QString(),
                                     valueFont, tagFont, this);
     m_vpnCard->setWidthSample(QStringLiteral("VPN 192.168.100.100"));
     m_vpnCard->setToolTip(QStringLiteral("WireGuard home-lan tunnel status — click to copy VPN IP"));
-    m_vpnCard->setOnClick([this]() -> bool {
+    m_vpnCard->setOnClick([this](const QPoint & /*pos*/) -> QString {
         if (m_lastVpnIp.isEmpty()) {
-            return false;
+            return {};
         }
         QApplication::clipboard()->setText(m_lastVpnIp);
-        return true;
+        return QStringLiteral("Copied VPN IP!");
     });
 
     layout->addWidget(m_cpuCard);
@@ -556,12 +655,28 @@ void StatsBarWidget::setSensorsEnabled(bool enabled) {
         }
     }
 
-    if (enabled && !m_clockTimer->isActive()) {
-        m_clockTimer->start();
-        refreshVpnAndClock();
-        refreshDisplay();
-    } else if (!enabled && m_clockTimer->isActive()) {
-        m_clockTimer->stop();
+    if (enabled) {
+        if (!m_clockTimer->isActive()) {
+            m_clockTimer->start();
+            refreshVpnAndClock();
+            refreshDisplay();
+        }
+        if (m_publicIpTimer && !m_publicIpTimer->isActive()) {
+            m_publicIpTimer->start();
+            if (m_lastPublicIp.isEmpty()) {
+                refreshPublicIp();
+            }
+        }
+    } else {
+        if (m_clockTimer->isActive()) {
+            m_clockTimer->stop();
+        }
+        if (m_publicIpTimer && m_publicIpTimer->isActive()) {
+            m_publicIpTimer->stop();
+        }
+        if (m_publicIpDebounceTimer && m_publicIpDebounceTimer->isActive()) {
+            m_publicIpDebounceTimer->stop();
+        }
     }
 }
 
@@ -618,6 +733,22 @@ QString StatsBarWidget::formatRateCompact(const QString &sensorId) const {
     return formatNetBytesPerSec(v.toDouble());
 }
 
+bool StatsBarWidget::isVirtualOrTunnelInterface(const QString &ifName) {
+    if (ifName == QLatin1String("lo") || ifName == QLatin1String("home-lan")) {
+        return true;
+    }
+    static constexpr const char *kVirtualPrefixes[] = {
+        "docker", "br-", "veth", "virbr", "cni", "podman",
+        "wg", "tun", "tap", "tailscale", "zt",
+    };
+    for (const char *prefix : kVirtualPrefixes) {
+        if (ifName.startsWith(QLatin1String(prefix))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 QString StatsBarWidget::queryIpv4ForInterface(const QString &ifName) {
     const QNetworkInterface iface = QNetworkInterface::interfaceFromName(ifName);
     if (!iface.isValid() || !iface.flags().testFlag(QNetworkInterface::IsUp)) {
@@ -629,6 +760,181 @@ QString StatsBarWidget::queryIpv4ForInterface(const QString &ifName) {
         }
     }
     return {};
+}
+
+QString StatsBarWidget::queryPrimaryPrivateIpv4() {
+    const QString wlanIp = queryIpv4ForInterface(QStringLiteral("wlan0"));
+    if (!wlanIp.isEmpty()) {
+        return wlanIp;
+    }
+
+    QString fallbackIp;
+    const QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
+    for (const QNetworkInterface &iface : ifaces) {
+        if (!iface.isValid()) {
+            continue;
+        }
+        const auto flags = iface.flags();
+        if (!flags.testFlag(QNetworkInterface::IsUp) ||
+            !flags.testFlag(QNetworkInterface::IsRunning) ||
+            flags.testFlag(QNetworkInterface::IsLoopBack) ||
+            flags.testFlag(QNetworkInterface::IsPointToPoint)) {
+            continue;
+        }
+        const QString name = iface.name();
+        if (isVirtualOrTunnelInterface(name)) {
+            continue;
+        }
+        for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
+            const QHostAddress ip = entry.ip();
+            if (ip.protocol() == QAbstractSocket::IPv4Protocol &&
+                !ip.isLoopback() && !ip.isLinkLocal()) {
+                if (name.startsWith(QLatin1String("wl")) ||
+                    name.startsWith(QLatin1String("en")) ||
+                    name.startsWith(QLatin1String("eth"))) {
+                    return ip.toString();
+                }
+                if (fallbackIp.isEmpty()) {
+                    fallbackIp = ip.toString();
+                }
+            }
+        }
+    }
+    return fallbackIp;
+}
+
+QString StatsBarWidget::parsePublicIpv4Response(const QByteArray &body) {
+    if (body.isEmpty() || body.size() > 64) {
+        return {};
+    }
+    const QString trimmed = QString::fromUtf8(body).trimmed();
+    if (trimmed.isEmpty()) {
+        return {};
+    }
+    for (const QChar ch : trimmed) {
+        if (ch.isSpace()) {
+            return {};
+        }
+    }
+    const QHostAddress addr(trimmed);
+    if (addr.isNull() ||
+        addr.protocol() != QAbstractSocket::IPv4Protocol ||
+        !addr.isGlobal() ||
+        addr.isPrivateUse() ||
+        addr.isLoopback()) {
+        return {};
+    }
+    return addr.toString();
+}
+
+void StatsBarWidget::setPublicIpForTesting(const QString &ip) {
+    if (m_publicIpDebounceTimer) {
+        m_publicIpDebounceTimer->stop();
+    }
+    if (m_publicIpTimer) {
+        m_publicIpTimer->stop();
+    }
+    if (m_publicIpReply) {
+        m_publicIpReply->disconnect(this);
+        m_publicIpReply->abort();
+        m_publicIpReply->deleteLater();
+        m_publicIpReply.clear();
+    }
+    m_lastPublicIp = ip;
+    refreshDisplay();
+}
+
+void StatsBarWidget::refreshPublicIp() {
+    if (m_publicIpDebounceTimer && m_publicIpDebounceTimer->isActive()) {
+        m_publicIpDebounceTimer->stop();
+    }
+    requestPublicIpEndpoint(0);
+}
+
+void StatsBarWidget::requestPublicIpEndpoint(int endpointIndex) {
+    if (m_publicIpReply) {
+        m_publicIpReply->disconnect(this);
+        m_publicIpReply->abort();
+        m_publicIpReply->deleteLater();
+        m_publicIpReply.clear();
+    }
+
+    if (m_lastPrivateIp.isEmpty() && m_lastVpnIp.isEmpty()) {
+        if (!m_lastPublicIp.isEmpty()) {
+            m_lastPublicIp.clear();
+            refreshDisplay();
+        }
+        return;
+    }
+
+    if (!m_netAccess || endpointIndex < 0 || endpointIndex >= kNumPublicIpEndpoints) {
+        return;
+    }
+
+    QNetworkRequest req{QUrl(QString::fromLatin1(kPublicIpEndpoints[endpointIndex]))};
+    req.setTransferTimeout(kPublicIpTimeoutMs);
+    req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("ghostty-union/0.1"));
+
+    QNetworkReply *reply = m_netAccess->get(req);
+    m_publicIpReply = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, endpointIndex]() {
+        if (m_publicIpReply == reply) {
+            m_publicIpReply.clear();
+        }
+        QString parsed;
+        if (reply->error() == QNetworkReply::NoError) {
+            parsed = parsePublicIpv4Response(reply->readAll());
+        }
+        reply->deleteLater();
+
+        if (!parsed.isEmpty()) {
+            if (m_lastPublicIp != parsed) {
+                m_lastPublicIp = parsed;
+                refreshDisplay();
+            } else {
+                updateNetToolTip();
+            }
+        } else if (endpointIndex + 1 < kNumPublicIpEndpoints) {
+            requestPublicIpEndpoint(endpointIndex + 1);
+        }
+    });
+}
+
+void StatsBarWidget::schedulePublicIpRefresh() {
+    if (m_lastPrivateIp != m_prevPublicIpTriggerPrivate ||
+        m_lastVpnIp != m_prevPublicIpTriggerVpn) {
+        m_prevPublicIpTriggerPrivate = m_lastPrivateIp;
+        m_prevPublicIpTriggerVpn = m_lastVpnIp;
+        if (m_lastPrivateIp.isEmpty() && m_lastVpnIp.isEmpty()) {
+            if (m_publicIpReply) {
+                m_publicIpReply->disconnect(this);
+                m_publicIpReply->abort();
+                m_publicIpReply->deleteLater();
+                m_publicIpReply.clear();
+            }
+            if (!m_lastPublicIp.isEmpty()) {
+                m_lastPublicIp.clear();
+                updateNetToolTip();
+            }
+            if (m_publicIpDebounceTimer) {
+                m_publicIpDebounceTimer->stop();
+            }
+        } else if (m_publicIpTimer && m_publicIpTimer->isActive() && m_publicIpDebounceTimer) {
+            m_publicIpDebounceTimer->start();
+        }
+    }
+}
+
+void StatsBarWidget::updateNetToolTip() {
+    if (!m_netCard) {
+        return;
+    }
+    const QString pri = m_lastPrivateIp.isEmpty() ? QStringLiteral("offline") : m_lastPrivateIp;
+    const QString pub = m_lastPublicIp.isEmpty() ? QStringLiteral("--") : m_lastPublicIp;
+    m_netCard->setToolTip(QStringLiteral(
+        "Private IPv4: %1\nPublic IPv4: %2\n"
+        "DL (green) / UL (cyan) 1Hz sparklines — click top row to copy private IP, bottom row to copy public IP")
+                              .arg(pri, pub));
 }
 
 void StatsBarWidget::refreshVpnAndClock() {
@@ -644,6 +950,7 @@ void StatsBarWidget::refreshVpnAndClock() {
         m_vpnCard->setVpnData(QStringLiteral("VPN off"), false,
                               QColor(GhosttyUnionTheme::kDimTextHex));
     }
+    schedulePublicIpRefresh();
 
     if (!m_values.isEmpty()) {
         pushHistorySample();
@@ -705,15 +1012,18 @@ void StatsBarWidget::refreshDisplay() {
     }
 
     // Network
-    QString wlanIp = m_values.value(kWlanIpId).toString();
-    if (wlanIp.isEmpty()) {
-        wlanIp = queryIpv4ForInterface(QStringLiteral("wlan0"));
+    QString privateIp = m_values.value(kWlanIpId).toString();
+    if (privateIp.isEmpty()) {
+        privateIp = queryPrimaryPrivateIpv4();
     }
-    m_lastWlanIp = wlanIp;
-    const QString ipPart = wlanIp.isEmpty() ? QStringLiteral("wlan0 down") : wlanIp;
-    m_netCard->setNetData(ipPart,
+    m_lastPrivateIp = privateIp;
+    const QString priPart = privateIp.isEmpty() ? QStringLiteral("offline") : privateIp;
+    const QString pubPart = m_lastPublicIp.isEmpty() ? QStringLiteral("--") : m_lastPublicIp;
+    m_netCard->setNetData(priPart, pubPart,
                           QStringLiteral("↓%1").arg(formatRateCompact(kNetDownId)),
                           QStringLiteral("↑%1").arg(formatRateCompact(kNetUpId)));
+    updateNetToolTip();
+    schedulePublicIpRefresh();
 }
 
 QStringList StatsBarWidget::summaryTexts() const {

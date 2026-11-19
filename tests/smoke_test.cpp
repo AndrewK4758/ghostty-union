@@ -4,8 +4,11 @@
 #include "TerminalTabPane.h"
 #include "TerminalWidget.h"
 
+#include <QApplication>
+#include <QClipboard>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLayout>
 #include <QPushButton>
 #include <QTabBar>
 #include <QTabWidget>
@@ -189,6 +192,64 @@ private Q_SLOTS:
 
         bar.setSensorsEnabled(false);
         bar.setSensorsEnabled(true);
+    }
+
+    void testStatsBarPrivateAndPublicIps() {
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("203.0.113.42\n")),
+                 QStringLiteral("203.0.113.42"));
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray(" 1.1.1.1 ")),
+                 QStringLiteral("1.1.1.1"));
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("192.168.1.10")), QString());
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("10.0.0.1")), QString());
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("172.20.20.20")), QString());
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("127.0.0.1")), QString());
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("2001:db8::1")), QString());
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("<html>502</html>")), QString());
+        QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray(128, '1')), QString());
+
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("lo")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("docker0")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("br-154dd75b2740")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("veth123")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("home-lan")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("wg0")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("tun0")));
+        QVERIFY(StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("tailscale0")));
+        QVERIFY(!StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("wlan0")));
+        QVERIFY(!StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("wlp2s0")));
+        QVERIFY(!StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("eth0")));
+        QVERIFY(!StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("enp3s0")));
+
+        StatsBarWidget bar;
+        bar.resize(1200, 40);
+        bar.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&bar));
+        QCOMPARE(bar.height(), 40);
+
+        bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
+        QCOMPARE(bar.publicIp(), QStringLiteral("203.0.113.42"));
+
+        const QStringList summaries = bar.summaryTexts();
+        QCOMPARE(summaries.size(), 5);
+        QVERIFY(summaries[3].contains(QLatin1String("PRI ")));
+        QVERIFY(summaries[3].contains(QLatin1String("PUB 203.0.113.42")));
+
+        QVERIFY(bar.layout() != nullptr);
+        QWidget *netCard = bar.layout()->itemAt(3) ? bar.layout()->itemAt(3)->widget() : nullptr;
+        QVERIFY(netCard != nullptr);
+        QCOMPARE(netCard->height(), 32);
+
+        if (!bar.privateIp().isEmpty()) {
+            QApplication::clipboard()->setText(QStringLiteral("stale"));
+            QTest::mouseClick(netCard, Qt::LeftButton, Qt::NoModifier, QPoint(20, 6));
+            QCOMPARE(QApplication::clipboard()->text(), bar.privateIp());
+        } else {
+            QVERIFY(summaries[3].contains(QLatin1String("PRI offline")));
+        }
+
+        QApplication::clipboard()->setText(QStringLiteral("stale"));
+        QTest::mouseClick(netCard, Qt::LeftButton, Qt::NoModifier, QPoint(20, 24));
+        QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("203.0.113.42"));
     }
 
     void testMainWindowTerminalSplitsAndIo() {
