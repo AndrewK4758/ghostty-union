@@ -9,12 +9,15 @@
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDateTime>
+#include <QDir>
 #include <QEnterEvent>
+#include <QFile>
 #include <QFont>
 #include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QHostAddress>
 #include <QLinearGradient>
+#include <QMap>
 #include <QMargins>
 #include <QMouseEvent>
 #include <QNetworkAccessManager>
@@ -26,6 +29,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QRegularExpression>
 #include <QSizePolicy>
 #include <QTimer>
 #include <QUrl>
@@ -62,9 +66,6 @@ const QString kCpuTempId = QStringLiteral("cpu/all/maximumTemperature");
 const QString kMemUsedId = QStringLiteral("memory/physical/used");
 const QString kMemTotalId = QStringLiteral("memory/physical/total");
 const QString kMemPercentId = QStringLiteral("memory/physical/usedPercent");
-const QString kGpuUsageId = QStringLiteral("gpu/gpu0/usage");
-const QString kGpuTempId = QStringLiteral("gpu/gpu0/temperature");
-const QString kGpuPowerId = QStringLiteral("gpu/gpu0/power");
 const QString kWlanIpId = QStringLiteral("network/wlan0/ipv4address");
 const QString kNetDownId = QStringLiteral("network/all/download");
 const QString kNetUpId = QStringLiteral("network/all/upload");
@@ -350,6 +351,7 @@ public:
     }
 
     void setWidthSample(const QString &sampleValueText) {
+        m_sampleValueText = sampleValueText;
         const QFontMetrics fmVal(m_valueFont);
         const QFontMetrics fmTag(m_tagFont);
         const int padLeft = (m_mode == Mode::VpnStatus) ? 24 : 9;
@@ -358,6 +360,17 @@ public:
         const int sparkW = (m_mode == Mode::GaugeSpark) ? (kGaugeBaseSparkWidthPx + 8) : 0;
         m_preferredWidth = padLeft + tagW + m_sampleValWidth + sparkW + 9;
         updateGeometry();
+    }
+
+    QString tag() const { return m_tag; }
+
+    void setTag(const QString &tag) {
+        if (m_tag == tag) {
+            return;
+        }
+        m_tag = tag;
+        setWidthSample(m_sampleValueText);
+        update();
     }
 
     void setNetWidthSample(const QString &ipSample, const QString &rateSample) {
@@ -771,6 +784,7 @@ private:
     QFont m_tagFont;
 
     QString m_valueText;
+    QString m_sampleValueText;
     QString m_privateIpText;
     QString m_publicIpText;
     QString m_downText;
@@ -794,12 +808,174 @@ private:
     std::deque<double> m_secondaryHistory;
 };
 
+bool StatsBarWidget::isIntegratedGpuName(const QString &name) {
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty()) {
+        return false;
+    }
+    if (trimmed.contains(QLatin1String("NVIDIA"), Qt::CaseInsensitive) ||
+        trimmed.contains(QLatin1String("GeForce"), Qt::CaseInsensitive) ||
+        trimmed.contains(QLatin1String("Quadro"), Qt::CaseInsensitive) ||
+        trimmed.contains(QLatin1String("Tesla"), Qt::CaseInsensitive)) {
+        return false;
+    }
+    if (trimmed.contains(QLatin1String("Radeon RX"), Qt::CaseInsensitive) ||
+        trimmed.contains(QLatin1String("Radeon PRO"), Qt::CaseInsensitive) ||
+        trimmed.contains(QLatin1String("Instinct"), Qt::CaseInsensitive) ||
+        trimmed.contains(QLatin1String("Arc"), Qt::CaseInsensitive)) {
+        return false;
+    }
+    static const char *kIntegratedHints[] = {
+        "Integrated", "UHD Graphics", "Iris", "HD Graphics",
+        "Granite Ridge", "Raphael", "Phoenix", "Hawk Point",
+        "Strix", "Rembrandt", "Cezanne", "Renoir", "Krackan",
+    };
+    for (const char *hint : kIntegratedHints) {
+        if (trimmed.contains(QLatin1String(hint), Qt::CaseInsensitive)) {
+            return true;
+        }
+    }
+    static const QRegularExpression reApu(
+        QStringLiteral("\\bRadeon\\s+\\d{3}M\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (reApu.match(trimmed).hasMatch()) {
+        return true;
+    }
+    static const QRegularExpression reGenericIgpu(
+        QStringLiteral("^(?:AMD\\s+Radeon(?:\\(TM\\))?\\s+Graphics|Intel\\(R\\)\\s+Graphics)$"),
+        QRegularExpression::CaseInsensitiveOption);
+    return reGenericIgpu.match(trimmed).hasMatch();
+}
+
+QString StatsBarWidget::formatGpuShortTag(const QString &name, int fallbackIndex) {
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty()) {
+        return QStringLiteral("GPU%1").arg(fallbackIndex);
+    }
+
+    static const QRegularExpression reConsumer(
+        QStringLiteral("(?:RTX|GTX|RX|Arc(?:\\(TM\\))?|Radeon)\\s+([A-Z]?\\d{3,4})"
+                       "(M\\b|\\s+(?:Ti\\s*SUPER|Ti|SUPER|XTX|XT|GRE|M)\\b)?"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch m = reConsumer.match(trimmed);
+    if (m.hasMatch()) {
+        const QString num = m.captured(1).toUpper();
+        const QString rawSuf = m.captured(2).simplified().toUpper();
+        QString normSuf;
+        if (rawSuf == QLatin1String("TI SUPER")) {
+            normSuf = QStringLiteral("TiS");
+        } else if (rawSuf == QLatin1String("TI")) {
+            normSuf = QStringLiteral("Ti");
+        } else if (rawSuf == QLatin1String("SUPER")) {
+            normSuf = QStringLiteral("S");
+        } else if (!rawSuf.isEmpty()) {
+            normSuf = rawSuf;
+        }
+        return num + normSuf;
+    }
+
+    static const QRegularExpression rePro(
+        QStringLiteral("(?:RTX|Quadro|Tesla|NVIDIA)\\s+([A-Z]\\d{2,4}[A-Z]?|\\d{4}\\s*Ada)"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch mPro = rePro.match(trimmed);
+    if (mPro.hasMatch()) {
+        return mPro.captured(1).simplified().remove(QLatin1Char(' '));
+    }
+
+    return QStringLiteral("GPU%1").arg(fallbackIndex);
+}
+
+QStringList StatsBarWidget::readConnectedNvidiaModelsFromProc(const QString &procRoot) {
+    QDir dir(procRoot);
+    if (!dir.exists()) {
+        return {};
+    }
+    const QStringList subdirs = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    QStringList models;
+    for (const QString &sub : subdirs) {
+        QFile f(dir.filePath(sub + QStringLiteral("/information")));
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            continue;
+        }
+        const QList<QByteArray> lines = f.readAll().split('\n');
+        for (const QByteArray &rawLine : lines) {
+            const QString line = QString::fromUtf8(rawLine);
+            if (line.startsWith(QLatin1String("Model:"))) {
+                const QString model = line.mid(6).trimmed();
+                if (!model.isEmpty()) {
+                    models.append(model);
+                }
+                break;
+            }
+        }
+    }
+    return models;
+}
+
+QList<StatsBarWidget::GpuDescriptor> StatsBarWidget::selectActiveGpus(
+    const QList<GpuDescriptor> &candidates,
+    const QStringList &connectedNvidiaModels,
+    bool enforceNvidiaProcFilter) {
+    QStringList remainingNvidia = connectedNvidiaModels;
+    QList<GpuDescriptor> connected;
+    connected.reserve(candidates.size());
+
+    for (const GpuDescriptor &cand : candidates) {
+        const bool isNvidia = cand.name.contains(QLatin1String("NVIDIA"), Qt::CaseInsensitive) ||
+                              cand.name.contains(QLatin1String("GeForce"), Qt::CaseInsensitive);
+        if (enforceNvidiaProcFilter && isNvidia) {
+            int matchIdx = -1;
+            for (int i = 0; i < remainingNvidia.size(); ++i) {
+                if (remainingNvidia[i].compare(cand.name.trimmed(), Qt::CaseInsensitive) == 0) {
+                    matchIdx = i;
+                    break;
+                }
+            }
+            if (matchIdx < 0) {
+                continue;
+            }
+            remainingNvidia.removeAt(matchIdx);
+        }
+        connected.append(cand);
+    }
+
+    QList<GpuDescriptor> discrete;
+    QList<GpuDescriptor> integrated;
+    for (const GpuDescriptor &cand : connected) {
+        if (isIntegratedGpuName(cand.name)) {
+            integrated.append(cand);
+        } else {
+            discrete.append(cand);
+        }
+    }
+
+    QList<GpuDescriptor> chosen = !discrete.isEmpty() ? std::move(discrete) : std::move(integrated);
+
+    QHash<QString, int> tagCounts;
+    for (int i = 0; i < chosen.size(); ++i) {
+        if (chosen[i].tag.isEmpty()) {
+            chosen[i].tag = formatGpuShortTag(chosen[i].name, i);
+        }
+        tagCounts[chosen[i].tag] = tagCounts.value(chosen[i].tag, 0) + 1;
+    }
+
+    QHash<QString, int> seenCounts;
+    for (GpuDescriptor &d : chosen) {
+        if (tagCounts.value(d.tag) > 1) {
+            const int occ = seenCounts.value(d.tag, 0);
+            seenCounts[d.tag] = occ + 1;
+            d.tag = QStringLiteral("%1#%2").arg(d.tag).arg(occ);
+        }
+    }
+
+    return chosen;
+}
+
 StatsBarWidget::StatsBarWidget(QWidget *parent)
     : QWidget(parent)
-    , m_sensorIds{kCpuUsageId, kCpuTempId,
-                  kMemUsedId, kMemTotalId, kMemPercentId,
-                  kGpuUsageId, kGpuTempId, kGpuPowerId,
-                  kWlanIpId, kNetDownId, kNetUpId} {
+    , m_baseSensorIds{kCpuUsageId, kCpuTempId,
+                      kMemUsedId, kMemTotalId, kMemPercentId,
+                      kWlanIpId, kNetDownId, kNetUpId} {
     setObjectName(QStringLiteral("StatsBarWidget"));
     setFixedHeight(kBarHeightPx);
     buildUi();
@@ -816,6 +992,18 @@ StatsBarWidget::StatsBarWidget(QWidget *parent)
         this);
     connect(m_dbus, &KSysGuard::SystemStats::DBusInterface::newSensorData,
             this, &StatsBarWidget::onNewSensorData);
+    connect(m_dbus, &KSysGuard::SystemStats::DBusInterface::sensorAdded,
+            this, [this](const QString &sensorId) {
+                if (!m_testingGpusOverride && sensorId.startsWith(QLatin1String("gpu/gpu"))) {
+                    discoverGpusFromDbus();
+                }
+            });
+    connect(m_dbus, &KSysGuard::SystemStats::DBusInterface::sensorRemoved,
+            this, [this](const QString &sensorId) {
+                if (!m_testingGpusOverride && sensorId.startsWith(QLatin1String("gpu/gpu"))) {
+                    discoverGpusFromDbus();
+                }
+            });
 
     m_netAccess = new QNetworkAccessManager(this);
 
@@ -844,9 +1032,9 @@ StatsBarWidget::~StatsBarWidget() {
         m_publicIpReply->deleteLater();
         m_publicIpReply.clear();
     }
-    if (m_dbus && m_subscribed) {
-        m_dbus->unsubscribe(m_sensorIds);
-        m_subscribed = false;
+    if (m_dbus && !m_subscribedSensorIds.isEmpty()) {
+        m_dbus->unsubscribe(m_subscribedSensorIds);
+        m_subscribedSensorIds.clear();
     }
 }
 
@@ -860,38 +1048,33 @@ void StatsBarWidget::paintEvent(QPaintEvent *event) {
 }
 
 void StatsBarWidget::buildUi() {
-    auto *layout = new EvenDeltaRowLayout(this);
-    layout->setContentsMargins(10, 4, 10, 4);
-    layout->setSpacing(8);
+    m_rowLayout = new EvenDeltaRowLayout(this);
+    m_rowLayout->setContentsMargins(10, 4, 10, 4);
+    m_rowLayout->setSpacing(8);
 
-    QFont valueFont(QStringLiteral("FiraCode Nerd Font SemBd"));
-    valueFont.setStyleHint(QFont::Monospace);
-    valueFont.setPointSizeF(9.2);
+    m_valueFont = QFont(QStringLiteral("FiraCode Nerd Font SemBd"));
+    m_valueFont.setStyleHint(QFont::Monospace);
+    m_valueFont.setPointSizeF(9.2);
 
-    QFont tagFont(QStringLiteral("FiraCode Nerd Font SemBd"));
-    tagFont.setStyleHint(QFont::Monospace);
-    tagFont.setPointSizeF(8.0);
-    tagFont.setBold(true);
+    m_tagFont = QFont(QStringLiteral("FiraCode Nerd Font SemBd"));
+    m_tagFont.setStyleHint(QFont::Monospace);
+    m_tagFont.setPointSizeF(8.0);
+    m_tagFont.setBold(true);
 
-    setFont(valueFont);
+    setFont(m_valueFont);
 
     m_cpuCard = new StatsCardWidget(StatsCardWidget::Mode::GaugeSpark, QStringLiteral("CPU"),
-                                    valueFont, tagFont, this);
+                                    m_valueFont, m_tagFont, this);
     m_cpuCard->setWidthSample(QStringLiteral("100% · 100°C"));
     m_cpuCard->setToolTip(QStringLiteral("CPU usage, max package temperature & 1Hz trend (ksystemstats)"));
 
     m_ramCard = new StatsCardWidget(StatsCardWidget::Mode::GaugeSpark, QStringLiteral("RAM"),
-                                    valueFont, tagFont, this);
+                                    m_valueFont, m_tagFont, this);
     m_ramCard->setWidthSample(QStringLiteral("99.9G · 100%"));
     m_ramCard->setToolTip(QStringLiteral("Physical RAM used (GiB & %) + 1Hz trend (ksystemstats)"));
 
-    m_gpuCard = new StatsCardWidget(StatsCardWidget::Mode::GaugeSpark, QStringLiteral("RTX"),
-                                    valueFont, tagFont, this);
-    m_gpuCard->setWidthSample(QStringLiteral("100% · 100°C · 150W"));
-    m_gpuCard->setToolTip(QStringLiteral("RTX 5070 Ti load, temperature, power & 1Hz trend (ksystemstats)"));
-
     m_netCard = new StatsCardWidget(StatsCardWidget::Mode::NetDualSpark, QString(),
-                                    valueFont, tagFont, this);
+                                    m_valueFont, m_tagFont, this);
     m_netCard->setNetWidthSample(QStringLiteral("PRI 255.255.255.255"), QStringLiteral("↓999.9M/s"));
     updateNetToolTip();
     m_netCard->setOnClick([this](const QPoint &pos) -> QString {
@@ -910,7 +1093,7 @@ void StatsBarWidget::buildUi() {
     });
 
     m_vpnCard = new StatsCardWidget(StatsCardWidget::Mode::VpnStatus, QString(),
-                                    valueFont, tagFont, this);
+                                    m_valueFont, m_tagFont, this);
     m_vpnCard->setWidthSample(QStringLiteral("VPN 192.168.100.100"));
     m_vpnCard->setToolTip(QStringLiteral("WireGuard home-lan tunnel status — click to copy VPN IP"));
     m_vpnCard->setOnClick([this](const QPoint & /*pos*/) -> QString {
@@ -921,38 +1104,334 @@ void StatsBarWidget::buildUi() {
         return QStringLiteral("Copied VPN IP!");
     });
 
-    layout->addWidget(m_cpuCard);
-    layout->addWidget(m_ramCard);
-    layout->addWidget(m_gpuCard);
-    layout->addWidget(m_netCard);
-    layout->addWidget(m_vpnCard);
+    m_rowLayout->addWidget(m_cpuCard);
+    m_rowLayout->addWidget(m_ramCard);
+    m_rowLayout->addWidget(m_netCard);
+    m_rowLayout->addWidget(m_vpnCard);
 
-    QFont timeFont = valueFont;
+    QFont timeFont = m_valueFont;
     timeFont.setBold(true);
 
-    m_clockPill = new ClockPillWidget(valueFont, timeFont, this);
+    m_clockPill = new ClockPillWidget(m_valueFont, timeFont, this);
     m_clockPill->setToolTip(QStringLiteral("Local date & 1s clock"));
-    layout->addWidget(m_clockPill);
+    m_rowLayout->addWidget(m_clockPill);
+
+    m_lastProcNvidiaModels = readConnectedNvidiaModelsFromProc();
+    if (!m_lastProcNvidiaModels.isEmpty()) {
+        QList<GpuDescriptor> seeded;
+        seeded.reserve(m_lastProcNvidiaModels.size());
+        for (int i = 0; i < m_lastProcNvidiaModels.size(); ++i) {
+            seeded.append(GpuDescriptor{
+                QStringLiteral("gpu/gpu%1").arg(i),
+                m_lastProcNvidiaModels[i],
+                {},
+                true,
+            });
+        }
+        applyGpuDescriptors(selectActiveGpus(seeded, m_lastProcNvidiaModels, true));
+    } else {
+        applyGpuDescriptors({GpuDescriptor{QStringLiteral("gpu/gpu0"), QString(), QStringLiteral("GPU0"), false}});
+    }
+}
+
+void StatsBarWidget::applyGpuDescriptors(const QList<GpuDescriptor> &gpus) {
+    if (!m_rowLayout) {
+        return;
+    }
+
+    QList<GpuCardEntry> oldPool = std::move(m_gpuEntries);
+    m_gpuEntries.clear();
+    for (const GpuCardEntry &old : oldPool) {
+        if (old.card) {
+            m_rowLayout->removeWidget(old.card);
+        }
+    }
+
+    QList<GpuCardEntry> nextEntries;
+    nextEntries.reserve(gpus.size());
+    for (int i = 0; i < gpus.size(); ++i) {
+        const GpuDescriptor &d = gpus[i];
+        const QString tag = d.tag.isEmpty() ? formatGpuShortTag(d.name, i) : d.tag;
+        const QString widthSample = d.hasPower
+                                        ? QStringLiteral("100% · 100°C · 350W")
+                                        : QStringLiteral("100% · 100°C");
+        const QString displayName = d.name.isEmpty() ? tag : d.name;
+        const QString tip = QStringLiteral("%1 — load, temperature%2 & 1Hz trend (ksystemstats)")
+                                .arg(displayName, d.hasPower ? QStringLiteral(", power") : QString());
+
+        StatsCardWidget *card = nullptr;
+        for (int j = 0; j < oldPool.size(); ++j) {
+            if (oldPool[j].prefix == d.prefix) {
+                card = oldPool[j].card;
+                oldPool.removeAt(j);
+                break;
+            }
+        }
+        if (card) {
+            card->setTag(tag);
+            card->setWidthSample(widthSample);
+            card->setToolTip(tip);
+        } else {
+            card = new StatsCardWidget(StatsCardWidget::Mode::GaugeSpark, tag,
+                                       m_valueFont, m_tagFont, this);
+            card->setWidthSample(widthSample);
+            card->setToolTip(tip);
+        }
+        card->show();
+
+        GpuCardEntry entry;
+        entry.prefix = d.prefix;
+        entry.name = d.name;
+        entry.tag = tag;
+        entry.usageId = d.prefix + QStringLiteral("/usage");
+        entry.tempId = d.prefix + QStringLiteral("/temperature");
+        entry.powerId = d.prefix + QStringLiteral("/power");
+        entry.nameId = d.prefix + QStringLiteral("/name");
+        entry.hasPower = d.hasPower;
+        entry.card = card;
+        nextEntries.append(entry);
+    }
+
+    for (const GpuCardEntry &stale : oldPool) {
+        if (stale.card) {
+            stale.card->hide();
+            stale.card->deleteLater();
+        }
+    }
+
+    for (int i = 0; i < nextEntries.size(); ++i) {
+        m_rowLayout->insertWidget(2 + i, nextEntries[i].card);
+    }
+
+    m_gpuEntries = std::move(nextEntries);
+    m_rowLayout->invalidate();
+    updateGeometry();
+    update();
+}
+
+void StatsBarWidget::syncSensorSubscriptions() {
+    QStringList desired = m_baseSensorIds;
+    for (const GpuCardEntry &g : m_gpuEntries) {
+        if (!g.usageId.isEmpty()) {
+            desired.append(g.usageId);
+        }
+        if (!g.tempId.isEmpty()) {
+            desired.append(g.tempId);
+        }
+        if (g.hasPower && !g.powerId.isEmpty()) {
+            desired.append(g.powerId);
+        }
+    }
+    desired.removeDuplicates();
+
+    if (!m_dbus) {
+        return;
+    }
+
+    if (!m_sensorsEnabled) {
+        if (!m_subscribedSensorIds.isEmpty()) {
+            m_dbus->unsubscribe(m_subscribedSensorIds);
+            m_subscribedSensorIds.clear();
+        }
+        return;
+    }
+
+    QStringList toUnsub;
+    for (const QString &id : m_subscribedSensorIds) {
+        if (!desired.contains(id)) {
+            toUnsub.append(id);
+        }
+    }
+    if (!toUnsub.isEmpty()) {
+        m_dbus->unsubscribe(toUnsub);
+    }
+
+    QStringList toSub;
+    for (const QString &id : desired) {
+        if (!m_subscribedSensorIds.contains(id)) {
+            toSub.append(id);
+        }
+    }
+    if (!toSub.isEmpty()) {
+        m_dbus->subscribe(toSub);
+        const auto *watcher = new QDBusPendingCallWatcher(m_dbus->sensorData(toSub), this);
+        connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
+            const QDBusPendingReply<KSysGuard::SensorDataList> reply = *w;
+            if (reply.isValid()) {
+                onNewSensorData(reply.value());
+            }
+            w->deleteLater();
+        });
+    }
+    m_subscribedSensorIds = desired;
+}
+
+void StatsBarWidget::discoverGpusFromDbus() {
+    if (!m_dbus || m_testingGpusOverride) {
+        return;
+    }
+    if (m_discoveryInFlight) {
+        m_discoveryPending = true;
+        return;
+    }
+    m_discoveryInFlight = true;
+
+    const auto *allWatcher = new QDBusPendingCallWatcher(m_dbus->allSensors(), this);
+    connect(allWatcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
+        const QDBusPendingReply<KSysGuard::SensorInfoMap> reply = *w;
+        w->deleteLater();
+
+        if (!reply.isValid() || m_testingGpusOverride) {
+            m_discoveryInFlight = false;
+            const bool rerun = m_discoveryPending;
+            m_discoveryPending = false;
+            if (rerun && !m_testingGpusOverride) {
+                discoverGpusFromDbus();
+            }
+            return;
+        }
+
+        struct GpuScan {
+            QString prefix;
+            bool hasName = false;
+            bool hasUsage = false;
+            bool hasTemp = false;
+            bool hasPower = false;
+        };
+
+        static const QRegularExpression reGpu(QStringLiteral("^gpu/gpu(\\d+)/([A-Za-z0-9_]+)$"));
+        QMap<int, GpuScan> byIndex;
+        const KSysGuard::SensorInfoMap sensors = reply.value();
+        for (auto it = sensors.cbegin(); it != sensors.cend(); ++it) {
+            const QRegularExpressionMatch m = reGpu.match(it.key());
+            if (!m.hasMatch()) {
+                continue;
+            }
+            const int idx = m.captured(1).toInt();
+            const QString leaf = m.captured(2);
+            GpuScan &scan = byIndex[idx];
+            if (scan.prefix.isEmpty()) {
+                scan.prefix = QStringLiteral("gpu/gpu%1").arg(idx);
+            }
+            if (leaf == QLatin1String("name")) {
+                scan.hasName = true;
+            } else if (leaf == QLatin1String("usage")) {
+                scan.hasUsage = true;
+            } else if (leaf == QLatin1String("temperature")) {
+                scan.hasTemp = true;
+            } else if (leaf == QLatin1String("power")) {
+                scan.hasPower = true;
+            }
+        }
+
+        QList<GpuScan> found;
+        QStringList queryIds;
+        for (auto it = byIndex.cbegin(); it != byIndex.cend(); ++it) {
+            const GpuScan &s = it.value();
+            if (!s.hasUsage && !s.hasTemp && !s.hasName) {
+                continue;
+            }
+            found.append(s);
+            if (s.hasName) {
+                queryIds.append(s.prefix + QStringLiteral("/name"));
+            }
+            if (s.hasUsage) {
+                queryIds.append(s.prefix + QStringLiteral("/usage"));
+            }
+            if (s.hasTemp) {
+                queryIds.append(s.prefix + QStringLiteral("/temperature"));
+            }
+            if (s.hasPower) {
+                queryIds.append(s.prefix + QStringLiteral("/power"));
+            }
+        }
+
+        if (queryIds.isEmpty()) {
+            m_discoveryInFlight = false;
+            const bool rerun = m_discoveryPending;
+            m_discoveryPending = false;
+            if (rerun && !m_testingGpusOverride) {
+                discoverGpusFromDbus();
+            }
+            return;
+        }
+
+        const auto *dataWatcher = new QDBusPendingCallWatcher(m_dbus->sensorData(queryIds), this);
+        connect(dataWatcher, &QDBusPendingCallWatcher::finished, this, [this, found](QDBusPendingCallWatcher *dw) {
+            const QDBusPendingReply<KSysGuard::SensorDataList> dataReply = *dw;
+            dw->deleteLater();
+
+            m_discoveryInFlight = false;
+            const bool rerun = m_discoveryPending;
+            m_discoveryPending = false;
+
+            if (m_testingGpusOverride) {
+                return;
+            }
+
+            if (dataReply.isValid()) {
+                for (const KSysGuard::SensorData &item : dataReply.value()) {
+                    m_values.insert(item.sensorProperty, item.payload);
+                }
+            }
+
+            QList<GpuDescriptor> candidates;
+            candidates.reserve(found.size());
+            for (const auto &s : found) {
+                GpuDescriptor desc;
+                desc.prefix = s.prefix;
+                desc.name = m_values.value(s.prefix + QStringLiteral("/name")).toString().trimmed();
+                desc.hasPower = s.hasPower;
+                candidates.append(desc);
+            }
+
+            QDir nvProcDir(QStringLiteral("/proc/driver/nvidia/gpus"));
+            const bool nvDirExists = nvProcDir.exists();
+            const QStringList nvSubdirs = nvDirExists
+                                              ? nvProcDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)
+                                              : QStringList{};
+            m_lastProcNvidiaModels = nvDirExists ? readConnectedNvidiaModelsFromProc() : QStringList{};
+            const bool enforceNvFilter = nvDirExists && (nvSubdirs.isEmpty() || !m_lastProcNvidiaModels.isEmpty());
+            QList<GpuDescriptor> active = selectActiveGpus(candidates, m_lastProcNvidiaModels, enforceNvFilter);
+            if (active.isEmpty()) {
+                if (!m_lastProcNvidiaModels.isEmpty()) {
+                    for (int i = 0; i < m_lastProcNvidiaModels.size(); ++i) {
+                        active.append(GpuDescriptor{
+                            QStringLiteral("gpu/gpu%1").arg(i),
+                            m_lastProcNvidiaModels[i],
+                            {},
+                            true,
+                        });
+                    }
+                    active = selectActiveGpus(active, m_lastProcNvidiaModels, true);
+                } else {
+                    active.append(GpuDescriptor{QStringLiteral("gpu/gpu0"), QString(), QStringLiteral("GPU0"), false});
+                }
+            }
+
+            applyGpuDescriptors(active);
+            syncSensorSubscriptions();
+            refreshDisplay();
+
+            if (rerun) {
+                discoverGpusFromDbus();
+            }
+        });
+    });
+}
+
+void StatsBarWidget::setGpusForTesting(const QList<GpuDescriptor> &gpus) {
+    m_testingGpusOverride = true;
+    applyGpuDescriptors(selectActiveGpus(gpus, {}, false));
+    syncSensorSubscriptions();
+    refreshDisplay();
 }
 
 void StatsBarWidget::setSensorsEnabled(bool enabled) {
-    if (m_dbus) {
-        if (enabled && !m_subscribed) {
-            m_dbus->subscribe(m_sensorIds);
-            m_subscribed = true;
-
-            const auto *watcher = new QDBusPendingCallWatcher(m_dbus->sensorData(m_sensorIds), this);
-            connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *w) {
-                const QDBusPendingReply<KSysGuard::SensorDataList> reply = *w;
-                if (reply.isValid()) {
-                    onNewSensorData(reply.value());
-                }
-                w->deleteLater();
-            });
-        } else if (!enabled && m_subscribed) {
-            m_dbus->unsubscribe(m_sensorIds);
-            m_subscribed = false;
-        }
+    m_sensorsEnabled = enabled;
+    syncSensorSubscriptions();
+    if (enabled && !m_testingGpusOverride) {
+        discoverGpusFromDbus();
     }
 
     if (enabled) {
@@ -981,9 +1460,21 @@ void StatsBarWidget::setSensorsEnabled(bool enabled) {
 }
 
 void StatsBarWidget::onNewSensorData(const KSysGuard::SensorDataList &updates) {
+    auto isTrackedSensor = [this](const QString &id) {
+        if (m_baseSensorIds.contains(id) || m_subscribedSensorIds.contains(id)) {
+            return true;
+        }
+        for (const GpuCardEntry &g : m_gpuEntries) {
+            if (id == g.usageId || id == g.tempId || id == g.powerId || id == g.nameId) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     bool touched = false;
     for (const KSysGuard::SensorData &item : updates) {
-        if (m_sensorIds.contains(item.sensorProperty)) {
+        if (isTrackedSensor(item.sensorProperty)) {
             m_values.insert(item.sensorProperty, item.payload);
             touched = true;
         }
@@ -999,13 +1490,15 @@ void StatsBarWidget::onNewSensorData(const KSysGuard::SensorDataList &updates) {
 void StatsBarWidget::pushHistorySample() {
     const double cpuPct = m_values.value(kCpuUsageId).toDouble();
     const double ramPct = m_values.value(kMemPercentId).toDouble();
-    const double gpuPct = m_values.value(kGpuUsageId).isValid() ? m_values.value(kGpuUsageId).toDouble() : 0.0;
     const double downBps = m_values.value(kNetDownId).isValid() ? m_values.value(kNetDownId).toDouble() : 0.0;
     const double upBps = m_values.value(kNetUpId).isValid() ? m_values.value(kNetUpId).toDouble() : 0.0;
 
     m_cpuCard->pushGaugeSample(cpuPct);
     m_ramCard->pushGaugeSample(ramPct);
-    m_gpuCard->pushGaugeSample(gpuPct);
+    for (const GpuCardEntry &g : m_gpuEntries) {
+        const double gpuPct = m_values.value(g.usageId).isValid() ? m_values.value(g.usageId).toDouble() : 0.0;
+        g.card->pushGaugeSample(gpuPct);
+    }
     m_netCard->pushNetSamples(downBps, upBps);
 }
 
@@ -1252,6 +1745,14 @@ void StatsBarWidget::refreshVpnAndClock() {
     }
     schedulePublicIpRefresh();
 
+    if (!m_testingGpusOverride && QDir(QStringLiteral("/proc/driver/nvidia/gpus")).exists()) {
+        const QStringList curNvidia = readConnectedNvidiaModelsFromProc();
+        if (curNvidia != m_lastProcNvidiaModels) {
+            m_lastProcNvidiaModels = curNvidia;
+            discoverGpusFromDbus();
+        }
+    }
+
     if (!m_values.isEmpty()) {
         pushHistorySample();
     }
@@ -1290,25 +1791,29 @@ void StatsBarWidget::refreshDisplay() {
     }
     m_ramCard->setGaugeData(ramText, ramPct, ramAccent);
 
-    // GPU RTX 5070 Ti
-    const QVariant gpuVal = m_values.value(kGpuUsageId);
-    if (gpuVal.isValid()) {
-        const double gpuPct = gpuVal.toDouble();
-        QColor gpuAccent(GhosttyUnionTheme::kGreenHex);
-        if (gpuPct >= 85.0) {
-            gpuAccent = QColor(GhosttyUnionTheme::kRedOrangeHex);
-        } else if (gpuPct >= 50.0) {
-            gpuAccent = QColor(GhosttyUnionTheme::kGoldHex);
+    // GPUs (1..N dynamically enumerated)
+    for (const GpuCardEntry &g : m_gpuEntries) {
+        const QVariant gpuVal = m_values.value(g.usageId);
+        const QVariant tempVal = m_values.value(g.tempId);
+        if (gpuVal.isValid() || tempVal.isValid()) {
+            const double gpuPct = gpuVal.isValid() ? gpuVal.toDouble() : 0.0;
+            const double gpuTemp = tempVal.isValid() ? tempVal.toDouble() : 0.0;
+            QColor gpuAccent(GhosttyUnionTheme::kGreenHex);
+            if (gpuPct >= 85.0 || gpuTemp >= 88.0) {
+                gpuAccent = QColor(GhosttyUnionTheme::kRedOrangeHex);
+            } else if (gpuPct >= 50.0 || gpuTemp >= 78.0) {
+                gpuAccent = QColor(GhosttyUnionTheme::kGoldHex);
+            }
+            const QVariant pwrVal = g.hasPower ? m_values.value(g.powerId) : QVariant();
+            const QString pwr = pwrVal.isValid()
+                                    ? QStringLiteral(" · %1W").arg(qRound(pwrVal.toDouble()))
+                                    : QString();
+            g.card->setGaugeData(
+                QStringLiteral("%1 · %2%3").arg(formatPercentValue(g.usageId), formatTempValue(g.tempId), pwr),
+                gpuPct, gpuAccent);
+        } else {
+            g.card->setGaugeData(QStringLiteral("idle"), 0.0, QColor(GhosttyUnionTheme::kDimTextHex));
         }
-        const QVariant pwrVal = m_values.value(kGpuPowerId);
-        const QString pwr = pwrVal.isValid()
-                                ? QStringLiteral(" · %1W").arg(qRound(pwrVal.toDouble()))
-                                : QString();
-        m_gpuCard->setGaugeData(
-            QStringLiteral("%1 · %2%3").arg(formatPercentValue(kGpuUsageId), formatTempValue(kGpuTempId), pwr),
-            gpuPct, gpuAccent);
-    } else {
-        m_gpuCard->setGaugeData(QStringLiteral("idle"), 0.0, QColor(GhosttyUnionTheme::kDimTextHex));
     }
 
     // Network
@@ -1326,14 +1831,26 @@ void StatsBarWidget::refreshDisplay() {
     schedulePublicIpRefresh();
 }
 
+QStringList StatsBarWidget::gpuTags() const {
+    QStringList tags;
+    tags.reserve(m_gpuEntries.size());
+    for (const GpuCardEntry &g : m_gpuEntries) {
+        tags.append(g.tag);
+    }
+    return tags;
+}
+
 QStringList StatsBarWidget::summaryTexts() const {
-    return {
-        m_cpuCard->summaryText(),
-        m_ramCard->summaryText(),
-        m_gpuCard->summaryText(),
-        m_netCard->summaryText(),
-        m_vpnCard->summaryText(),
-    };
+    QStringList out;
+    out.reserve(4 + m_gpuEntries.size());
+    out.append(m_cpuCard->summaryText());
+    out.append(m_ramCard->summaryText());
+    for (const GpuCardEntry &g : m_gpuEntries) {
+        out.append(g.card->summaryText());
+    }
+    out.append(m_netCard->summaryText());
+    out.append(m_vpnCard->summaryText());
+    return out;
 }
 
 int StatsBarWidget::historySampleCount() const {
