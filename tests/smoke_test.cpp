@@ -6,9 +6,11 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QCoreApplication>
 #include <QImage>
 #include <QKeyEvent>
 #include <QLayout>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QTabBar>
 #include <QTabWidget>
@@ -576,6 +578,61 @@ private Q_SLOTS:
         const int botRowY = static_cast<int>(std::ceil((pad.y() + ch) * imgDpr)) - 1;
         QVERIFY2(colorDist(img.pixelColor(shadeMidX, topRowY), termBg) > 8, "Shade U+2593 stepped down from row top");
         QVERIFY2(colorDist(img.pixelColor(shadeMidX, botRowY), termBg) > 8, "Shade U+2593 clipped above row bottom");
+    }
+
+    void testTerminalScrollbarMouseDragAndClick() {
+        TerminalWidget term(QString(), nullptr, /*startShell=*/false);
+        term.resize(640, 240);
+        term.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&term));
+
+        QVERIFY(term.scrollbarState().total <= term.scrollbarState().len);
+
+        QByteArray lines;
+        for (int i = 0; i < 200; ++i) {
+            lines.append(QStringLiteral("Line %1\r\n").arg(i, 3, 10, QLatin1Char('0')).toUtf8());
+        }
+        term.feedVtBytes(lines);
+
+        const auto sbInit = term.scrollbarState();
+        QVERIFY(sbInit.total > sbInit.len);
+        const uint64_t maxOffset = sbInit.total - sbInit.len;
+        QCOMPARE(sbInit.offset, maxOffset);
+        QVERIFY(term.plainTextSnapshot().contains(QStringLiteral("Line 199")));
+
+        // Track click near top jumps viewport to the top of scrollback
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, QPoint(term.width() - 6, 8));
+        QCOMPARE(term.scrollbarState().offset, uint64_t{0});
+        QVERIFY(term.plainTextSnapshot().contains(QStringLiteral("Line 000")));
+
+        // Drag thumb smoothly from top -> middle -> bottom (including horizontal drift outside gutter)
+        const QPoint pressPt(term.width() - 6, 10);
+        QTest::mousePress(&term, Qt::LeftButton, Qt::NoModifier, pressPt);
+
+        const QPointF midLocal(static_cast<qreal>(term.width() - 6), static_cast<qreal>(term.height()) * 0.5);
+        QMouseEvent midMove(QEvent::MouseMove, midLocal,
+                            term.mapToGlobal(midLocal.toPoint()),
+                            Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&term, &midMove);
+        const uint64_t midOffset = term.scrollbarState().offset;
+        QVERIFY(midOffset > 0);
+        QVERIFY(midOffset < maxOffset);
+
+        const QPointF botLocal(static_cast<qreal>(term.width() - 100), static_cast<qreal>(term.height() - 4));
+        QMouseEvent botMove(QEvent::MouseMove, botLocal,
+                            term.mapToGlobal(botLocal.toPoint()),
+                            Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&term, &botMove);
+        QCOMPARE(term.scrollbarState().offset, maxOffset);
+        QVERIFY(term.plainTextSnapshot().contains(QStringLiteral("Line 199")));
+
+        QTest::mouseRelease(&term, Qt::LeftButton, Qt::NoModifier, botLocal.toPoint());
+        QVERIFY(!term.grab().toImage().isNull());
+
+        // Scrollbar gutter keeps priority over PTY mouse tracking modes
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, QPoint(term.width() - 6, 8));
+        QCOMPARE(term.scrollbarState().offset, uint64_t{0});
     }
 };
 

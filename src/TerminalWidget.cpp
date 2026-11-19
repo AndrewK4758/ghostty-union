@@ -5,6 +5,7 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDir>
+#include <QEvent>
 #include <QFontMetricsF>
 #include <QKeyEvent>
 #include <QMessageBox>
@@ -1015,7 +1016,7 @@ void TerminalWidget::resizeTerminalToWidget() {
     if (std::abs(dpr - m_metricsDpr) > 0.001) {
         updateFontMetrics();
     }
-    const int availW = std::max(m_cellWidth, width() - 2 * kPadX);
+    const int availW = std::max(m_cellWidth, width() - kPadX - kPadRight);
     const int availH = std::max(m_cellHeight, height() - 2 * kPadY);
     const uint16_t newCols = static_cast<uint16_t>(std::clamp(availW / m_cellWidth, 2, 1000));
     const uint16_t newRows = static_cast<uint16_t>(std::clamp(availH / m_cellHeight, 1, 1000));
@@ -1048,7 +1049,7 @@ void TerminalWidget::resizeTerminalToWidget() {
     msize.padding_top = kPadY;
     msize.padding_bottom = kPadY;
     msize.padding_left = kPadX;
-    msize.padding_right = kPadX;
+    msize.padding_right = kPadRight;
     ghostty_mouse_encoder_setopt(m_mouseEncoder, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &msize);
 
     updateRenderState(true);
@@ -1077,6 +1078,11 @@ void TerminalWidget::updateRenderState(bool forceAllDirty) {
     ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_COLORS, &m_colors);
 
     ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &m_scrollbar);
+    if (!hasScrollbar() && (m_scrollbarHovered || m_scrollbarDragging)) {
+        m_scrollbarHovered = false;
+        m_scrollbarDragging = false;
+        unsetCursor();
+    }
 
     uint16_t rsRows = 0;
     ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_ROWS, &rsRows);
@@ -1457,17 +1463,23 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         }
     }
 
-    // Subtle Solar Forge / Ollie scrollbar indicator when scrollback exists
-    if (m_scrollbar.total > m_scrollbar.len && m_scrollbar.total > 0) {
-        const int trackH = std::max(1, height() - 8);
-        const qreal ratioLen = static_cast<qreal>(m_scrollbar.len) / static_cast<qreal>(m_scrollbar.total);
-        const qreal ratioOff = static_cast<qreal>(m_scrollbar.offset) / static_cast<qreal>(m_scrollbar.total);
-        const int thumbH = std::max(20, static_cast<int>(trackH * ratioLen));
-        const int thumbY = 4 + static_cast<int>((trackH - thumbH) *
-                                                (ratioOff / std::max(0.0001, 1.0 - ratioLen)));
+    // Interactive Solar Forge / Ollie scrollbar gutter when scrollback exists
+    QRectF trackRect;
+    QRectF thumbRect;
+    if (computeScrollbarGeometry(trackRect, thumbRect)) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(Qt::NoPen);
+        if (m_scrollbarHovered || m_scrollbarDragging) {
+            p.setBrush(QColor(255, 255, 255, 20));
+            p.drawRoundedRect(trackRect, 4.0, 4.0);
+        }
         QColor barCol(GhosttyUnionTheme::kGoldHex);
-        barCol.setAlpha(110);
-        p.fillRect(width() - 5, thumbY, 3, thumbH, barCol);
+        barCol.setAlpha(m_scrollbarDragging ? 240 : (m_scrollbarHovered ? 210 : 120));
+        p.setBrush(barCol);
+        const qreal radius = thumbRect.width() * 0.5;
+        p.drawRoundedRect(thumbRect, radius, radius);
+        p.restore();
     }
 }
 
@@ -1589,9 +1601,121 @@ bool TerminalWidget::cellPointAt(const QPointF &pos, uint16_t &colOut, uint16_t 
     return true;
 }
 
+bool TerminalWidget::hasScrollbar() const {
+    return m_terminal != nullptr && m_scrollbar.total > m_scrollbar.len &&
+           m_scrollbar.total > 0 && height() > 2 * kScrollbarMarginY;
+}
+
+bool TerminalWidget::isInScrollbarZone(const QPointF &pos) const {
+    return hasScrollbar() &&
+           pos.x() >= static_cast<qreal>(width() - kScrollbarHitWidth) &&
+           pos.x() <= static_cast<qreal>(width()) &&
+           pos.y() >= 0.0 &&
+           pos.y() <= static_cast<qreal>(height());
+}
+
+bool TerminalWidget::computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const {
+    if (!hasScrollbar()) {
+        return false;
+    }
+    const qreal trackTop = static_cast<qreal>(kScrollbarMarginY);
+    const qreal trackH = std::max(1.0, static_cast<qreal>(height() - 2 * kScrollbarMarginY));
+    const uint64_t maxOffset = m_scrollbar.total - m_scrollbar.len;
+    const qreal ratioLen = static_cast<qreal>(m_scrollbar.len) / static_cast<qreal>(m_scrollbar.total);
+    const qreal minThumbH = std::min(trackH, 24.0);
+    const qreal thumbH = std::clamp(trackH * ratioLen, minThumbH, trackH);
+    const qreal travel = std::max(0.0, trackH - thumbH);
+    const qreal frac = (maxOffset > 0)
+                           ? std::clamp(static_cast<qreal>(m_scrollbar.offset) / static_cast<qreal>(maxOffset),
+                                        0.0, 1.0)
+                           : 0.0;
+    const qreal thumbY = trackTop + travel * frac;
+
+    const bool active = m_scrollbarHovered || m_scrollbarDragging;
+    const qreal barW = active ? 8.0 : 4.0;
+    const qreal rightInset = active ? 2.0 : 3.0;
+    const qreal barX = static_cast<qreal>(width()) - rightInset - barW;
+
+    trackRectOut = QRectF(static_cast<qreal>(width()) - 10.0, trackTop, 8.0, trackH);
+    thumbRectOut = QRectF(barX, thumbY, barW, thumbH);
+    return true;
+}
+
+void TerminalWidget::scrollViewportToThumbTop(qreal desiredThumbTop) {
+    QRectF trackRect;
+    QRectF thumbRect;
+    if (!computeScrollbarGeometry(trackRect, thumbRect)) {
+        return;
+    }
+    const uint64_t maxOffset = m_scrollbar.total - m_scrollbar.len;
+    if (maxOffset == 0) {
+        return;
+    }
+
+    const qreal travel = std::max(0.0, trackRect.height() - thumbRect.height());
+    uint64_t targetRow = 0;
+    if (travel <= 0.5) {
+        targetRow = (desiredThumbTop <= trackRect.top()) ? 0 : maxOffset;
+    } else {
+        const qreal frac = std::clamp((desiredThumbTop - trackRect.top()) / travel, 0.0, 1.0);
+        targetRow = static_cast<uint64_t>(std::llround(frac * static_cast<qreal>(maxOffset)));
+    }
+    if (targetRow == m_scrollbar.offset) {
+        return;
+    }
+
+    GhosttyTerminalScrollViewport sb{};
+    if (targetRow == 0) {
+        sb.tag = GHOSTTY_SCROLL_VIEWPORT_TOP;
+    } else if (targetRow >= maxOffset) {
+        sb.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
+    } else {
+        sb.tag = GHOSTTY_SCROLL_VIEWPORT_ROW;
+        sb.value.row = static_cast<size_t>(targetRow);
+    }
+
+    ghostty_terminal_scroll_viewport(m_terminal, sb);
+    updateRenderState(false);
+    update();
+}
+
+void TerminalWidget::updateScrollbarHoverState(const QPointF &pos) {
+    const bool hovered = isInScrollbarZone(pos);
+    if (hovered != m_scrollbarHovered) {
+        m_scrollbarHovered = hovered;
+        update();
+    }
+    if (m_scrollbarDragging || m_scrollbarHovered) {
+        setCursor(Qt::ArrowCursor);
+    } else {
+        unsetCursor();
+    }
+}
+
 void TerminalWidget::mousePressEvent(QMouseEvent *event) {
     setFocus(Qt::MouseFocusReason);
     Q_EMIT focused(this);
+
+    if (isInScrollbarZone(event->position())) {
+        if (event->button() == Qt::LeftButton) {
+            QRectF trackRect;
+            QRectF thumbRect;
+            if (computeScrollbarGeometry(trackRect, thumbRect)) {
+                const qreal py = event->position().y();
+                m_scrollbarDragging = true;
+                if (py >= thumbRect.top() - 2.0 && py <= thumbRect.bottom() + 2.0) {
+                    m_scrollbarDragGrabOffset = py - thumbRect.top();
+                } else {
+                    m_scrollbarDragGrabOffset = thumbRect.height() * 0.5;
+                    scrollViewportToThumbTop(py - m_scrollbarDragGrabOffset);
+                }
+                updateScrollbarHoverState(event->position());
+                update();
+            }
+        }
+        event->accept();
+        return;
+    }
 
     const bool shiftBypass = event->modifiers().testFlag(Qt::ShiftModifier);
     bool tracking = false;
@@ -1614,6 +1738,14 @@ void TerminalWidget::mousePressEvent(QMouseEvent *event) {
 }
 
 void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
+    if (m_scrollbarDragging && event->button() == Qt::LeftButton) {
+        m_scrollbarDragging = false;
+        updateScrollbarHoverState(event->position());
+        update();
+        event->accept();
+        return;
+    }
+
     const bool shiftBypass = event->modifiers().testFlag(Qt::ShiftModifier);
     bool tracking = false;
     if (!shiftBypass && m_terminal) {
@@ -1630,6 +1762,24 @@ void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
 }
 
 void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
+    if (m_scrollbarDragging) {
+        if (!event->buttons().testFlag(Qt::LeftButton)) {
+            m_scrollbarDragging = false;
+            updateScrollbarHoverState(event->position());
+            update();
+            return;
+        }
+        scrollViewportToThumbTop(event->position().y() - m_scrollbarDragGrabOffset);
+        event->accept();
+        return;
+    }
+
+    updateScrollbarHoverState(event->position());
+    if (m_scrollbarHovered && !m_selecting && event->buttons() == Qt::NoButton) {
+        event->accept();
+        return;
+    }
+
     const bool shiftBypass = event->modifiers().testFlag(Qt::ShiftModifier);
     bool tracking = false;
     if (!shiftBypass && m_terminal) {
@@ -1652,6 +1802,17 @@ void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
     if (m_selecting && event->buttons().testFlag(Qt::LeftButton)) {
         handleSelectionMouseMove(event);
     }
+}
+
+void TerminalWidget::leaveEvent(QEvent *event) {
+    if (m_scrollbarHovered) {
+        m_scrollbarHovered = false;
+        if (!m_scrollbarDragging) {
+            unsetCursor();
+        }
+        update();
+    }
+    QWidget::leaveEvent(event);
 }
 
 void TerminalWidget::wheelEvent(QWheelEvent *event) {
