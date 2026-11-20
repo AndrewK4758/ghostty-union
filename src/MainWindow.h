@@ -38,7 +38,7 @@ private:
     void requestCloseTabAt(int index);
     void dismissTabCloseModal(bool restoreFocus);
     void confirmPendingTabClose();
-    void closeTabAt(int index, bool allowWindowClose);
+    void closeTabAt(int index);
     void wireShortcuts();
     void updateWindowTitle();
 
