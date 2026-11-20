@@ -10,6 +10,7 @@
 #include <QDBusPendingReply>
 #include <QDateTime>
 #include <QDir>
+#include <QEasingCurve>
 #include <QFile>
 #include <QFont>
 #include <QFontMetrics>
@@ -24,10 +25,12 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QRadialGradient>
 #include <QRegularExpression>
 #include <QSizePolicy>
 #include <QTimer>
 #include <QUrl>
+#include <QVariantAnimation>
 
 #include <algorithm>
 #include <cmath>
@@ -266,7 +269,7 @@ private:
 };
 
 /**
- * Custom-painted rounded clock pill centering the local date and 1s clock inside a flexible width.
+ * Custom-painted Solar Forge glassmorphic clock pill with hover glow and 1s tick pulse.
  */
 class ClockPillWidget final : public QWidget {
 public:
@@ -278,19 +281,43 @@ public:
         setFixedHeight(kCardHeightPx);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setFocusPolicy(Qt::NoFocus);
+        setMouseTracking(true);
 
         const QFontMetrics fmDate(m_dateFont);
         const QFontMetrics fmTime(m_timeFont);
-        m_preferredWidth = 10 + fmDate.horizontalAdvance(QStringLiteral("Wed Sep 30"))
-                           + 8 + fmTime.horizontalAdvance(QStringLiteral("23:59:59")) + 10;
+        m_preferredWidth = 12 + fmDate.horizontalAdvance(QStringLiteral("Wed Sep 30"))
+                           + 14 + fmTime.horizontalAdvance(QStringLiteral("23:59:59")) + 12;
+
+        m_hoverAnim = new QVariantAnimation(this);
+        m_hoverAnim->setDuration(150);
+        m_hoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_hoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_hoverProgress = v.toReal();
+            update();
+        });
+
+        m_tickAnim = new QVariantAnimation(this);
+        m_tickAnim->setDuration(320);
+        m_tickAnim->setEasingCurve(QEasingCurve::OutQuad);
+        QObject::connect(m_tickAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_tickGlow = v.toReal();
+            update();
+        });
     }
 
     void setDateTimeText(const QString &dateText, const QString &timeText) {
         if (m_dateText == dateText && m_timeText == timeText) {
             return;
         }
+        const bool hadPrevious = !m_timeText.isEmpty();
         m_dateText = dateText;
         m_timeText = timeText;
+        if (hadPrevious && isVisible()) {
+            m_tickAnim->stop();
+            m_tickAnim->setStartValue(1.0);
+            m_tickAnim->setEndValue(0.0);
+            m_tickAnim->start();
+        }
         update();
     }
 
@@ -303,16 +330,74 @@ public:
     }
 
 protected:
+    void enterEvent(QEnterEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(1.0);
+        m_hoverAnim->start();
+        QWidget::enterEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(0.0);
+        m_hoverAnim->start();
+        QWidget::leaveEvent(event);
+    }
+
     void paintEvent(QPaintEvent * /*event*/) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
 
         const QRectF cardRect = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-        p.setBrush(QColor(0, 0, 0, 65));
-        p.setPen(QPen(QColor(GhosttyUnionTheme::kDividerHex), 1.0));
-        p.drawRoundedRect(cardRect, 6.0, 6.0);
+        constexpr qreal radius = 8.0;
+        QPainterPath clip;
+        clip.addRoundedRect(cardRect, radius, radius);
 
-        const int avail = std::max(0, width() - 20);
+        p.save();
+        p.setClipPath(clip);
+
+        // Obsidian glass surface gradient
+        QLinearGradient bg(cardRect.topLeft(), cardRect.bottomLeft());
+        bg.setColorAt(0.0, QColor(0x27, 0x25, 0x2F, 225));
+        bg.setColorAt(1.0, QColor(0x1B, 0x1A, 0x21, 235));
+        p.fillRect(cardRect, bg);
+
+        // Subtle warm Solar Forge hover sheen
+        if (m_hoverProgress > 0.01) {
+            QRadialGradient hoverGlow(QPointF(cardRect.center().x(), cardRect.top()), cardRect.width() * 0.65);
+            hoverGlow.setColorAt(0.0, QColor(255, 211, 0, static_cast<int>(36.0 * m_hoverProgress)));
+            hoverGlow.setColorAt(1.0, QColor(0, 0, 0, 0));
+            p.fillRect(cardRect, hoverGlow);
+        }
+
+        // Right-side Solar Forge gold vertical accent pill
+        QLinearGradient barGrad(QPointF(0.0, cardRect.top() + 5.0), QPointF(0.0, cardRect.bottom() - 5.0));
+        barGrad.setColorAt(0.0, QColor(GhosttyUnionTheme::kGoldHex));
+        barGrad.setColorAt(1.0, QColor(GhosttyUnionTheme::kAmberHex));
+        p.setPen(Qt::NoPen);
+        p.setBrush(barGrad);
+        p.drawRoundedRect(QRectF(cardRect.right() - 4.0, cardRect.top() + 6.0, 2.5, cardRect.height() - 12.0), 1.25, 1.25);
+
+        // Top glass specular rim
+        p.fillRect(QRectF(cardRect.left() + 6.0, cardRect.top() + 0.5, cardRect.width() - 12.0, 1.0),
+                   QColor(255, 255, 255, static_cast<int>(24 + 26 * m_hoverProgress)));
+        p.restore();
+
+        QColor borderCol = QColor(GhosttyUnionTheme::kChromeBorderHex);
+        if (m_hoverProgress > 0.01) {
+            borderCol = QColor(
+                static_cast<int>(borderCol.red() + (255 - borderCol.red()) * m_hoverProgress * 0.65),
+                static_cast<int>(borderCol.green() + (211 - borderCol.green()) * m_hoverProgress * 0.65),
+                static_cast<int>(borderCol.blue() + (0 - borderCol.blue()) * m_hoverProgress * 0.65),
+                static_cast<int>(175 + 65 * m_hoverProgress));
+        }
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(borderCol, 1.0));
+        p.drawPath(clip);
+
+        const int avail = std::max(0, width() - 24);
         if (avail <= 0) {
             return;
         }
@@ -321,27 +406,48 @@ protected:
         const QFontMetrics fmTime(m_timeFont);
         const int dateW = fmDate.horizontalAdvance(m_dateText);
         const int timeW = fmTime.horizontalAdvance(m_timeText);
+        constexpr int sepW = 14;
 
-        if (avail >= dateW + 8 + timeW) {
-            const int startX = 10 + (avail - (dateW + 8 + timeW)) / 2;
+        auto drawSepDot = [&](int dotCenterX) {
+            const qreal cy = height() * 0.5;
+            if (m_tickGlow > 0.02) {
+                QColor halo(GhosttyUnionTheme::kGoldHex);
+                halo.setAlpha(static_cast<int>(85.0 * m_tickGlow));
+                p.setPen(Qt::NoPen);
+                p.setBrush(halo);
+                p.drawEllipse(QPointF(dotCenterX, cy), 3.2 + 2.2 * m_tickGlow, 3.2 + 2.2 * m_tickGlow);
+            }
+            QColor dotCol(GhosttyUnionTheme::kAmberHex);
+            dotCol.setAlpha(static_cast<int>(165 + 90 * m_tickGlow));
+            p.setPen(Qt::NoPen);
+            p.setBrush(dotCol);
+            p.drawEllipse(QPointF(dotCenterX, cy), 1.8, 1.8);
+        };
+
+        if (avail >= dateW + sepW + timeW) {
+            const int startX = 10 + (avail - (dateW + sepW + timeW)) / 2;
             p.setFont(m_dateFont);
             p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
             p.drawText(QRect(startX, 0, dateW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_dateText);
 
+            drawSepDot(startX + dateW + sepW / 2);
+
             p.setFont(m_timeFont);
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            p.drawText(QRect(startX + dateW + 8, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
-        } else if (avail > timeW + 20) {
-            const QString elidedDate = fmDate.elidedText(m_dateText, Qt::ElideRight, avail - timeW - 8);
+            p.drawText(QRect(startX + dateW + sepW, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
+        } else if (avail > timeW + 24) {
+            const QString elidedDate = fmDate.elidedText(m_dateText, Qt::ElideRight, avail - timeW - sepW);
             const int edW = fmDate.horizontalAdvance(elidedDate);
-            const int startX = 10 + (avail - (edW + 8 + timeW)) / 2;
+            const int startX = 10 + (avail - (edW + sepW + timeW)) / 2;
             p.setFont(m_dateFont);
             p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
             p.drawText(QRect(startX, 0, edW, height()), Qt::AlignVCenter | Qt::AlignLeft, elidedDate);
 
+            drawSepDot(startX + edW + sepW / 2);
+
             p.setFont(m_timeFont);
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            p.drawText(QRect(startX + edW + 8, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
+            p.drawText(QRect(startX + edW + sepW, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
         } else {
             p.setFont(m_timeFont);
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
@@ -356,10 +462,15 @@ private:
     QString m_dateText;
     QString m_timeText;
     int m_preferredWidth = kMinItemWidthPx;
+    QVariantAnimation *m_hoverAnim = nullptr;
+    QVariantAnimation *m_tickAnim = nullptr;
+    qreal m_hoverProgress = 0.0;
+    qreal m_tickGlow = 0.0;
 };
 
 /**
- * Custom-painted rounded telemetry card supporting GaugeSpark, NetDualSpark, and VpnStatus modes.
+ * Custom-painted Solar Forge glassmorphic telemetry card with smooth hover,
+ * animated progress gauges, smoothed cubic sparklines, copy shimmer, and live VPN pulse.
  */
 class StatsCardWidget final : public QWidget {
 public:
@@ -383,10 +494,49 @@ public:
         setMouseTracking(true);
         setFocusPolicy(Qt::NoFocus);
 
+        m_hoverAnim = new QVariantAnimation(this);
+        m_hoverAnim->setDuration(150);
+        m_hoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_hoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_hoverProgress = v.toReal();
+            update();
+        });
+
+        m_gaugeAnim = new QVariantAnimation(this);
+        m_gaugeAnim->setDuration(360);
+        m_gaugeAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_gaugeAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_displayPercent = v.toReal();
+            update();
+        });
+
+        m_copiedAnim = new QVariantAnimation(this);
+        m_copiedAnim->setDuration(260);
+        m_copiedAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_copiedAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_copiedGlow = v.toReal();
+            update();
+        });
+
+        m_vpnPulseAnim = new QVariantAnimation(this);
+        m_vpnPulseAnim->setDuration(1800);
+        m_vpnPulseAnim->setStartValue(0.0);
+        m_vpnPulseAnim->setEndValue(1.0);
+        m_vpnPulseAnim->setLoopCount(-1);
+        m_vpnPulseAnim->setEasingCurve(QEasingCurve::InOutSine);
+        QObject::connect(m_vpnPulseAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_vpnPulsePhase = v.toReal();
+            update();
+        });
+
         m_copiedTimer.setSingleShot(true);
-        m_copiedTimer.setInterval(900);
+        m_copiedTimer.setInterval(950);
         QObject::connect(&m_copiedTimer, &QTimer::timeout, this, [this]() {
             m_copiedFlash = false;
+            m_copiedAnim->stop();
+            m_copiedAnim->setStartValue(m_copiedGlow);
+            m_copiedAnim->setEndValue(0.0);
+            m_copiedAnim->start();
             update();
         });
     }
@@ -400,8 +550,8 @@ public:
         m_sampleValueText = sampleValueText;
         const QFontMetrics fmVal(m_valueFont);
         const QFontMetrics fmTag(m_tagFont);
-        const int padLeft = (m_mode == Mode::VpnStatus) ? 24 : 9;
-        const int tagW = m_tag.isEmpty() ? 0 : (fmTag.horizontalAdvance(m_tag) + 6);
+        const int padLeft = (m_mode == Mode::VpnStatus) ? 26 : 12;
+        const int tagW = m_tag.isEmpty() ? 0 : (fmTag.horizontalAdvance(m_tag) + 14);
         m_sampleValWidth = fmVal.horizontalAdvance(sampleValueText);
         const int sparkW = (m_mode == Mode::GaugeSpark) ? (kGaugeBaseSparkWidthPx + 8) : 0;
         m_preferredWidth = padLeft + tagW + m_sampleValWidth + sparkW + 9;
@@ -421,7 +571,7 @@ public:
         const QFontMetrics fmCompact(m_compactFont);
         m_ipColWidth = fmCompact.horizontalAdvance(ipSample);
         m_rateColWidth = fmCompact.horizontalAdvance(rateSample);
-        m_preferredWidth = 9 + m_ipColWidth + 10 + m_rateColWidth + 8 + kNetBaseSparkWidthPx + 9;
+        m_preferredWidth = 12 + m_ipColWidth + 10 + m_rateColWidth + 8 + kNetBaseSparkWidthPx + 9;
         updateGeometry();
     }
 
@@ -435,8 +585,18 @@ public:
 
     void setGaugeData(const QString &valueText, double percent, const QColor &accent) {
         m_valueText = valueText;
-        m_percent = std::clamp(percent, 0.0, 100.0);
+        const double clamped = std::clamp(percent, 0.0, 100.0);
         m_accent = accent;
+        if (std::abs(clamped - m_percent) > 0.25 && isVisible()) {
+            m_percent = clamped;
+            m_gaugeAnim->stop();
+            m_gaugeAnim->setStartValue(m_displayPercent);
+            m_gaugeAnim->setEndValue(m_percent);
+            m_gaugeAnim->start();
+        } else {
+            m_percent = clamped;
+            m_displayPercent = clamped;
+        }
         update();
     }
 
@@ -446,6 +606,9 @@ public:
         m_publicIpText = publicIpText;
         m_downText = downText;
         m_upText = upText;
+        m_accent = (privateIpText == QLatin1String("offline"))
+                       ? QColor(GhosttyUnionTheme::kDimTextHex)
+                       : QColor(GhosttyUnionTheme::kCyanHex);
         m_valueText = QStringLiteral("PRI %1 | PUB %2  %3 %4")
                           .arg(privateIpText, publicIpText, downText, upText);
         update();
@@ -455,6 +618,7 @@ public:
         m_valueText = valueText;
         m_online = online;
         m_accent = accent;
+        syncVpnPulseState();
         update();
     }
 
@@ -484,16 +648,34 @@ public:
     }
 
 protected:
+    void showEvent(QShowEvent *event) override {
+        QWidget::showEvent(event);
+        syncVpnPulseState();
+    }
+
+    void hideEvent(QHideEvent *event) override {
+        QWidget::hideEvent(event);
+        if (m_vpnPulseAnim && m_vpnPulseAnim->state() == QAbstractAnimation::Running) {
+            m_vpnPulseAnim->stop();
+        }
+    }
+
     void enterEvent(QEnterEvent *event) override {
         m_hovered = true;
         m_hoverPos = event->position().toPoint();
-        update();
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(1.0);
+        m_hoverAnim->start();
         QWidget::enterEvent(event);
     }
 
     void leaveEvent(QEvent *event) override {
         m_hovered = false;
-        update();
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(0.0);
+        m_hoverAnim->start();
         QWidget::leaveEvent(event);
     }
 
@@ -511,6 +693,10 @@ protected:
             if (!flashMsg.isEmpty()) {
                 m_copiedMessage = flashMsg;
                 m_copiedFlash = true;
+                m_copiedAnim->stop();
+                m_copiedAnim->setStartValue(0.0);
+                m_copiedAnim->setEndValue(1.0);
+                m_copiedAnim->start();
                 m_copiedTimer.start();
                 update();
             }
@@ -523,14 +709,62 @@ protected:
         p.setRenderHint(QPainter::Antialiasing, true);
 
         const QRectF cardRect = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-        QColor fillCol = palette().color(QPalette::Base);
-        fillCol.setAlpha(m_hovered ? 215 : 170);
-        const QColor borderCol = m_hovered ? QColor(255, 211, 0, 95)
-                                           : QColor(GhosttyUnionTheme::kDividerHex);
+        constexpr qreal radius = 8.0;
+        QPainterPath clip;
+        clip.addRoundedRect(cardRect, radius, radius);
 
-        p.setBrush(fillCol);
+        p.save();
+        p.setClipPath(clip);
+
+        // Obsidian glass surface gradient
+        QLinearGradient bgGrad(cardRect.topLeft(), cardRect.bottomLeft());
+        bgGrad.setColorAt(0.0, QColor(0x2A, 0x28, 0x33, 232));
+        bgGrad.setColorAt(1.0, QColor(0x1D, 0x1C, 0x23, 240));
+        p.fillRect(cardRect, bgGrad);
+
+        // Subtle left-side semantic ambient glow
+        QRadialGradient accentBloom(QPointF(cardRect.left() + 6.0, cardRect.center().y()), 48.0);
+        QColor bloomCol = m_accent;
+        bloomCol.setAlpha(static_cast<int>(26 + 24 * m_hoverProgress));
+        accentBloom.setColorAt(0.0, bloomCol);
+        accentBloom.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.fillRect(cardRect, accentBloom);
+
+        // Smooth animated Solar Forge hover / copy shimmer wash
+        const qreal highlight = std::max(m_hoverProgress, m_copiedGlow);
+        if (highlight > 0.01) {
+            QRadialGradient topSheen(QPointF(cardRect.center().x(), cardRect.top()), cardRect.width() * 0.65);
+            topSheen.setColorAt(0.0, QColor(255, 211, 0, static_cast<int>((m_copiedFlash ? 58.0 : 34.0) * highlight)));
+            topSheen.setColorAt(1.0, QColor(0, 0, 0, 0));
+            p.fillRect(cardRect, topSheen);
+        }
+
+        // Luminous 2.5px left accent pill
+        const QColor barCol = m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent;
+        p.setPen(Qt::NoPen);
+        p.setBrush(barCol);
+        p.drawRoundedRect(QRectF(cardRect.left() + 2.0, cardRect.top() + 5.5, 2.5, cardRect.height() - 11.0),
+                          1.25, 1.25);
+
+        // Crisp glassmorphic top highlight hairline
+        p.fillRect(QRectF(cardRect.left() + 8.0, cardRect.top() + 0.5, cardRect.width() - 16.0, 1.0),
+                   QColor(255, 255, 255, static_cast<int>(24 + 30 * highlight)));
+        p.restore();
+
+        // Border shifts smoothly toward Solar Forge gold on hover/copy
+        QColor borderCol(GhosttyUnionTheme::kChromeBorderHex);
+        if (highlight > 0.01) {
+            const QColor targetBorder = m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex)
+                                                      : QColor(255, 211, 0, 160);
+            borderCol = QColor(
+                static_cast<int>(borderCol.red() + (targetBorder.red() - borderCol.red()) * highlight),
+                static_cast<int>(borderCol.green() + (targetBorder.green() - borderCol.green()) * highlight),
+                static_cast<int>(borderCol.blue() + (targetBorder.blue() - borderCol.blue()) * highlight),
+                static_cast<int>(185 + 70 * highlight));
+        }
+        p.setBrush(Qt::NoBrush);
         p.setPen(QPen(borderCol, 1.0));
-        p.drawRoundedRect(cardRect, 6.0, 6.0);
+        p.drawPath(clip);
 
         if (m_mode == Mode::GaugeSpark) {
             paintGaugeSpark(p);
@@ -542,6 +776,19 @@ protected:
     }
 
 private:
+    void syncVpnPulseState() {
+        if (!m_vpnPulseAnim) {
+            return;
+        }
+        if (m_mode == Mode::VpnStatus && m_online && isVisible()) {
+            if (m_vpnPulseAnim->state() != QAbstractAnimation::Running) {
+                m_vpnPulseAnim->start();
+            }
+        } else if (m_vpnPulseAnim->state() == QAbstractAnimation::Running) {
+            m_vpnPulseAnim->stop();
+        }
+    }
+
     static void drawSparkSeries(QPainter &p, const QRectF &box, const std::deque<double> &samples,
                                 double maxScale, const QColor &lineColor, bool fillUnder) {
         if (samples.empty() || box.width() <= 2.0 || box.height() <= 2.0) {
@@ -552,61 +799,82 @@ private:
         const qreal stepX = box.width() / static_cast<qreal>(kMaxSamples - 1);
         const qreal startX = box.right() - static_cast<qreal>(n > 0 ? n - 1 : 0) * stepX;
 
-        QPainterPath linePath;
+        std::vector<QPointF> pts;
+        pts.reserve(n);
         for (size_t i = 0; i < n; ++i) {
             const double norm = std::clamp(samples[i] / denom, 0.0, 1.0);
             const qreal x = (n == 1) ? box.left() : (startX + static_cast<qreal>(i) * stepX);
-            const qreal y = box.bottom() - norm * (box.height() - 2.0) - 1.0;
-            if (i == 0) {
-                linePath.moveTo(x, y);
-            } else {
-                linePath.lineTo(x, y);
-            }
+            const qreal y = box.bottom() - norm * (box.height() - 3.0) - 1.5;
+            pts.emplace_back(x, y);
         }
+
+        QPainterPath linePath;
+        linePath.moveTo(pts.front());
         if (n == 1) {
-            linePath.lineTo(box.right(), linePath.currentPosition().y());
+            linePath.lineTo(box.right(), pts.front().y());
+        } else {
+            for (size_t i = 1; i < n; ++i) {
+                const QPointF &prev = pts[i - 1];
+                const QPointF &cur = pts[i];
+                const qreal midX = (prev.x() + cur.x()) * 0.5;
+                linePath.cubicTo(QPointF(midX, prev.y()), QPointF(midX, cur.y()), cur);
+            }
         }
 
         if (fillUnder) {
             QPainterPath fillPath = linePath;
-            const qreal firstX = (n == 1) ? box.left() : startX;
+            const qreal firstX = pts.front().x();
             fillPath.lineTo(box.right(), box.bottom());
             fillPath.lineTo(firstX, box.bottom());
             fillPath.closeSubpath();
 
             QLinearGradient grad(box.topLeft(), box.bottomLeft());
             QColor topC = lineColor;
-            topC.setAlpha(85);
+            topC.setAlpha(108);
+            QColor midC = lineColor;
+            midC.setAlpha(36);
             QColor botC = lineColor;
-            botC.setAlpha(8);
+            botC.setAlpha(4);
             grad.setColorAt(0.0, topC);
+            grad.setColorAt(0.65, midC);
             grad.setColorAt(1.0, botC);
             p.fillPath(fillPath, grad);
         }
 
-        p.setPen(QPen(lineColor, 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setPen(QPen(lineColor, 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         p.setBrush(Qt::NoBrush);
         p.drawPath(linePath);
+
+        // Glowing live sample dot at the latest point
+        const QPointF tip = (n == 1) ? QPointF(box.right(), pts.front().y()) : pts.back();
+        QColor halo = lineColor;
+        halo.setAlpha(90);
+        p.setPen(Qt::NoPen);
+        p.setBrush(halo);
+        p.drawEllipse(tip, 3.0, 3.0);
+        p.setBrush(lineColor.lighter(125));
+        p.drawEllipse(tip, 1.5, 1.5);
     }
 
     void paintGaugeSpark(QPainter &p) const {
-        constexpr int leftPad = 9;
+        constexpr int leftPad = 10;
         const int rightEdge = width() - 9;
-        constexpr int textTop = 3;
-        const int textH = height() - 10;
+        constexpr int textTop = 2;
+        const int textH = height() - 9;
 
         const QFontMetrics fmTag(m_tagFont);
         const QFontMetrics fmVal(m_valueFont);
-        const int tagW = fmTag.horizontalAdvance(m_tag);
+        const int rawTagW = fmTag.horizontalAdvance(m_tag);
+        const int pillTagW = rawTagW + 10;
         const int actualValW = fmVal.horizontalAdvance(m_valueText);
 
         int sparkLeft = 0;
         int sparkW = 0;
         if (width() >= m_preferredWidth) {
-            sparkLeft = leftPad + tagW + 6 + std::max(m_sampleValWidth, actualValW) + 8;
+            sparkLeft = leftPad + pillTagW + 6 + std::max(m_sampleValWidth, actualValW) + 8;
             sparkW = std::max(0, rightEdge - sparkLeft);
         } else {
-            const int minSparkLeft = leftPad + tagW + 6 + actualValW + 6;
+            const int minSparkLeft = leftPad + pillTagW + 6 + actualValW + 6;
             const int candidateSparkW = rightEdge - minSparkLeft;
             if (candidateSparkW >= kMinSparkWidthPx) {
                 sparkW = std::min(kGaugeBaseSparkWidthPx, candidateSparkW);
@@ -620,51 +888,66 @@ private:
         const int textRight = (sparkW > 0) ? (sparkLeft - 6) : rightEdge;
         int x = leftPad;
 
-        if (textRight > x) {
-            p.setFont(m_tagFont);
-            p.setPen(m_accent);
+        if (textRight > x && !m_tag.isEmpty()) {
             const int availTagW = std::max(0, textRight - x);
-            const QString tagText = (availTagW < tagW)
-                                        ? fmTag.elidedText(m_tag, Qt::ElideRight, availTagW)
-                                        : m_tag;
-            const int drawnTagW = std::min(tagW, availTagW);
-            p.drawText(QRect(x, textTop, drawnTagW, textH), Qt::AlignVCenter | Qt::AlignLeft, tagText);
-            x += drawnTagW + 6;
+            const int drawnPillW = std::min(pillTagW, availTagW);
+            if (drawnPillW >= 14) {
+                const QRectF pillRect(x, textTop + 3.0, drawnPillW, textH - 6.0);
+                QColor pillBg = m_accent;
+                pillBg.setAlpha(30);
+                QColor pillBorder = m_accent;
+                pillBorder.setAlpha(95);
+                p.setBrush(pillBg);
+                p.setPen(QPen(pillBorder, 0.9));
+                p.drawRoundedRect(pillRect, 4.5, 4.5);
+
+                p.setFont(m_tagFont);
+                p.setPen(m_accent.lighter(110));
+                const QString tagText = fmTag.elidedText(m_tag, Qt::ElideRight, std::max(4, drawnPillW - 8));
+                p.drawText(pillRect, Qt::AlignCenter, tagText);
+                x += drawnPillW + 6;
+            }
         }
 
         if (textRight > x) {
             p.setFont(m_valueFont);
-            p.setPen(palette().color(QPalette::WindowText));
+            p.setPen(QColor(GhosttyUnionTheme::kChromeTextHex));
             const int availValW = textRight - x;
             const QString valText = fmVal.elidedText(m_valueText, Qt::ElideRight, availValW);
             p.drawText(QRect(x, textTop, availValW, textH), Qt::AlignVCenter | Qt::AlignLeft, valText);
         }
 
         if (sparkW >= kMinSparkWidthPx) {
-            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 5.0, static_cast<qreal>(sparkW), 18.0);
+            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 4.5, static_cast<qreal>(sparkW), 18.5);
             drawSparkSeries(p, sparkBox, m_primaryHistory, 100.0, m_accent, true);
         }
 
-        // Bottom inset progress gauge
-        const qreal trackW = std::max(0.0, static_cast<qreal>(width()) - 14.0);
+        // Smooth animated bottom inset Solar Forge gradient gauge
+        const qreal trackW = std::max(0.0, static_cast<qreal>(width()) - 18.0);
         if (trackW > 0.0) {
-            const QRectF trackRect(7.0, height() - 4.5, trackW, 2.5);
+            const QRectF trackRect(10.0, height() - 5.0, trackW, 2.8);
             p.setPen(Qt::NoPen);
-            p.setBrush(QColor(255, 255, 255, 24));
-            p.drawRoundedRect(trackRect, 1.25, 1.25);
+            p.setBrush(QColor(255, 255, 255, 22));
+            p.drawRoundedRect(trackRect, 1.4, 1.4);
 
-            if (m_percent > 0.0) {
-                const qreal fillW = std::max(3.0, trackRect.width() * (m_percent / 100.0));
-                const QRectF fillRect(trackRect.left(), trackRect.top(),
-                                      std::min(trackRect.width(), fillW), trackRect.height());
-                p.setBrush(m_accent);
-                p.drawRoundedRect(fillRect, 1.25, 1.25);
+            if (m_displayPercent > 0.1) {
+                const qreal fillW = std::min(trackRect.width(),
+                                             std::max(3.5, trackRect.width() * (m_displayPercent / 100.0)));
+                const QRectF fillRect(trackRect.left(), trackRect.top(), fillW, trackRect.height());
+                QLinearGradient gaugeGrad(fillRect.topLeft(), fillRect.topRight());
+                QColor startC = m_accent;
+                startC.setAlpha(155);
+                gaugeGrad.setColorAt(0.0, startC);
+                gaugeGrad.setColorAt(0.85, m_accent);
+                gaugeGrad.setColorAt(1.0, m_accent.lighter(135));
+                p.setBrush(gaugeGrad);
+                p.drawRoundedRect(fillRect, 1.4, 1.4);
             }
         }
     }
 
     void paintNetDualSpark(QPainter &p) const {
-        constexpr int leftPad = 9;
+        constexpr int leftPad = 11;
         const int rightEdge = width() - 9;
 
         const QFontMetrics fm(m_compactFont);
@@ -723,13 +1006,13 @@ private:
             const QRect topIpRect(ipX, 2, ipW, 14);
             const QRect botIpRect(ipX, 16, ipW, 14);
 
-            if (m_hovered && ipW > 0) {
+            if (m_hoverProgress > 0.02 && ipW > 0) {
                 const bool hoverTop = (m_hoverPos.y() < height() / 2);
-                const QRectF hlRect = QRectF(hoverTop ? topIpRect : botIpRect).adjusted(-2.0, 0.0, 2.0, 0.0);
+                const QRectF hlRect = QRectF(hoverTop ? topIpRect : botIpRect).adjusted(-3.0, 0.5, 3.0, -0.5);
                 p.save();
-                p.setPen(Qt::NoPen);
-                p.setBrush(QColor(255, 211, 0, 22));
-                p.drawRoundedRect(hlRect, 3.0, 3.0);
+                p.setPen(QPen(QColor(255, 211, 0, static_cast<int>(70.0 * m_hoverProgress)), 0.8));
+                p.setBrush(QColor(255, 211, 0, static_cast<int>(28.0 * m_hoverProgress)));
+                p.drawRoundedRect(hlRect, 4.0, 4.0);
                 p.restore();
             }
 
@@ -779,7 +1062,7 @@ private:
         }
 
         if (sparkW >= kMinSparkWidthPx) {
-            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 6.0, static_cast<qreal>(sparkW), 20.0);
+            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 5.5, static_cast<qreal>(sparkW), 21.0);
             double peak = 65536.0;
             for (double v : m_primaryHistory) {
                 peak = std::max(peak, v);
@@ -794,29 +1077,33 @@ private:
 
     void paintVpnStatus(QPainter &p) const {
         const qreal cy = height() * 0.5;
-        constexpr qreal cx = 14.0;
+        constexpr qreal cx = 16.0;
         if (m_online) {
+            const qreal pulse = std::sin(m_vpnPulsePhase * 3.14159265358979323846);
+            const qreal haloR = 5.5 + 3.5 * pulse;
             QColor halo = m_accent;
-            halo.setAlpha(55);
+            halo.setAlpha(static_cast<int>(82.0 - 52.0 * pulse));
             p.setPen(Qt::NoPen);
             p.setBrush(halo);
-            p.drawEllipse(QPointF(cx, cy), 7.0, 7.0);
+            p.drawEllipse(QPointF(cx, cy), haloR, haloR);
 
             p.setBrush(m_accent);
-            p.drawEllipse(QPointF(cx, cy), 4.0, 4.0);
+            p.drawEllipse(QPointF(cx, cy), 3.8, 3.8);
+            p.setBrush(QColor(255, 255, 255, 160));
+            p.drawEllipse(QPointF(cx - 1.0, cy - 1.0), 1.1, 1.1);
         } else {
             p.setBrush(Qt::NoBrush);
             p.setPen(QPen(QColor(GhosttyUnionTheme::kDimTextHex), 1.4));
             p.drawEllipse(QPointF(cx, cy), 3.5, 3.5);
         }
 
-        const int textW = std::max(0, width() - 32);
+        const int textW = std::max(0, width() - 34);
         if (textW > 0) {
             p.setFont(m_valueFont);
             p.setPen(m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent);
             const QString display = m_copiedFlash ? m_copiedMessage : m_valueText;
             const QFontMetrics fmVal(m_valueFont);
-            p.drawText(QRect(24, 0, textW, height()), Qt::AlignVCenter | Qt::AlignLeft,
+            p.drawText(QRect(26, 0, textW, height()), Qt::AlignVCenter | Qt::AlignLeft,
                        fmVal.elidedText(display, Qt::ElideRight, textW));
         }
     }
@@ -838,14 +1125,22 @@ private:
     int m_rateColWidth = 0;
     int m_preferredWidth = kMinItemWidthPx;
     double m_percent = 0.0;
+    double m_displayPercent = 0.0;
     bool m_online = false;
     QColor m_accent{GhosttyUnionTheme::kGoldHex};
 
     bool m_hovered = false;
     QPoint m_hoverPos;
+    qreal m_hoverProgress = 0.0;
+    qreal m_copiedGlow = 0.0;
+    qreal m_vpnPulsePhase = 0.0;
     bool m_copiedFlash = false;
     QString m_copiedMessage;
     QTimer m_copiedTimer;
+    QVariantAnimation *m_hoverAnim = nullptr;
+    QVariantAnimation *m_gaugeAnim = nullptr;
+    QVariantAnimation *m_copiedAnim = nullptr;
+    QVariantAnimation *m_vpnPulseAnim = nullptr;
     std::function<QString(const QPoint &)> m_onClick;
 
     std::deque<double> m_primaryHistory;
@@ -1084,10 +1379,25 @@ StatsBarWidget::~StatsBarWidget() {
 
 void StatsBarWidget::paintEvent(QPaintEvent *event) {
     QPainter p(this);
-    const QColor barBg = palette().color(QPalette::Window).darker(108);
+    QLinearGradient barBg(0.0, 0.0, 0.0, static_cast<qreal>(height()));
+    barBg.setColorAt(0.0, QColor(0x16, 0x15, 0x1B));
+    barBg.setColorAt(1.0, QColor(0x1C, 0x1B, 0x22));
     p.fillRect(rect(), barBg);
-    p.fillRect(0, 0, width(), 1, QColor(255, 211, 0, 30));
-    p.fillRect(0, height() - 1, width(), 1, QColor(GhosttyUnionTheme::kDividerHex));
+
+    // Subtle Solar Forge top hairline glow
+    QLinearGradient topRibbon(0.0, 0.0, static_cast<qreal>(width()), 0.0);
+    topRibbon.setColorAt(0.0, QColor(255, 211, 0, 12));
+    topRibbon.setColorAt(0.35, QColor(255, 211, 0, 72));
+    topRibbon.setColorAt(0.65, QColor(255, 152, 0, 58));
+    topRibbon.setColorAt(1.0, QColor(255, 61, 0, 14));
+    p.fillRect(0, 0, width(), 1, topRibbon);
+
+    // Crisp bottom divider with warm center highlight
+    QLinearGradient botLine(0.0, 0.0, static_cast<qreal>(width()), 0.0);
+    botLine.setColorAt(0.0, QColor(GhosttyUnionTheme::kDividerHex));
+    botLine.setColorAt(0.5, QColor(0x52, 0x49, 0x3A));
+    botLine.setColorAt(1.0, QColor(GhosttyUnionTheme::kDividerHex));
+    p.fillRect(0, height() - 1, width(), 1, botLine);
     QWidget::paintEvent(event);
 }
 

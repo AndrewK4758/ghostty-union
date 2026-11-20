@@ -8,6 +8,7 @@
 #include <QAbstractButton>
 #include <QApplication> // IWYU pragma: keep
 #include <QClipboard>
+#include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDir> // IWYU pragma: keep
 #include <QFile>
@@ -16,6 +17,8 @@
 #include <QKeyEvent> // IWYU pragma: keep
 #include <QLabel>
 #include <QLayout>
+#include <QLineEdit>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QPushButton>
@@ -1668,6 +1671,130 @@ private Q_SLOTS:
         // Narrowing window below 6 * 90 clamps tabs to minimum floor (90px)
         win.resize(450, 600);
         QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 90, 2000);
+    }
+
+    [[maybe_unused]] static void testTabRenamingModalContextMenusAndSolarForgeChrome() {
+        MainWindow win;
+        win.resize(1100, 640);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+        auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(pane0 && pane0->activeTerminal());
+        TerminalWidget *term0 = pane0->activeTerminal();
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        auto *renameModal = win.findChild<QWidget *>(QStringLiteral("tabRenameModal"));
+        auto *renameInput = win.findChild<QLineEdit *>(QStringLiteral("tabRenameInput"));
+        auto *renameResetBtn = win.findChild<QPushButton *>(QStringLiteral("tabRenameResetButton"));
+        auto *renameSaveBtn = win.findChild<QPushButton *>(QStringLiteral("tabRenameSaveButton"));
+        QVERIFY(renameModal && renameInput && renameResetBtn && renameSaveBtn);
+        QVERIFY(!renameModal->isVisible());
+
+        // 1. Ctrl+Shift+A opens rename modal; Escape cancels and restores terminal focus
+        QTest::keyClick(term0, Qt::Key_A, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        QVERIFY(!renameResetBtn->isVisible());
+        QTRY_VERIFY_WITH_TIMEOUT(renameInput->hasFocus(), 2000);
+        QVERIFY(!win.grab().toImage().isNull());
+
+        QTest::keyClick(renameInput, Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QVERIFY(!pane0->hasCustomTitle());
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // 2. Double-clicking tab opens rename modal; saving sets persistent custom title
+        const QPoint tab0Center = bar->tabRect(0).center();
+        QTest::mouseDClick(bar, Qt::LeftButton, Qt::NoModifier, tab0Center);
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        renameInput->setText(QStringLiteral("API Server"));
+        QTest::keyClick(renameInput, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QVERIFY(pane0->hasCustomTitle());
+        QCOMPARE(pane0->customTitle(), QStringLiteral("API Server"));
+        QCOMPARE(tabs->tabText(0), QStringLiteral("API Server"));
+        QVERIFY(win.windowTitle().startsWith(QLatin1String("API Server")));
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // Dynamic shell OSC 2 title changes must NOT overwrite a custom tab name
+        term0->feedVtBytes(QByteArrayLiteral("\x1b]2;/tmp/dynamic-shell-title\x07"));
+        QApplication::processEvents();
+        QCOMPARE(tabs->tabText(0), QStringLiteral("API Server"));
+
+        // 3. Re-opening rename modal exposes Reset button; clicking Reset restores live shell title
+        QTest::keyClick(term0, Qt::Key_A, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        QVERIFY(renameResetBtn->isVisible());
+        QTest::mouseClick(renameResetBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QVERIFY(!pane0->hasCustomTitle());
+        QCOMPARE(tabs->tabText(0), QStringLiteral("/tmp/dynamic-shell-title"));
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // 4. Tab bar right-click opens Solar Forge context menu with Rename / Duplicate / Close
+        QContextMenuEvent tabCtxEv(QContextMenuEvent::Mouse, tab0Center, bar->mapToGlobal(tab0Center));
+        QCoreApplication::sendEvent(bar, &tabCtxEv);
+        auto *tabMenu = win.findChild<QMenu *>(QStringLiteral("tabBarContextMenu"));
+        QTRY_VERIFY_WITH_TIMEOUT((tabMenu = win.findChild<QMenu *>(QStringLiteral("tabBarContextMenu"))) != nullptr &&
+                                     tabMenu->isVisible(),
+                                 2000);
+        QVERIFY(tabMenu->styleSheet().contains(QLatin1String("#FFD300")));
+        bool hasRenameInTabMenu = false;
+        bool hasDuplicateInTabMenu = false;
+        QAction *dupAction = nullptr;
+        for (QAction *act : tabMenu->actions()) {
+            if (act->text().contains(QLatin1String("Rename Tab"))) {
+                hasRenameInTabMenu = true;
+            }
+            if (act->text().contains(QLatin1String("Duplicate Tab"))) {
+                hasDuplicateInTabMenu = true;
+                dupAction = act;
+            }
+        }
+        QVERIFY(hasRenameInTabMenu);
+        QVERIFY(hasDuplicateInTabMenu);
+        QVERIFY(dupAction != nullptr);
+        dupAction->trigger();
+        tabMenu->close();
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+
+        // Switching tabs drives sliding Solar Forge active indicator & paints cleanly
+        tabs->setCurrentIndex(0);
+        QApplication::processEvents();
+        tabs->setCurrentIndex(1);
+        QApplication::processEvents();
+        QVERIFY(!win.grab().toImage().isNull());
+
+        // 5. Terminal right-click opens Solar Forge menu with Rename Tab… wired to rename modal
+        auto *pane1 = qobject_cast<TerminalTabPane *>(tabs->widget(1));
+        QVERIFY(pane1 && pane1->activeTerminal());
+        TerminalWidget *term1 = pane1->activeTerminal();
+        QTest::mouseClick(term1, Qt::RightButton, Qt::NoModifier, QPoint(40, 40));
+        QMenu *termMenu = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((termMenu = term1->findChild<QMenu *>(QStringLiteral("terminalContextMenu"))) != nullptr &&
+                                     termMenu->isVisible(),
+                                 2000);
+        QVERIFY(termMenu->styleSheet().contains(QLatin1String("#FFD300")));
+        QAction *termRenameAct = nullptr;
+        for (QAction *act : termMenu->actions()) {
+            if (act->text().contains(QLatin1String("Rename Tab"))) {
+                termRenameAct = act;
+                break;
+            }
+        }
+        QVERIFY(termRenameAct != nullptr);
+        termMenu->close();
+        termRenameAct->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        renameInput->setText(QStringLiteral("Logs"));
+        QTest::mouseClick(renameSaveBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QCOMPARE(tabs->tabText(1), QStringLiteral("Logs"));
     }
 };
 

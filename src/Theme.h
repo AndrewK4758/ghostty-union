@@ -1,6 +1,16 @@
 #pragma once
 
 #include <QColor>
+#include <QEasingCurve>
+#include <QGraphicsOpacityEffect>
+#include <QIcon>
+#include <QMenu>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
+#include <QPointer>
+#include <QPropertyAnimation>
+#include <QString>
 #include <array>
 #include <ghostty/vt.h>
 
@@ -15,6 +25,14 @@ inline constexpr const char *kTealHex = "#80CBC4";
 inline constexpr const char *kCyanHex = "#89DDF7";
 inline constexpr const char *kDividerHex = "#383530";
 inline constexpr const char *kDimTextHex = "#9EA3B0";
+
+// Solar Forge non-text window/chrome obsidian surfaces
+inline constexpr const char *kChromeDeepHex = "#151419";
+inline constexpr const char *kChromeBarHex = "#1B1A20";
+inline constexpr const char *kChromeCardTopHex = "#292731";
+inline constexpr const char *kChromeCardBotHex = "#1E1D24";
+inline constexpr const char *kChromeBorderHex = "#3E3B36";
+inline constexpr const char *kChromeTextHex = "#F1F0F6";
 
 // Ghostty "Ollie" color palette (verified via `ghostty +list-colors --theme=Ollie`)
 inline constexpr GhosttyColorRgb kOllieBackground{0x22, 0x21, 0x25};
@@ -49,6 +67,183 @@ inline QColor toQColor(const GhosttyColorRgb &c) {
 
 inline QColor withAlpha(const GhosttyColorRgb &c, int alpha) {
     return {c.r, c.g, c.b, alpha};
+}
+
+enum class MenuIcon {
+    Copy,
+    Paste,
+    OpenLink,
+    Rename,
+    ResetName,
+    NewTab,
+    Duplicate,
+    SplitRight,
+    SplitDown,
+    Rearrange,
+    ResetTerminal,
+    CloseTab,
+};
+
+inline QIcon makeSolarForgeMenuIcon(MenuIcon kind, const QColor &accent = QColor(kGoldHex)) {
+    constexpr int logical = 16;
+    constexpr qreal dpr = 2.0;
+    QPixmap pm(static_cast<int>(logical * dpr), static_cast<int>(logical * dpr));
+    pm.setDevicePixelRatio(dpr);
+    pm.fill(Qt::transparent);
+
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    const QPen pen(accent, 1.45, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+
+    switch (kind) {
+    case MenuIcon::Copy:
+        p.drawRoundedRect(QRectF(5.5, 4.5, 7.5, 8.5), 1.6, 1.6);
+        p.drawLine(QPointF(3.0, 10.5), QPointF(3.0, 3.0));
+        p.drawLine(QPointF(3.0, 3.0), QPointF(9.5, 3.0));
+        break;
+    case MenuIcon::Paste:
+        p.drawRoundedRect(QRectF(3.5, 3.5, 9.0, 10.0), 1.8, 1.8);
+        p.drawRoundedRect(QRectF(6.0, 2.0, 4.0, 2.4), 0.9, 0.9);
+        p.drawLine(QPointF(6.0, 8.0), QPointF(10.0, 8.0));
+        p.drawLine(QPointF(6.0, 10.8), QPointF(9.0, 10.8));
+        break;
+    case MenuIcon::OpenLink:
+        p.drawRoundedRect(QRectF(2.5, 5.0, 8.0, 8.5), 1.6, 1.6);
+        p.drawLine(QPointF(7.5, 8.5), QPointF(13.5, 2.5));
+        p.drawLine(QPointF(9.5, 2.5), QPointF(13.5, 2.5));
+        p.drawLine(QPointF(13.5, 2.5), QPointF(13.5, 6.5));
+        break;
+    case MenuIcon::Rename: {
+        QPainterPath path;
+        path.moveTo(3.0, 13.0);
+        path.lineTo(5.6, 12.2);
+        path.lineTo(12.6, 5.2);
+        path.lineTo(10.8, 3.4);
+        path.lineTo(3.8, 10.4);
+        path.closeSubpath();
+        p.drawPath(path);
+        p.drawLine(QPointF(9.2, 5.0), QPointF(11.0, 6.8));
+        break;
+    }
+    case MenuIcon::ResetName:
+        p.drawArc(QRectF(3.0, 3.0, 10.0, 10.0), 40 * 16, 290 * 16);
+        p.drawLine(QPointF(12.2, 3.2), QPointF(12.5, 6.5));
+        p.drawLine(QPointF(9.4, 6.0), QPointF(12.5, 6.5));
+        break;
+    case MenuIcon::NewTab:
+        p.drawRoundedRect(QRectF(2.5, 3.0, 11.0, 10.0), 2.0, 2.0);
+        p.drawLine(QPointF(8.0, 5.5), QPointF(8.0, 10.5));
+        p.drawLine(QPointF(5.5, 8.0), QPointF(10.5, 8.0));
+        break;
+    case MenuIcon::Duplicate:
+        p.drawRoundedRect(QRectF(2.5, 4.5, 8.0, 8.5), 1.6, 1.6);
+        p.drawRoundedRect(QRectF(5.5, 2.5, 8.0, 8.5), 1.6, 1.6);
+        break;
+    case MenuIcon::SplitRight:
+        p.drawRoundedRect(QRectF(2.2, 2.8, 11.6, 10.4), 1.8, 1.8);
+        p.drawLine(QPointF(8.0, 2.8), QPointF(8.0, 13.2));
+        break;
+    case MenuIcon::SplitDown:
+        p.drawRoundedRect(QRectF(2.2, 2.8, 11.6, 10.4), 1.8, 1.8);
+        p.drawLine(QPointF(2.2, 8.0), QPointF(13.8, 8.0));
+        break;
+    case MenuIcon::Rearrange:
+        p.drawRoundedRect(QRectF(2.5, 2.5, 4.5, 4.5), 1.0, 1.0);
+        p.drawRoundedRect(QRectF(9.0, 2.5, 4.5, 4.5), 1.0, 1.0);
+        p.drawRoundedRect(QRectF(2.5, 9.0, 4.5, 4.5), 1.0, 1.0);
+        p.drawRoundedRect(QRectF(9.0, 9.0, 4.5, 4.5), 1.0, 1.0);
+        break;
+    case MenuIcon::ResetTerminal:
+        p.drawArc(QRectF(2.8, 2.8, 10.4, 10.4), 60 * 16, 260 * 16);
+        p.drawLine(QPointF(8.0, 2.0), QPointF(8.0, 5.2));
+        p.drawLine(QPointF(8.0, 2.0), QPointF(11.0, 3.4));
+        break;
+    case MenuIcon::CloseTab:
+        p.drawRoundedRect(QRectF(2.5, 2.5, 11.0, 11.0), 2.4, 2.4);
+        p.drawLine(QPointF(5.6, 5.6), QPointF(10.4, 10.4));
+        p.drawLine(QPointF(10.4, 5.6), QPointF(5.6, 10.4));
+        break;
+    }
+
+    return QIcon(pm);
+}
+
+inline QString solarForgeMenuStyleSheet() {
+    return QStringLiteral(
+        "QMenu {"
+        "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2A2832, stop:1 #1C1B22);"
+        "  color: #F0EFF6;"
+        "  border: 1px solid #49453E;"
+        "  border-top: 2px solid %1;"
+        "  border-radius: 10px;"
+        "  padding: 6px 5px;"
+        "  font-size: 12.5px;"
+        "}"
+        "QMenu::item {"
+        "  padding: 6px 26px 6px 12px;"
+        "  margin: 1px 2px;"
+        "  border-radius: 7px;"
+        "  border: 1px solid transparent;"
+        "  background: transparent;"
+        "}"
+        "QMenu::item:selected {"
+        "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+        "    stop:0 rgba(255, 211, 0, 48), stop:0.65 rgba(255, 152, 0, 34), stop:1 rgba(255, 61, 0, 24));"
+        "  color: %1;"
+        "  border: 1px solid rgba(255, 211, 0, 120);"
+        "}"
+        "QMenu::item:disabled {"
+        "  color: #676A7C;"
+        "}"
+        "QMenu::icon {"
+        "  padding-left: 6px;"
+        "}"
+        "QMenu::separator {"
+        "  height: 1px;"
+        "  margin: 5px 10px;"
+        "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+        "    stop:0 transparent, stop:0.25 rgba(255, 211, 0, 58), stop:0.75 rgba(255, 152, 0, 48), stop:1 transparent);"
+        "}"
+        "QMenu::right-arrow {"
+        "  width: 10px;"
+        "  height: 10px;"
+        "  right: 8px;"
+        "}"
+    ).arg(QString::fromLatin1(kGoldHex));
+}
+
+inline void styleSolarForgeMenu(QMenu *menu) {
+    if (!menu) {
+        return;
+    }
+    menu->setAttribute(Qt::WA_TranslucentBackground);
+    menu->setWindowFlags(menu->windowFlags() | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
+    menu->setStyleSheet(solarForgeMenuStyleSheet());
+}
+
+inline void popupSolarForgeMenuAnimated(QMenu *menu, const QPoint &globalPos) {
+    if (!menu) {
+        return;
+    }
+    auto *fx = new QGraphicsOpacityEffect(menu);
+    fx->setOpacity(0.0);
+    menu->setGraphicsEffect(fx);
+    menu->popup(globalPos);
+
+    auto *fade = new QPropertyAnimation(fx, "opacity", menu);
+    fade->setDuration(115);
+    fade->setStartValue(0.0);
+    fade->setEndValue(1.0);
+    fade->setEasingCurve(QEasingCurve::OutCubic);
+    const QPointer<QMenu> guard(menu);
+    QObject::connect(fade, &QPropertyAnimation::finished, menu, [guard]() {
+        if (guard) {
+            guard->setGraphicsEffect(nullptr);
+        }
+    });
+    fade->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
 } // namespace GhosttyUnionTheme
