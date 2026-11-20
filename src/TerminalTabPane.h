@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QList>
 #include <QPointer>
 #include <QSplitter>
 #include <QWidget>
@@ -37,14 +36,15 @@ public:
     explicit TerminalTabPane(TerminalWidget *adoptedTerminal, QWidget *parent = nullptr);
     ~TerminalTabPane() override = default;
 
-    TerminalWidget *activeTerminal() const { return m_active; }
-    QString title() const;
-    QString currentWorkingDirectory() const;
+    [[nodiscard]] TerminalWidget *activeTerminal() const { return m_active; }
+    [[nodiscard]] int terminalCount() const;
+    [[nodiscard]] QString title() const;
+    [[nodiscard]] QString currentWorkingDirectory() const;
 
     void splitActive(Qt::Orientation orientation);
     bool closeActive();
     void navigateSplit(int dx, int dy);
-    void resizeSplit(int dx, int dy, int stepPx = 40);
+    void resizeSplit(int dx, int dy, int stepPx = 40) const;
     bool swapTerminals(TerminalWidget *a, TerminalWidget *b);
     bool dockTerminal(TerminalWidget *source, TerminalWidget *target, DropZone zone);
     bool moveSplit(int dx, int dy);
@@ -72,24 +72,24 @@ private:
     void wireTerminal(TerminalWidget *term);
     void recordFocusedTerminal(TerminalWidget *term);
     void activateTerminal(TerminalWidget *term);
-    TerminalWidget *chooseNextFocusAfterRemoving(TerminalWidget *removing,
-                                                 QSplitter *parentSplitter,
+    TerminalWidget *chooseNextFocusAfterRemoving(const TerminalWidget *removing,
+                                                 const QSplitter *parentSplitter,
                                                  int removedIdx) const;
-    TerminalWidget *findDirectionalNeighbor(TerminalWidget *origin, int dx, int dy) const;
+    TerminalWidget *findDirectionalNeighbor(const TerminalWidget *origin, int dx, int dy) const;
     void removeTerminalWidget(TerminalWidget *term, bool deleteIt);
-    void collapseSingleChildSplitter(QSplitter *splitter);
-    void collectTerminals(QSplitter *root, QList<TerminalWidget *> &out) const;
+    void collapseSingleChildSplitter(QSplitter *splitter) const;
+    static void collectTerminals(const QSplitter *root, QList<TerminalWidget *> &out);
     void setSplitTreeVisibility(QWidget *node, bool unzoomed);
-    void updateSplitDimming();
+    void updateSplitDimming() const;
     bool computeDropTarget(TerminalWidget *source,
                            const QPoint &globalPos,
                            TerminalWidget *&targetOut,
                            DropZone &zoneOut,
                            QRect &previewRectOut,
                            QString &labelOut) const;
-    void onSplitDragMoved(TerminalWidget *source, const QPoint &globalPos);
+    void onSplitDragMoved(TerminalWidget *source, const QPoint &globalPos) const;
     void onSplitDragReleased(TerminalWidget *source, const QPoint &globalPos);
-    void clearDropOverlay();
+    void clearDropOverlay() const;
 
     QSplitter *m_rootSplitter = nullptr;
     TerminalWidget *m_active = nullptr;

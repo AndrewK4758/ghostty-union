@@ -5,14 +5,16 @@
 #include "TerminalTabPane.h"
 #include "TerminalWidget.h"
 
-#include <QApplication>
+#include <QAbstractButton>
+#include <QApplication> // IWYU pragma: keep
 #include <QClipboard>
 #include <QCoreApplication>
-#include <QDir>
+#include <QDir> // IWYU pragma: keep
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
-#include <QKeyEvent>
+#include <QKeyEvent> // IWYU pragma: keep
+#include <QLabel>
 #include <QLayout>
 #include <QMouseEvent>
 #include <QPointer>
@@ -20,11 +22,10 @@
 #include <QSysInfo>
 #include <QTabBar>
 #include <QTabWidget>
-#include <QTemporaryDir>
+#include <QTemporaryDir> // IWYU pragma: keep
 #include <QTest>
 #include <QUrl>
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <vector>
 #include <ghostty/vt.h>
@@ -33,11 +34,13 @@
 #include <linux/input-event-codes.h>
 #endif
 
+namespace {
+
 class GhosttyUnionSmokeTest final : public QObject {
     Q_OBJECT
 
 private Q_SLOTS:
-    void testKeyEncoderSequences() {
+    [[maybe_unused]] static void testKeyEncoderSequences() {
         GhosttyKeyEncoder enc = nullptr;
         GhosttyKeyEvent ev = nullptr;
         QCOMPARE(ghostty_key_encoder_new(nullptr, &enc), GHOSTTY_SUCCESS);
@@ -46,7 +49,7 @@ private Q_SLOTS:
         auto encodeEvent = [&](GhosttyKittyKeyFlags kittyFlags,
                                const QKeyEvent &qev,
                                GhosttyKeyAction action = GHOSTTY_KEY_ACTION_PRESS) -> QByteArray {
-            const bool altEsc = true;
+            constexpr bool altEsc = true;
             ghostty_key_encoder_setopt(enc, GHOSTTY_KEY_ENCODER_OPT_ALT_ESC_PREFIX, &altEsc);
             ghostty_key_encoder_setopt(enc, GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS, &kittyFlags);
 
@@ -58,7 +61,7 @@ private Q_SLOTS:
             if (ghostty_key_encoder_encode(enc, ev, buf, sizeof(buf), &len) != GHOSTTY_SUCCESS) {
                 return QByteArrayLiteral("<ENCODE_ERROR>");
             }
-            return QByteArray(buf, static_cast<qsizetype>(len));
+            return {buf, static_cast<qsizetype>(len)};
         };
 
         auto encodeQt = [&](GhosttyKittyKeyFlags kittyFlags,
@@ -73,10 +76,10 @@ private Q_SLOTS:
             return encodeEvent(kittyFlags, qev);
         };
 
-        const GhosttyKittyKeyFlags kfLegacy = GHOSTTY_KITTY_KEY_DISABLED;
-        const GhosttyKittyKeyFlags kfDisamb = GHOSTTY_KITTY_KEY_DISAMBIGUATE;
-        const GhosttyKittyKeyFlags kfAlt = GHOSTTY_KITTY_KEY_DISAMBIGUATE | GHOSTTY_KITTY_KEY_REPORT_ALTERNATES;
-        const GhosttyKittyKeyFlags kfAll = GHOSTTY_KITTY_KEY_ALL;
+        constexpr GhosttyKittyKeyFlags kfLegacy = GHOSTTY_KITTY_KEY_DISABLED;
+        constexpr GhosttyKittyKeyFlags kfDisambiguate = GHOSTTY_KITTY_KEY_DISAMBIGUATE;
+        constexpr GhosttyKittyKeyFlags kfAlt = GHOSTTY_KITTY_KEY_DISAMBIGUATE | GHOSTTY_KITTY_KEY_REPORT_ALTERNATES;
+        constexpr GhosttyKittyKeyFlags kfAll = GHOSTTY_KITTY_KEY_ALL;
 
         // Basic keys & legacy compatibility
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_A, Qt::NoModifier, QStringLiteral("a")), QByteArray("a"));
@@ -87,7 +90,7 @@ private Q_SLOTS:
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_Backspace, Qt::NoModifier, QStringLiteral("\x7f")), QByteArray("\x7f"));
 
         // Shift+uppercase letters across legacy and Kitty keyboard protocol flags
-        for (const GhosttyKittyKeyFlags kf : {kfLegacy, kfDisamb, kfAlt}) {
+        for (const GhosttyKittyKeyFlags kf : {kfLegacy, kfDisambiguate, kfAlt}) {
             QCOMPARE(encodeQt(kf, Qt::Key_A, Qt::ShiftModifier, QStringLiteral("A")), QByteArray("A"));
             QCOMPARE(encodeQt(kf, Qt::Key_Z, Qt::ShiftModifier, QStringLiteral("Z")), QByteArray("Z"));
         }
@@ -95,7 +98,7 @@ private Q_SLOTS:
                  QByteArray("\x1b[97:65;2;65u"));
 
         // Shifted digits & punctuation (regression for unshiftedCodepoint + consumed Shift)
-        for (const GhosttyKittyKeyFlags kf : {kfLegacy, kfDisamb, kfAlt}) {
+        for (const GhosttyKittyKeyFlags kf : {kfLegacy, kfDisambiguate, kfAlt}) {
             QCOMPARE(encodeQt(kf, Qt::Key_Exclam, Qt::ShiftModifier, QStringLiteral("!")), QByteArray("!"));
             QCOMPARE(encodeQt(kf, Qt::Key_Underscore, Qt::ShiftModifier, QStringLiteral("_")), QByteArray("_"));
             QCOMPARE(encodeQt(kf, Qt::Key_Question, Qt::ShiftModifier, QStringLiteral("?")), QByteArray("?"));
@@ -106,15 +109,15 @@ private Q_SLOTS:
 
         // CapsLock & CapsLock+Shift (XKB Lock bit 0x02)
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_A, Qt::NoModifier, QStringLiteral("A"), 0, 0, 0x02u), QByteArray("A"));
-        QCOMPARE(encodeQt(kfDisamb, Qt::Key_A, Qt::NoModifier, QStringLiteral("A"), 0, 0, 0x02u), QByteArray("A"));
+        QCOMPARE(encodeQt(kfDisambiguate, Qt::Key_A, Qt::NoModifier, QStringLiteral("A"), 0, 0, 0x02u), QByteArray("A"));
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_A, Qt::ShiftModifier, QStringLiteral("a"), 0, 0, 0x02u), QByteArray("a"));
-        QCOMPARE(encodeQt(kfDisamb, Qt::Key_A, Qt::ShiftModifier, QStringLiteral("a"), 0, 0, 0x02u), QByteArray("a"));
+        QCOMPARE(encodeQt(kfDisambiguate, Qt::Key_A, Qt::ShiftModifier, QStringLiteral("a"), 0, 0, 0x02u), QByteArray("a"));
 
         // Shift+Space / Shift+Tab / Shift+Return
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_Space, Qt::ShiftModifier, QStringLiteral(" ")), QByteArray(" "));
-        QCOMPARE(encodeQt(kfDisamb, Qt::Key_Space, Qt::ShiftModifier, QStringLiteral(" ")), QByteArray("\x1b[32;2u"));
-        QCOMPARE(encodeQt(kfDisamb, Qt::Key_Backtab, Qt::ShiftModifier, QString()), QByteArray("\x1b[9;2u"));
-        QCOMPARE(encodeQt(kfDisamb, Qt::Key_Return, Qt::ShiftModifier, QStringLiteral("\r")), QByteArray("\x1b[13;2u"));
+        QCOMPARE(encodeQt(kfDisambiguate, Qt::Key_Space, Qt::ShiftModifier, QStringLiteral(" ")), QByteArray("\x1b[32;2u"));
+        QCOMPARE(encodeQt(kfDisambiguate, Qt::Key_Backtab, Qt::ShiftModifier, QString()), QByteArray("\x1b[9;2u"));
+        QCOMPARE(encodeQt(kfDisambiguate, Qt::Key_Return, Qt::ShiftModifier, QStringLiteral("\r")), QByteArray("\x1b[13;2u"));
 
         // Ctrl+Shift, Ctrl+Space, Alt+Shift, Super
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_AsciiCircum, Qt::ControlModifier | Qt::ShiftModifier, QStringLiteral("\x1e")),
@@ -128,11 +131,11 @@ private Q_SLOTS:
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_Greater, Qt::AltModifier | Qt::ShiftModifier, QStringLiteral(">")),
                  QByteArray("\x1b>"));
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_A, Qt::MetaModifier, QStringLiteral("a")), QByteArray());
-        QCOMPARE(encodeQt(kfDisamb, Qt::Key_A, Qt::MetaModifier, QStringLiteral("a")), QByteArray("\x1b[97;9u"));
+        QCOMPARE(encodeQt(kfDisambiguate, Qt::Key_A, Qt::MetaModifier, QStringLiteral("a")), QByteArray("\x1b[97;9u"));
 
         // Keypad mapping: NumLock ON vs NumLock OFF (even when evdev scancode is KEY_KP7)
 #ifdef __linux__
-        const quint32 kp7Scan = KEY_KP7 + 8;
+        constexpr quint32 kp7Scan = KEY_KP7 + 8;
         QCOMPARE(GhosttyUnionKeyMap::mapQtKey(Qt::Key_7, kp7Scan, Qt::KeypadModifier), GHOSTTY_KEY_NUMPAD_7);
         QCOMPARE(encodeQt(kfLegacy, Qt::Key_7, Qt::KeypadModifier, QStringLiteral("7"), kp7Scan, 0, 0x10u),
                  QByteArray("7"));
@@ -188,7 +191,7 @@ private Q_SLOTS:
         ghostty_key_encoder_free(enc);
     }
 
-    void testStatsBarLiveSensors() {
+    [[maybe_unused]] static void testStatsBarLiveSensors() {
         StatsBarWidget bar;
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
@@ -215,7 +218,7 @@ private Q_SLOTS:
         bar.setSensorsEnabled(true);
     }
 
-    void testStatsBarPrivateAndPublicIps() {
+    [[maybe_unused]] static void testStatsBarPrivateAndPublicIps() {
         QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray("203.0.113.42\n")),
                  QStringLiteral("203.0.113.42"));
         QCOMPARE(StatsBarWidget::parsePublicIpv4Response(QByteArray(" 1.1.1.1 ")),
@@ -276,7 +279,7 @@ private Q_SLOTS:
         QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("203.0.113.42"));
     }
 
-    void testStatsBarFullWidthEvenGrowthAndShrink() {
+    [[maybe_unused]] static void testStatsBarFullWidthEvenGrowthAndShrink() {
         StatsBarWidget bar;
         bar.resize(1220, 40);
         bar.show();
@@ -336,7 +339,8 @@ private Q_SLOTS:
                              __FILE__, __LINE__);
             }
             for (int i = 0; i < itemCount - 1; ++i) {
-                const int gap = cur[static_cast<size_t>(i + 1)]->x() -
+                const auto nextIdx = static_cast<size_t>(i) + 1;
+                const int gap = cur[nextIdx]->x() -
                                 (cur[static_cast<size_t>(i)]->x() + cur[static_cast<size_t>(i)]->width());
                 if (gap != 8) {
                     QTest::qFail(qPrintable(QStringLiteral("gap[%1]=%2").arg(i).arg(gap)), __FILE__, __LINE__);
@@ -358,21 +362,21 @@ private Q_SLOTS:
         const auto w1600 = snapshotWidths(1600);
         const auto w2200 = snapshotWidths(2200);
         for (int i = 0; i < itemCount; ++i) {
-            const size_t idx = static_cast<size_t>(i);
+            const auto idx = static_cast<size_t>(i);
             QCOMPARE(wGrown[idx] - wGrowBase[idx], 100);
             delta1600.push_back(w1600[idx] - hintWidths[idx]);
             delta2200.push_back(w2200[idx] - hintWidths[idx]);
             QVERIFY(delta2200.back() > 0);
         }
-        QVERIFY(*std::max_element(delta1600.begin(), delta1600.end()) -
-                    *std::min_element(delta1600.begin(), delta1600.end()) <= 1);
-        QVERIFY(*std::max_element(delta2200.begin(), delta2200.end()) -
-                    *std::min_element(delta2200.begin(), delta2200.end()) <= 1);
+        QVERIFY(*std::ranges::max_element(delta1600) -
+                    *std::ranges::min_element(delta1600) <= 1);
+        QVERIFY(*std::ranges::max_element(delta2200) -
+                    *std::ranges::min_element(delta2200) <= 1);
 
         const int shrinkTargetW = 20 + 8 * (itemCount - 1) + sumHints - itemCount * 40;
         const auto wShrink = snapshotWidths(shrinkTargetW);
         for (int i = 0; i < itemCount; ++i) {
-            const size_t idx = static_cast<size_t>(i);
+            const auto idx = static_cast<size_t>(i);
             QCOMPARE(wShrink[idx] - hintWidths[idx], -40);
         }
 
@@ -381,7 +385,7 @@ private Q_SLOTS:
             int minDelta = 0;
             int maxDelta = 0;
             for (int i = 0; i < itemCount; ++i) {
-                const size_t idx = static_cast<size_t>(i);
+                const auto idx = static_cast<size_t>(i);
                 QVERIFY(widths[idx] >= 72);
                 if (widths[idx] > 72) {
                     const int d = widths[idx] - hintWidths[idx];
@@ -452,7 +456,7 @@ private Q_SLOTS:
         }
     }
 
-    void testStatsBarMultiGpuEnumerationAndHotplug() {
+    [[maybe_unused]] static void testStatsBarMultiGpuEnumerationAndHotplug() {
         QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("NVIDIA GeForce RTX 5070 Ti Laptop GPU")),
                  QStringLiteral("5070Ti"));
         QCOMPARE(StatsBarWidget::formatGpuShortTag(QStringLiteral("NVIDIA GeForce RTX 5080")),
@@ -509,11 +513,11 @@ private Q_SLOTS:
         QCOMPARE(activeDual[1].tag, QStringLiteral("5080"));
 
         // iGPU-only fallback & duplicate model disambiguation
-        const auto activeIgpuOnly = StatsBarWidget::selectActiveGpus(
+        const auto activeIntegratedOnly = StatsBarWidget::selectActiveGpus(
             {{QStringLiteral("gpu/gpu0"), QStringLiteral("Granite Ridge [Radeon 610M]"), {}, false}},
             {}, false);
-        QCOMPARE(activeIgpuOnly.size(), 1);
-        QCOMPARE(activeIgpuOnly[0].tag, QStringLiteral("610M"));
+        QCOMPARE(activeIntegratedOnly.size(), 1);
+        QCOMPARE(activeIntegratedOnly[0].tag, QStringLiteral("610M"));
 
         const auto activeDup = StatsBarWidget::selectActiveGpus(
             {{QStringLiteral("gpu/gpu0"), QStringLiteral("NVIDIA GeForce RTX 5090"), {}, true},
@@ -561,7 +565,7 @@ private Q_SLOTS:
         verifyBarCount(1, {QStringLiteral("5070Ti")});
     }
 
-    void testMainWindowTerminalSplitsAndIo() {
+    [[maybe_unused]] static void testMainWindowTerminalSplitsAndIo() {
         MainWindow win;
         win.resize(900, 600);
         win.show();
@@ -597,7 +601,7 @@ private Q_SLOTS:
         QVERIFY(!term->isHidden());
     }
 
-    void testTabDoesNotStealTerminalFocus() {
+    [[maybe_unused]] static void testTabDoesNotStealTerminalFocus() {
         MainWindow win;
         win.resize(900, 600);
         win.show();
@@ -618,7 +622,7 @@ private Q_SLOTS:
         QVERIFY(term->hasFocus());
     }
 
-    void testP10kPromptSpacingAndGlyphs() {
+    [[maybe_unused]] static void testP10kPromptSpacingAndGlyphs() {
         TerminalWidget term(QString(), nullptr, /*startShell=*/false);
         term.resize(900, 260);
         term.show();
@@ -627,7 +631,7 @@ private Q_SLOTS:
         const QSize cs = term.cellSize();
         const int cw = cs.width();
         const int ch = cs.height();
-        const QPoint pad = TerminalWidget::viewportOffset();
+        constexpr QPoint pad = TerminalWidget::viewportOffset();
         QVERIFY(cw >= 4);
         QVERIFY(ch >= 8);
 
@@ -678,8 +682,8 @@ private Q_SLOTS:
             return maxDist;
         };
 
-        const QColor seg1Bg(0x21, 0x88, 0xff);
-        const QColor seg2Bg(0x30, 0x36, 0x3d);
+        constexpr QColor seg1Bg(0x21, 0x88, 0xff);
+        constexpr QColor seg2Bg(0x30, 0x36, 0x3d);
 
         // Icon cells (col 6 = U+F303, col 10 = U+F489, col 35 = U+F10FE) must render visible fg ink
         QVERIFY2(cellMaxDistFromBg(6, 0, seg1Bg, 0, 0) > 80, "U+F303 icon did not render visible ink");
@@ -692,7 +696,7 @@ private Q_SLOTS:
         QVERIFY2(cellMaxDistFromBg(36, 0, seg2Bg, 1, 1) <= 4, "U+F10FE overflowed into right space padding cell");
 
         // Horizontal box-drawing filler dashes (cols 28..30, U+2500) must connect with zero gaps
-        const QColor gapLineCol(118, 131, 144);
+        constexpr QColor gapLineCol(118, 131, 144);
         const int gx0 = static_cast<int>(std::round((pad.x() + 28 * cw) * imgDpr));
         const int gx1 = static_cast<int>(std::round((pad.x() + 31 * cw) * imgDpr));
         const int gy0 = static_cast<int>(std::floor(pad.y() * imgDpr));
@@ -722,14 +726,15 @@ private Q_SLOTS:
 
         // Shade block ▓ (col 37, U+2593) must fill full row height without vertical step against col 36
         const QColor termBg = img.pixelColor(0, 0);
-        const int shadeMidX = static_cast<int>(std::round((pad.x() + 37 * cw + cw / 2) * imgDpr));
+        const double midCellX = static_cast<double>(pad.x() + 37 * cw) + static_cast<double>(cw) * 0.5;
+        const int shadeMidX = static_cast<int>(std::round(midCellX * imgDpr));
         const int topRowY = static_cast<int>(std::floor(pad.y() * imgDpr));
         const int botRowY = static_cast<int>(std::ceil((pad.y() + ch) * imgDpr)) - 1;
         QVERIFY2(colorDist(img.pixelColor(shadeMidX, topRowY), termBg) > 8, "Shade U+2593 stepped down from row top");
         QVERIFY2(colorDist(img.pixelColor(shadeMidX, botRowY), termBg) > 8, "Shade U+2593 clipped above row bottom");
     }
 
-    void testTerminalScrollbarMouseDragAndClick() {
+    [[maybe_unused]] static void testTerminalScrollbarMouseDragAndClick() {
         TerminalWidget term(QString(), nullptr, /*startShell=*/false);
         term.resize(640, 240);
         term.show();
@@ -784,7 +789,7 @@ private Q_SLOTS:
         QCOMPARE(term.scrollbarState().offset, uint64_t{0});
     }
 
-    void testOsc7AndKittyPwdTracking() {
+    [[maybe_unused]] static void testOsc7AndKittyPwdTracking() {
         QCOMPARE(GhosttyUnionLink::parseOsc7Pwd(
                      QStringLiteral("file://arch_laptop/home/ak/projects%20dir"),
                      QStringLiteral("arch_laptop")),
@@ -820,7 +825,7 @@ private Q_SLOTS:
         QCOMPARE(term.currentWorkingDirectory(), QStringLiteral("/var/tmp"));
     }
 
-    void testCtrlHoverAndCtrlClickLinksAndFiles() {
+    [[maybe_unused]] static void testCtrlHoverAndCtrlClickLinksAndFiles() {
         QTemporaryDir tmpDir;
         QVERIFY(tmpDir.isValid());
         QVERIFY(QDir().mkpath(tmpDir.filePath(QStringLiteral("src"))));
@@ -843,7 +848,7 @@ private Q_SLOTS:
         const QSize cs = term.cellSize();
         const int cw = cs.width();
         const int ch = cs.height();
-        const QPoint pad = TerminalWidget::viewportOffset();
+        constexpr QPoint pad = TerminalWidget::viewportOffset();
         const int cols = std::max(20, (term.width() - 6 - 12) / cw);
         auto cellCenter = [&](int col, int row) {
             return QPoint(pad.x() + col * cw + cw / 2, pad.y() + row * ch + ch / 2);
@@ -962,7 +967,7 @@ private Q_SLOTS:
         QVERIFY(ptyBytes.contains("\x1b[<"));
     }
 
-    void testGhosttySurfaceParityFeatures() {
+    [[maybe_unused]] static void testGhosttySurfaceParityFeatures() {
         // 1. Unfocused split dimming (`unfocused-split-opacity = 0.88`)
         TerminalTabPane pane;
         pane.resize(800, 400);
@@ -1004,8 +1009,8 @@ private Q_SLOTS:
         {
             QFocusEvent fin(QEvent::FocusIn, Qt::ActiveWindowFocusReason);
             QCoreApplication::sendEvent(&term, &fin);
-            QFocusEvent fout(QEvent::FocusOut, Qt::ActiveWindowFocusReason);
-            QCoreApplication::sendEvent(&term, &fout);
+            QFocusEvent focusOutEv(QEvent::FocusOut, Qt::ActiveWindowFocusReason);
+            QCoreApplication::sendEvent(&term, &focusOutEv);
         }
         QCOMPARE(ptyBytes, QByteArrayLiteral("\x1b[I\x1b[O"));
 
@@ -1027,12 +1032,12 @@ private Q_SLOTS:
         const QSize cs = term.cellSize();
         const int cw = cs.width();
         const int ch = cs.height();
-        const QPoint pad = TerminalWidget::viewportOffset();
+        constexpr QPoint pad = TerminalWidget::viewportOffset();
         auto cellCenter = [&](int col, int row) {
             return QPoint(pad.x() + col * cw + cw / 2, pad.y() + row * ch + ch / 2);
         };
 
-        term.feedVtBytes(QByteArrayLiteral("\x1b]133;A\x07$ \x1b]133;B\x07" "abcdef"));
+        term.feedVtBytes(QByteArrayLiteral("\x1b]133;A\x07$ \x1b]133;B\x07" "hello!"));
         ptyBytes.clear();
         QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, cellCenter(3, 0));
         QCOMPARE(ptyBytes, QByteArrayLiteral("\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D"));
@@ -1042,7 +1047,7 @@ private Q_SLOTS:
         QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, cellCenter(0, 0));
         QVERIFY(ptyBytes.isEmpty());
 
-        term.feedVtBytes(QByteArrayLiteral("\x1b[?1049h\x1b]133;A\x07$ \x1b]133;B\x07" "abcdef"));
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1049h\x1b]133;A\x07$ \x1b]133;B\x07" "hello!"));
         QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, cellCenter(3, 0));
         QVERIFY(ptyBytes.isEmpty());
         term.feedVtBytes(QByteArrayLiteral("\x1b[?1049l"));
@@ -1091,7 +1096,7 @@ private Q_SLOTS:
         QTRY_COMPARE_WITH_TIMEOUT(liveTerm->currentWorkingDirectory(), canonicalTarget, 5000);
     }
 
-    void testCtrlDFocusShiftAcrossNestedSplitsAndTabs() {
+    [[maybe_unused]] static void testCtrlDFocusShiftAcrossNestedSplitsAndTabs() {
         MainWindow win;
         win.resize(1000, 640);
         win.show();
@@ -1189,7 +1194,7 @@ private Q_SLOTS:
         QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(tA));
     }
 
-    void testSplitRearrangementDragSwapDockAndDetach() {
+    [[maybe_unused]] static void testSplitRearrangementDragSwapDockAndDetach() {
         MainWindow win;
         win.resize(1000, 640);
         win.show();
@@ -1316,7 +1321,358 @@ private Q_SLOTS:
         QTest::keyClick(tC, Qt::Key_Return);
         QTRY_VERIFY_WITH_TIMEOUT(tC->plainTextSnapshot().contains(QLatin1String("__AFTER_DETACH__")), 5000);
     }
+
+    [[maybe_unused]] static void testTabCloseCustomModalAndMultiTabIsolation() {
+        MainWindow win;
+        win.resize(960, 620);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+
+        auto *modal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+        auto *card = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmCard"));
+        auto *titleLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTitle"));
+        auto *targetLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTarget"));
+        auto *paneBadge = win.findChild<QLabel *>(QStringLiteral("tabClosePaneBadge"));
+        auto *bodyLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalBody"));
+        auto *cancelBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseCancelButton"));
+        auto *confirmBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseConfirmButton"));
+        QVERIFY(modal != nullptr);
+        QVERIFY(card != nullptr);
+        QVERIFY(titleLbl != nullptr);
+        QVERIFY(targetLbl != nullptr);
+        QVERIFY(paneBadge != nullptr);
+        QVERIFY(bodyLbl != nullptr);
+        QVERIFY(cancelBtn != nullptr);
+        QVERIFY(confirmBtn != nullptr);
+        QVERIFY(!modal->isVisible());
+
+        auto findCloseButtonForTab = [bar](int idx) -> QAbstractButton * {
+            if (auto *btn = qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::RightSide))) {
+                return btn;
+            }
+            return qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::LeftSide));
+        };
+
+        auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(pane0 != nullptr);
+        TerminalWidget *term0 = pane0->activeTerminal();
+        QVERIFY(term0 != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // Open a second tab
+        QTest::keyClick(term0, Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+        auto *pane1 = qobject_cast<TerminalTabPane *>(tabs->widget(1));
+        QVERIFY(pane1 != nullptr);
+        QCOMPARE(pane1->terminalCount(), 1);
+        TerminalWidget *term1 = pane1->activeTerminal();
+        QVERIFY(term1 != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+        tabs->setTabText(1, QStringLiteral("work-tab"));
+        QApplication::processEvents();
+
+        // 1. Clicking real QTabBar close button opens in-window custom modal (no OS QMessageBox)
+        QAbstractButton *closeTab1Btn = findCloseButtonForTab(1);
+        QVERIFY(closeTab1Btn != nullptr);
+        QTest::mouseClick(closeTab1Btn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QCOMPARE(QApplication::activeModalWidget(), static_cast<QWidget *>(nullptr));
+        QCOMPARE(modal->geometry(), win.rect());
+        QCOMPARE(titleLbl->text(), QStringLiteral("Close Tab?"));
+        QCOMPARE(confirmBtn->text(), QStringLiteral("Close Tab"));
+        QVERIFY(targetLbl->text().contains(QLatin1String("work-tab")));
+        QVERIFY(!paneBadge->isVisible());
+        QTRY_VERIFY_WITH_TIMEOUT(cancelBtn->hasFocus(), 2000);
+
+        // Window shortcuts must be blocked while modal is open
+        QTest::keyClick(cancelBtn, Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QApplication::processEvents();
+        QCOMPARE(tabs->count(), 2);
+        QVERIFY(modal->isVisible());
+
+        // Modal tracks window resize and paints cleanly; clicking inside card does NOT dismiss it
+        win.resize(1040, 660);
+        QTRY_COMPARE_WITH_TIMEOUT(modal->geometry(), win.rect(), 2000);
+        QVERIFY(!win.grab().toImage().isNull());
+        QTest::mouseClick(titleLbl, Qt::LeftButton);
+        QApplication::processEvents();
+        QVERIFY(modal->isVisible());
+
+        // Accidental Enter/Return cancels safely (Cancel is focused by default)
+        QTest::keyClick(cancelBtn, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        // 2. Escape and clicking backdrop scrim outside the card both cancel safely
+        QTest::mouseClick(closeTab1Btn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::keyClick(cancelBtn, Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        QTest::mouseClick(closeTab1Btn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::mouseClick(modal, Qt::LeftButton, Qt::NoModifier, QPoint(8, 8));
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        // 3. Multi-split tab: tab close shows pane count; Ctrl+Shift+W closes active split without modal
+        pane1->splitActive(Qt::Horizontal);
+        QCOMPARE(pane1->terminalCount(), 2);
+        QTest::mouseClick(findCloseButtonForTab(1), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QCOMPARE(titleLbl->text(), QStringLiteral("Close Tab with 2 Panes?"));
+        QVERIFY(paneBadge->isVisible());
+        QCOMPARE(paneBadge->text(), QStringLiteral("2 panes"));
+        QVERIFY(bodyLbl->text().contains(QLatin1String("2 split panes")));
+        QTest::mouseClick(cancelBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(pane1->terminalCount(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
+
+        QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(pane1->terminalCount(), 1, 2000);
+        QVERIFY(!modal->isVisible());
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
+
+        // 4. Closing a non-active tab via its close button closes ONLY that tab, keeping active tab & app open
+        tabs->setTabText(0, QStringLiteral("main-tab"));
+        tabs->setTabText(1, QStringLiteral("build-tab"));
+        tabs->setCurrentIndex(0);
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+        const QPointer<TerminalTabPane> guardPane1(pane1);
+        QTest::mouseClick(findCloseButtonForTab(1), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QCOMPARE(confirmBtn->text(), QStringLiteral("Close Tab"));
+        QVERIFY(targetLbl->text().contains(QLatin1String("build-tab")));
+        QVERIFY(!targetLbl->text().contains(QLatin1String("main-tab")));
+
+        // Arrow-key navigation inside modal: Right focuses Close, Left focuses Cancel, Tab toggles
+        QTest::keyClick(cancelBtn, Qt::Key_Right);
+        QTRY_VERIFY_WITH_TIMEOUT(confirmBtn->hasFocus(), 2000);
+        QTest::keyClick(confirmBtn, Qt::Key_Left);
+        QTRY_VERIFY_WITH_TIMEOUT(cancelBtn->hasFocus(), 2000);
+        QTest::keyClick(cancelBtn, Qt::Key_Tab);
+        QTRY_VERIFY_WITH_TIMEOUT(confirmBtn->hasFocus(), 2000);
+
+        // Return while Close is focused confirms closing ONLY Tab 1
+        QTest::keyClick(confirmBtn, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
+        QCOMPARE(tabs->count(), 1);
+        QCOMPARE(tabs->currentWidget(), static_cast<QWidget *>(pane0));
+        QTRY_VERIFY_WITH_TIMEOUT(guardPane1.isNull(), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+    }
+
+    [[maybe_unused]] static void testClosingLastTabClosesWindowAndHandlesConcurrentExits() {
+        auto findCloseButtonForTab = [](QTabBar *bar, int idx) -> QAbstractButton * {
+            if (auto *btn = qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::RightSide))) {
+                return btn;
+            }
+            return qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::LeftSide));
+        };
+
+        // 1. Single-tab window: Cancel keeps window & tab open; Close Window exits window
+        {
+            MainWindow win;
+            win.resize(960, 620);
+            win.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&win));
+            win.activateWindow();
+
+            auto *tabs = win.findChild<QTabWidget *>();
+            QVERIFY(tabs != nullptr);
+            auto *modal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+            auto *titleLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTitle"));
+            auto *cancelBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseCancelButton"));
+            auto *confirmBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseConfirmButton"));
+            QVERIFY(modal && titleLbl && cancelBtn && confirmBtn);
+
+            QCOMPARE(tabs->count(), 1);
+            const QPointer<TerminalTabPane> origPane(qobject_cast<TerminalTabPane *>(tabs->widget(0)));
+            QVERIFY(origPane);
+            QTRY_VERIFY_WITH_TIMEOUT(origPane->activeTerminal() && origPane->activeTerminal()->hasFocus(), 2000);
+
+            QAbstractButton *closeBtn0 = findCloseButtonForTab(tabs->tabBar(), 0);
+            QVERIFY(closeBtn0 != nullptr);
+            QTest::mouseClick(closeBtn0, Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+            QCOMPARE(titleLbl->text(), QStringLiteral("Close Window?"));
+            QCOMPARE(confirmBtn->text(), QStringLiteral("Close Window"));
+            QVERIFY(!win.grab().toImage().isNull());
+
+            QTest::mouseClick(cancelBtn, Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+            QVERIFY(win.isVisible());
+            QCOMPARE(tabs->count(), 1);
+            QCOMPARE(tabs->widget(0), static_cast<QWidget *>(origPane.data()));
+
+            QTest::mouseClick(findCloseButtonForTab(tabs->tabBar(), 0), Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+            QTest::mouseClick(confirmBtn, Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(!win.isVisible(), 2000);
+            QCOMPARE(tabs->count(), 0);
+            QTRY_VERIFY_WITH_TIMEOUT(origPane.isNull(), 2000);
+        }
+
+        // 2. Single-tab window via Ctrl+Shift+W: confirms and closes the window
+        {
+            MainWindow win;
+            win.resize(960, 620);
+            win.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&win));
+            win.activateWindow();
+
+            auto *tabs = win.findChild<QTabWidget *>();
+            QVERIFY(tabs != nullptr);
+            auto *modal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+            auto *confirmBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseConfirmButton"));
+            auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+            QVERIFY(modal && confirmBtn && pane0 && pane0->activeTerminal());
+            QTRY_VERIFY_WITH_TIMEOUT(pane0->activeTerminal()->hasFocus(), 2000);
+
+            QTest::keyClick(pane0->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+            QCOMPARE(confirmBtn->text(), QStringLiteral("Close Window"));
+            QTest::mouseClick(confirmBtn, Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(!win.isVisible(), 2000);
+        }
+
+        // 3. Dynamic last-tab upgrade & auto-dismiss when tabs exit concurrently while modal is open
+        {
+            MainWindow win;
+            win.resize(960, 620);
+            win.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&win));
+            win.activateWindow();
+
+            auto *tabs = win.findChild<QTabWidget *>();
+            QVERIFY(tabs != nullptr);
+            auto *modal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+            auto *titleLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTitle"));
+            auto *confirmBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseConfirmButton"));
+            QVERIFY(modal && titleLbl && confirmBtn);
+
+            auto *paneA = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+            QVERIFY(paneA && paneA->activeTerminal());
+            QTRY_VERIFY_WITH_TIMEOUT(paneA->activeTerminal()->hasFocus(), 2000);
+
+            // Auto-dismiss when pending tab itself empties while modal is open
+            QTest::keyClick(paneA->activeTerminal(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+            auto *paneD = qobject_cast<TerminalTabPane *>(tabs->widget(1));
+            QVERIFY(paneD != nullptr);
+
+            QTest::mouseClick(findCloseButtonForTab(tabs->tabBar(), 1), Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+            Q_EMIT paneD->emptied(paneD);
+            QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+            QVERIFY(win.isVisible());
+            QCOMPARE(tabs->count(), 1);
+            QCOMPARE(tabs->widget(0), static_cast<QWidget *>(paneA));
+            QTRY_VERIFY_WITH_TIMEOUT(paneA->activeTerminal()->hasFocus(), 2000);
+
+            // Open Tab 1 again, show close modal ("Close Tab"), then let Tab 0 exit -> dynamically switches to "Close Window"
+            QTest::keyClick(paneA->activeTerminal(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+            const QPointer<TerminalTabPane> paneB(qobject_cast<TerminalTabPane *>(tabs->widget(1)));
+            QVERIFY(paneB);
+
+            QTest::mouseClick(findCloseButtonForTab(tabs->tabBar(), 1), Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+            QCOMPARE(titleLbl->text(), QStringLiteral("Close Tab?"));
+            QCOMPARE(confirmBtn->text(), QStringLiteral("Close Tab"));
+
+            Q_EMIT paneA->emptied(paneA);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 2000);
+            QVERIFY(modal->isVisible());
+            QCOMPARE(tabs->widget(0), static_cast<QWidget *>(paneB.data()));
+            QCOMPARE(titleLbl->text(), QStringLiteral("Close Window?"));
+            QCOMPARE(confirmBtn->text(), QStringLiteral("Close Window"));
+
+            QTest::mouseClick(confirmBtn, Qt::LeftButton);
+            QTRY_VERIFY_WITH_TIMEOUT(!win.isVisible(), 2000);
+            QTRY_VERIFY_WITH_TIMEOUT(paneB.isNull(), 2000);
+        }
+    }
+
+    [[maybe_unused]] static void testAdaptiveTabBarSizing() {
+        MainWindow win;
+        win.resize(1000, 600);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+        QCOMPARE(bar->elideMode(), Qt::ElideMiddle);
+
+        // Short path title must NOT shrink tab below preferred width (200px)
+        tabs->setTabText(0, QStringLiteral("~"));
+        QApplication::processEvents();
+        QCOMPARE(bar->tabRect(0).width(), 200);
+
+        // Very long path title must stay capped at preferred width (200px)
+        tabs->setTabText(0, QStringLiteral("/home/ak/projects/very/deeply/nested/workspace/directory/path"));
+        QApplication::processEvents();
+        QCOMPARE(bar->tabRect(0).width(), 200);
+
+        // 3 tabs on 1000px window still have plenty of space -> all remain 200px
+        for (int i = 0; i < 2; ++i) {
+            QTest::keyClick(QApplication::focusWidget(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), i + 2, 3000);
+        }
+        tabs->setTabText(1, QStringLiteral("/"));
+        tabs->setTabText(2, QStringLiteral("zsh"));
+        QApplication::processEvents();
+        for (int i = 0; i < 3; ++i) {
+            QCOMPARE(bar->tabRect(i).width(), 200);
+        }
+
+        // Add 3 more tabs (total 6 -> 1200px > ~970px container): tabs shrink evenly to fit
+        for (int i = 0; i < 3; ++i) {
+            QTest::keyClick(QApplication::focusWidget(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), i + 4, 3000);
+        }
+        QApplication::processEvents();
+        const int shrunkWidth = bar->tabRect(0).width();
+        QVERIFY2(shrunkWidth < 200 && shrunkWidth >= 90,
+                 qPrintable(QStringLiteral("Expected shrunk width in [90, 200), got %1").arg(shrunkWidth)));
+        for (int i = 1; i < 6; ++i) {
+            QCOMPARE(bar->tabRect(i).width(), shrunkWidth);
+        }
+        QVERIFY(shrunkWidth * 6 <= tabs->width());
+
+        // Widening window so 6 * 200 fits restores tabs back to 200px
+        win.resize(1400, 600);
+        QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 200, 2000);
+        for (int i = 1; i < 6; ++i) {
+            QCOMPARE(bar->tabRect(i).width(), 200);
+        }
+
+        // Narrowing window below 6 * 90 clamps tabs to minimum floor (90px)
+        win.resize(450, 600);
+        QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 90, 2000);
+    }
 };
 
-QTEST_MAIN(GhosttyUnionSmokeTest)
 #include "smoke_test.moc"
+
+} // namespace
+
+QTEST_MAIN(GhosttyUnionSmokeTest)

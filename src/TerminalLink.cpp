@@ -21,13 +21,10 @@ struct CellCoord {
 };
 
 bool hasControlChars(const QString &s) {
-    for (const QChar ch : s) {
+    return std::ranges::any_of(s, [](const QChar ch) {
         const ushort uc = ch.unicode();
-        if (uc < 0x20U || uc == 0x7fU) {
-            return true;
-        }
-    }
-    return false;
+        return uc < 0x20U || uc == 0x7fU;
+    });
 }
 
 bool isLocalHost(const QString &host, const QString &localHostName) {
@@ -98,9 +95,10 @@ QString readRefText(const GhosttyGridRef &ref) {
 }
 
 bool rowHasWrapOut(GhosttyTerminal terminal, uint16_t row) {
-    GhosttyPoint pt{};
-    pt.tag = GHOSTTY_POINT_TAG_VIEWPORT;
-    pt.value.coordinate = GhosttyPointCoordinate{0, row};
+    const GhosttyPoint pt{
+        .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+        .value = {.coordinate = {.x = 0, .y = row}},
+    };
     GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
     if (ghostty_terminal_grid_ref(terminal, pt, &ref) != GHOSTTY_SUCCESS) {
         return false;
@@ -115,9 +113,10 @@ bool rowHasWrapOut(GhosttyTerminal terminal, uint16_t row) {
 }
 
 bool rowIsWrapContinuation(GhosttyTerminal terminal, uint16_t row) {
-    GhosttyPoint pt{};
-    pt.tag = GHOSTTY_POINT_TAG_VIEWPORT;
-    pt.value.coordinate = GhosttyPointCoordinate{0, row};
+    const GhosttyPoint pt{
+        .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+        .value = {.coordinate = {.x = 0, .y = row}},
+    };
     GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
     if (ghostty_terminal_grid_ref(terminal, pt, &ref) != GHOSTTY_SUCCESS) {
         return false;
@@ -269,7 +268,7 @@ bool parseFileUriToLocal(const QString &uri,
 
     QString pathPart;
     QString fragment;
-    const int hashIdx = uri.indexOf(QLatin1Char('#'));
+    const qsizetype hashIdx = uri.indexOf(QLatin1Char('#'));
     const QString mainUri = (hashIdx >= 0) ? uri.left(hashIdx) : uri;
     if (hashIdx >= 0) {
         fragment = uri.mid(hashIdx + 1);
@@ -277,7 +276,7 @@ bool parseFileUriToLocal(const QString &uri,
 
     if (mainUri.startsWith(QStringLiteral("file://"), Qt::CaseInsensitive)) {
         const QString rest = mainUri.mid(7);
-        const int slashIdx = rest.indexOf(QLatin1Char('/'));
+        const qsizetype slashIdx = rest.indexOf(QLatin1Char('/'));
         if (slashIdx < 0) {
             return false;
         }
@@ -408,12 +407,7 @@ bool isPureDigits(const QString &s) {
     if (s.isEmpty()) {
         return false;
     }
-    for (const QChar c : s) {
-        if (!c.isDigit()) {
-            return false;
-        }
-    }
-    return true;
+    return std::ranges::all_of(s, [](const QChar c) { return c.isDigit(); });
 }
 
 } // namespace
@@ -479,9 +473,10 @@ ResolvedLink resolveAt(GhosttyTerminal terminal,
     }
 
     auto refAt = [&](uint16_t col, uint16_t row, GhosttyGridRef &outRef) -> bool {
-        GhosttyPoint pt{};
-        pt.tag = GHOSTTY_POINT_TAG_VIEWPORT;
-        pt.value.coordinate = GhosttyPointCoordinate{col, row};
+        const GhosttyPoint pt{
+            .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+            .value = {.coordinate = {.x = col, .y = row}},
+        };
         outRef = GHOSTTY_INIT_SIZED(GhosttyGridRef);
         return ghostty_terminal_grid_ref(terminal, pt, &outRef) == GHOSTTY_SUCCESS;
     };
@@ -813,9 +808,9 @@ ResolvedLink resolveAt(GhosttyTerminal terminal,
         }
 
         // Filesystem path branch: try full trimmed match, then shorten at trailing spaces if needed
-        qsizetype candEnd = trimmedEnd;
-        while (candEnd > hoverCharIdx) {
-            const QString sub = logicalText.mid(mStart, candEnd - mStart);
+        qsizetype candidateEnd = trimmedEnd;
+        while (candidateEnd > hoverCharIdx) {
+            const QString sub = logicalText.mid(mStart, candidateEnd - mStart);
             QString localPath;
             int ln = 0;
             int col = 0;
@@ -826,14 +821,14 @@ ResolvedLink resolveAt(GhosttyTerminal terminal,
                 link.line = ln;
                 link.column = col;
                 link.isLocalFile = true;
-                link.spans = buildSpansForRange(mStart, candEnd);
+                link.spans = buildSpansForRange(mStart, candidateEnd);
                 return link;
             }
             const qsizetype lastSpace = sub.lastIndexOf(QLatin1Char(' '));
             if (lastSpace <= 0) {
                 break;
             }
-            candEnd = mStart + lastSpace;
+            candidateEnd = mStart + lastSpace;
         }
     }
 

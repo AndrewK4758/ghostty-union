@@ -202,8 +202,7 @@ GhosttyKey mapEvdevScanCode(quint32 nativeScanCode) {
     if (nativeScanCode < 8) {
         return GHOSTTY_KEY_UNIDENTIFIED;
     }
-    const quint32 evdev = nativeScanCode - 8;
-    switch (evdev) {
+    switch (const quint32 evdev = nativeScanCode - 8; evdev) {
     // Writing system keys
     case KEY_GRAVE: return GHOSTTY_KEY_BACKQUOTE;
     case KEY_0: return GHOSTTY_KEY_DIGIT_0;
@@ -382,8 +381,8 @@ GhosttyKey mapEvdevScanCode(quint32 nativeScanCode) {
 }
 #endif
 
-GhosttyKey mapXkbKeysym(quint32 keysym) {
-    switch (keysym) {
+GhosttyKey mapXkbKeySymbol(quint32 keySymbol) {
+    switch (keySymbol) {
     case 0xffe1: return GHOSTTY_KEY_SHIFT_LEFT;
     case 0xffe2: return GHOSTTY_KEY_SHIFT_RIGHT;
     case 0xffe3: return GHOSTTY_KEY_CONTROL_LEFT;
@@ -468,7 +467,7 @@ GhosttyKey mapQtKey(int qtKey,
 #endif
 
     if (nativeVirtualKey != 0) {
-        const GhosttyKey symKey = mapXkbKeysym(nativeVirtualKey);
+        const GhosttyKey symKey = mapXkbKeySymbol(nativeVirtualKey);
         if (symKey != GHOSTTY_KEY_UNIDENTIFIED) {
             return symKey;
         }
@@ -625,7 +624,7 @@ uint32_t unshiftedCodepoint(const QKeyEvent *event) {
     if (!txt.isEmpty()) {
         const auto ucs4 = txt.toUcs4();
         if (!ucs4.isEmpty()) {
-            const char32_t cp = static_cast<char32_t>(ucs4.at(0));
+            const auto cp = static_cast<char32_t>(ucs4.at(0));
             if (isUsableTextCodepoint(cp)) {
                 if (event->modifiers().testFlag(Qt::ShiftModifier) && QChar::isUpper(cp)) {
                     return static_cast<uint32_t>(QChar::toLower(cp));
@@ -645,7 +644,7 @@ QByteArray keyEventUtf8(const QKeyEvent *event, GhosttyMods mods) {
     if (!text.isEmpty()) {
         const auto ucs4 = text.toUcs4();
         if (!ucs4.isEmpty()) {
-            const char32_t cp = static_cast<char32_t>(ucs4.at(0));
+            const auto cp = static_cast<char32_t>(ucs4.at(0));
             if (isUsableTextCodepoint(cp)) {
                 return text.toUtf8();
             }
@@ -657,10 +656,10 @@ QByteArray keyEventUtf8(const QKeyEvent *event, GhosttyMods mods) {
         const bool caps = (mods & GHOSTTY_MODS_CAPS_LOCK) != 0;
         const char ch = (shift != caps) ? static_cast<char>('A' + (k - Qt::Key_A))
                                         : static_cast<char>('a' + (k - Qt::Key_A));
-        return QByteArray(1, ch);
+        return {1, ch};
     }
     if (k >= 0x20 && k <= 0x7e) {
-        return QByteArray(1, static_cast<char>(k));
+        return {1, static_cast<char>(k)};
     }
     return {};
 }
@@ -673,7 +672,7 @@ GhosttyMods consumedModifiers(const QKeyEvent * /*event*/,
     if ((mods & GHOSTTY_MODS_SHIFT) != 0 && !utf8.isEmpty()) {
         const auto ucs4 = QString::fromUtf8(utf8).toUcs4();
         if (!ucs4.isEmpty()) {
-            const char32_t cp = static_cast<char32_t>(ucs4.at(0));
+            const auto cp = static_cast<char32_t>(ucs4.at(0));
             if (static_cast<uint32_t>(cp) != unshiftedCp || QChar::isLetter(cp)) {
                 consumed |= GHOSTTY_MODS_SHIFT;
             }
@@ -689,15 +688,15 @@ void populateGhosttyKeyEvent(GhosttyKeyEvent outEvent,
     if (!outEvent || !event) {
         return;
     }
-    const GhosttyKey gkey = mapQtKey(event);
-    const GhosttyMods gmods = mapQtModifiers(event);
+    const GhosttyKey ghosttyKey = mapQtKey(event);
+    const GhosttyMods ghosttyMods = mapQtModifiers(event);
     const uint32_t unshifted = unshiftedCodepoint(event);
-    utf8Storage = keyEventUtf8(event, gmods);
-    const GhosttyMods consumed = consumedModifiers(event, gmods, unshifted, utf8Storage);
+    utf8Storage = keyEventUtf8(event, ghosttyMods);
+    const GhosttyMods consumed = consumedModifiers(event, ghosttyMods, unshifted, utf8Storage);
 
     ghostty_key_event_set_action(outEvent, action);
-    ghostty_key_event_set_key(outEvent, gkey);
-    ghostty_key_event_set_mods(outEvent, gmods);
+    ghostty_key_event_set_key(outEvent, ghosttyKey);
+    ghostty_key_event_set_mods(outEvent, ghosttyMods);
     ghostty_key_event_set_consumed_mods(outEvent, consumed);
     ghostty_key_event_set_composing(outEvent, false);
     ghostty_key_event_set_unshifted_codepoint(outEvent, unshifted);

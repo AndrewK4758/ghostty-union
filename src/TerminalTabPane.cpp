@@ -115,8 +115,8 @@ protected:
 
         if (!m_label.isEmpty()) {
             const QFontMetrics fm(font());
-            const int padX = 10;
-            const int padY = 5;
+            constexpr int padX = 10;
+            constexpr int padY = 5;
             const int bw = std::min(std::max(60, m_previewRect.width() - 16),
                                     fm.horizontalAdvance(m_label) + 2 * padX);
             const int bh = fm.height() + 2 * padY;
@@ -236,10 +236,10 @@ void TerminalTabPane::recordFocusedTerminal(TerminalWidget *term) {
     if (!term) {
         return;
     }
-    m_focusHistory.erase(
-        std::remove_if(m_focusHistory.begin(), m_focusHistory.end(),
-                       [term](const QPointer<TerminalWidget> &p) { return p.isNull() || p.data() == term; }),
-        m_focusHistory.end());
+    const auto removed = std::ranges::remove_if(
+        m_focusHistory,
+        [term](const QPointer<TerminalWidget> &p) { return p.isNull() || p.data() == term; });
+    m_focusHistory.erase(removed.begin(), removed.end());
     m_focusHistory.prepend(QPointer<TerminalWidget>(term));
 }
 
@@ -267,6 +267,12 @@ QString TerminalTabPane::title() const {
         return m_active->title();
     }
     return QStringLiteral("zsh");
+}
+
+int TerminalTabPane::terminalCount() const {
+    QList<TerminalWidget *> all;
+    collectTerminals(m_rootSplitter, all);
+    return static_cast<int>(all.size());
 }
 
 QString TerminalTabPane::currentWorkingDirectory() const {
@@ -347,17 +353,17 @@ bool TerminalTabPane::closeActive() {
     return true;
 }
 
-TerminalWidget *TerminalTabPane::chooseNextFocusAfterRemoving(TerminalWidget *removing,
-                                                              QSplitter *parentSplitter,
+TerminalWidget *TerminalTabPane::chooseNextFocusAfterRemoving(const TerminalWidget *removing,
+                                                              const QSplitter *parentSplitter,
                                                               int removedIdx) const {
     if (m_active && m_active != removing) {
         return m_active;
     }
     QList<TerminalWidget *> all;
     collectTerminals(m_rootSplitter, all);
-    for (const QPointer<TerminalWidget> &cand : m_focusHistory) {
-        if (cand && cand.data() != removing && all.contains(cand.data())) {
-            return cand.data();
+    for (const QPointer<TerminalWidget> &candidate : m_focusHistory) {
+        if (candidate && candidate.data() != removing && all.contains(candidate.data())) {
+            return candidate.data();
         }
     }
     if (parentSplitter && removedIdx >= 0) {
@@ -376,9 +382,9 @@ TerminalWidget *TerminalTabPane::chooseNextFocusAfterRemoving(TerminalWidget *re
             }
         }
     }
-    for (TerminalWidget *cand : all) {
-        if (cand != removing) {
-            return cand;
+    for (TerminalWidget *candidate : all) {
+        if (candidate != removing) {
+            return candidate;
         }
     }
     return nullptr;
@@ -389,10 +395,10 @@ void TerminalTabPane::removeTerminalWidget(TerminalWidget *term, bool deleteIt) 
         return;
     }
     clearDropOverlay();
-    m_focusHistory.erase(
-        std::remove_if(m_focusHistory.begin(), m_focusHistory.end(),
-                       [term](const QPointer<TerminalWidget> &p) { return p.isNull() || p.data() == term; }),
-        m_focusHistory.end());
+    const auto removed = std::ranges::remove_if(
+        m_focusHistory,
+        [term](const QPointer<TerminalWidget> &p) { return p.isNull() || p.data() == term; });
+    m_focusHistory.erase(removed.begin(), removed.end());
 
     if (m_zoomed) {
         m_zoomed = false;
@@ -444,7 +450,7 @@ void TerminalTabPane::removeTerminalWidget(TerminalWidget *term, bool deleteIt) 
     activateTerminal(nextActive);
 }
 
-void TerminalTabPane::collapseSingleChildSplitter(QSplitter *splitter) {
+void TerminalTabPane::collapseSingleChildSplitter(QSplitter *splitter) const {
     while (splitter && splitter != m_rootSplitter && splitter->count() == 1) {
         QWidget *onlyChild = splitter->widget(0);
         auto *grand = qobject_cast<QSplitter *>(splitter->parentWidget());
@@ -484,7 +490,7 @@ void TerminalTabPane::collapseSingleChildSplitter(QSplitter *splitter) {
     }
 }
 
-void TerminalTabPane::collectTerminals(QSplitter *root, QList<TerminalWidget *> &out) const {
+void TerminalTabPane::collectTerminals(const QSplitter *root, QList<TerminalWidget *> &out) {
     if (!root) {
         return;
     }
@@ -498,7 +504,7 @@ void TerminalTabPane::collectTerminals(QSplitter *root, QList<TerminalWidget *> 
     }
 }
 
-TerminalWidget *TerminalTabPane::findDirectionalNeighbor(TerminalWidget *origin, int dx, int dy) const {
+TerminalWidget *TerminalTabPane::findDirectionalNeighbor(const TerminalWidget *origin, int dx, int dy) const {
     if (!origin || m_zoomed) {
         return nullptr;
     }
@@ -512,11 +518,11 @@ TerminalWidget *TerminalTabPane::findDirectionalNeighbor(TerminalWidget *origin,
     TerminalWidget *best = nullptr;
     double bestScore = std::numeric_limits<double>::max();
 
-    for (TerminalWidget *cand : all) {
-        if (cand == origin || !cand->isVisible()) {
+    for (TerminalWidget *candidate : all) {
+        if (candidate == origin || !candidate->isVisible()) {
             continue;
         }
-        const QPoint c = cand->mapTo(this, cand->rect().center());
+        const QPoint c = candidate->mapTo(this, candidate->rect().center());
         const int vx = c.x() - curCenter.x();
         const int vy = c.y() - curCenter.y();
         const int primary = vx * dx + vy * dy;
@@ -527,7 +533,7 @@ TerminalWidget *TerminalTabPane::findDirectionalNeighbor(TerminalWidget *origin,
         const double score = static_cast<double>(primary) + static_cast<double>(cross) * 2.5;
         if (score < bestScore) {
             bestScore = score;
-            best = cand;
+            best = candidate;
         }
     }
     return best;
@@ -539,7 +545,7 @@ void TerminalTabPane::navigateSplit(int dx, int dy) {
     }
 }
 
-void TerminalTabPane::resizeSplit(int dx, int dy, int stepPx) {
+void TerminalTabPane::resizeSplit(int dx, int dy, int stepPx) const {
     if (!m_active || m_zoomed) {
         return;
     }
@@ -815,7 +821,7 @@ bool TerminalTabPane::detachTerminalToNewTab(TerminalWidget *term) {
     if (all.size() < 2 || !all.contains(term)) {
         return false;
     }
-    term->disconnect(this);
+    static_cast<void>(term->disconnect(this));
     removeTerminalWidget(term, /*deleteIt=*/false);
     Q_EMIT detachToNewTabRequested(term);
     return true;
@@ -851,7 +857,7 @@ void TerminalTabPane::toggleZoom() {
     activateTerminal(m_active);
 }
 
-void TerminalTabPane::updateSplitDimming() {
+void TerminalTabPane::updateSplitDimming() const {
     QList<TerminalWidget *> all;
     collectTerminals(m_rootSplitter, all);
     const bool multiSplitVisible = !m_zoomed && all.size() > 1;
@@ -899,92 +905,92 @@ bool TerminalTabPane::computeDropTarget(TerminalWidget *source,
     const int dBottom = height() - 1 - localPos.y();
     const int minEdgeDist = std::min({dLeft, dRight, dTop, dBottom});
     if (minEdgeDist < 18) {
-        DropZone candZone = DropZone::RootLeft;
-        Qt::Orientation candOrient = Qt::Horizontal;
-        QRect candRect;
-        QString candLabel;
+        DropZone candidateZone = DropZone::RootLeft;
+        Qt::Orientation candidateOrient = Qt::Horizontal;
+        QRect candidateRect;
+        QString candidateLabel;
         if (minEdgeDist == dLeft) {
-            candZone = DropZone::RootLeft;
-            candOrient = Qt::Horizontal;
+            candidateZone = DropZone::RootLeft;
+            candidateOrient = Qt::Horizontal;
             const int w = std::max(80, width() / 3);
-            candRect = QRect(0, 0, w, height());
-            candLabel = QStringLiteral("Dock Full Left");
+            candidateRect = QRect(0, 0, w, height());
+            candidateLabel = QStringLiteral("Dock Full Left");
         } else if (minEdgeDist == dRight) {
-            candZone = DropZone::RootRight;
-            candOrient = Qt::Horizontal;
+            candidateZone = DropZone::RootRight;
+            candidateOrient = Qt::Horizontal;
             const int w = std::max(80, width() / 3);
-            candRect = QRect(width() - w, 0, w, height());
-            candLabel = QStringLiteral("Dock Full Right");
+            candidateRect = QRect(width() - w, 0, w, height());
+            candidateLabel = QStringLiteral("Dock Full Right");
         } else if (minEdgeDist == dTop) {
-            candZone = DropZone::RootTop;
-            candOrient = Qt::Vertical;
+            candidateZone = DropZone::RootTop;
+            candidateOrient = Qt::Vertical;
             const int h = std::max(60, height() / 3);
-            candRect = QRect(0, 0, width(), h);
-            candLabel = QStringLiteral("Dock Full Top");
+            candidateRect = QRect(0, 0, width(), h);
+            candidateLabel = QStringLiteral("Dock Full Top");
         } else {
-            candZone = DropZone::RootBottom;
-            candOrient = Qt::Vertical;
+            candidateZone = DropZone::RootBottom;
+            candidateOrient = Qt::Vertical;
             const int h = std::max(60, height() / 3);
-            candRect = QRect(0, height() - h, width(), h);
-            candLabel = QStringLiteral("Dock Full Bottom");
+            candidateRect = QRect(0, height() - h, width(), h);
+            candidateLabel = QStringLiteral("Dock Full Bottom");
         }
-        if (all.size() > 2 || m_rootSplitter->orientation() != candOrient) {
-            zoneOut = candZone;
-            previewRectOut = candRect;
-            labelOut = candLabel;
+        if (all.size() > 2 || m_rootSplitter->orientation() != candidateOrient) {
+            zoneOut = candidateZone;
+            previewRectOut = candidateRect;
+            labelOut = candidateLabel;
             return true;
         }
     }
 
-    TerminalWidget *cand = nullptr;
-    QRect candRect;
+    TerminalWidget *candidate = nullptr;
+    QRect candidateRect;
     for (TerminalWidget *w : all) {
         if (!w->isVisible()) {
             continue;
         }
         const QRect wr(w->mapTo(this, QPoint(0, 0)), w->size());
         if (wr.contains(localPos)) {
-            cand = w;
-            candRect = wr;
+            candidate = w;
+            candidateRect = wr;
             break;
         }
     }
-    if (!cand || cand == source) {
+    if (!candidate || candidate == source) {
         return false;
     }
 
-    const qreal nx = static_cast<qreal>(localPos.x() - candRect.left()) / std::max(1, candRect.width());
-    const qreal ny = static_cast<qreal>(localPos.y() - candRect.top()) / std::max(1, candRect.height());
+    const qreal nx = static_cast<qreal>(localPos.x() - candidateRect.left()) / std::max(1, candidateRect.width());
+    const qreal ny = static_cast<qreal>(localPos.y() - candidateRect.top()) / std::max(1, candidateRect.height());
     const qreal eL = nx;
     const qreal eR = 1.0 - nx;
     const qreal eT = ny;
     const qreal eB = 1.0 - ny;
     const qreal minNorm = std::min({eL, eR, eT, eB});
 
-    targetOut = cand;
+    targetOut = candidate;
     if (minNorm >= 0.25) {
         zoneOut = DropZone::CenterSwap;
-        previewRectOut = candRect.adjusted(4, 4, -4, -4);
+        previewRectOut = candidateRect.adjusted(4, 4, -4, -4);
         labelOut = QStringLiteral("Swap Panes");
         return true;
     }
     if (minNorm == eL) {
         zoneOut = DropZone::Left;
-        previewRectOut = QRect(candRect.left(), candRect.top(), candRect.width() / 2, candRect.height());
+        previewRectOut = QRect(candidateRect.left(), candidateRect.top(), candidateRect.width() / 2, candidateRect.height());
         labelOut = QStringLiteral("Dock Left");
     } else if (minNorm == eR) {
         zoneOut = DropZone::Right;
-        const int halfW = candRect.width() / 2;
-        previewRectOut = QRect(candRect.left() + candRect.width() - halfW, candRect.top(), halfW, candRect.height());
+        const int halfW = candidateRect.width() / 2;
+        previewRectOut = QRect(candidateRect.left() + candidateRect.width() - halfW, candidateRect.top(), halfW, candidateRect.height());
         labelOut = QStringLiteral("Dock Right");
     } else if (minNorm == eT) {
         zoneOut = DropZone::Top;
-        previewRectOut = QRect(candRect.left(), candRect.top(), candRect.width(), candRect.height() / 2);
+        previewRectOut = QRect(candidateRect.left(), candidateRect.top(), candidateRect.width(), candidateRect.height() / 2);
         labelOut = QStringLiteral("Dock Top");
     } else {
         zoneOut = DropZone::Bottom;
-        const int halfH = candRect.height() / 2;
-        previewRectOut = QRect(candRect.left(), candRect.top() + candRect.height() - halfH, candRect.width(), halfH);
+        const int halfH = candidateRect.height() / 2;
+        previewRectOut = QRect(candidateRect.left(), candidateRect.top() + candidateRect.height() - halfH, candidateRect.width(), halfH);
         labelOut = QStringLiteral("Dock Bottom");
     }
     return true;
@@ -1000,7 +1006,7 @@ TerminalTabPane::DropZone TerminalTabPane::previewDropZoneForTesting(TerminalWid
     return zone;
 }
 
-void TerminalTabPane::onSplitDragMoved(TerminalWidget *source, const QPoint &globalPos) {
+void TerminalTabPane::onSplitDragMoved(TerminalWidget *source, const QPoint &globalPos) const {
     TerminalWidget *target = nullptr;
     DropZone zone = DropZone::None;
     QRect previewRect;
@@ -1031,7 +1037,7 @@ void TerminalTabPane::onSplitDragReleased(TerminalWidget *source, const QPoint &
     }
 }
 
-void TerminalTabPane::clearDropOverlay() {
+void TerminalTabPane::clearDropOverlay() const {
     if (m_dropOverlay) {
         m_dropOverlay->clearPreview();
     }
