@@ -269,6 +269,12 @@ QString TerminalTabPane::title() const {
     return QStringLiteral("zsh");
 }
 
+int TerminalTabPane::terminalCount() const {
+    QList<TerminalWidget *> all;
+    collectTerminals(m_rootSplitter, all);
+    return static_cast<int>(all.size());
+}
+
 QString TerminalTabPane::currentWorkingDirectory() const {
     return m_active ? m_active->currentWorkingDirectory() : QString();
 }

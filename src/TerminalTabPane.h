@@ -37,6 +37,7 @@ public:
     ~TerminalTabPane() override = default;
 
     [[nodiscard]] TerminalWidget *activeTerminal() const { return m_active; }
+    [[nodiscard]] int terminalCount() const;
     [[nodiscard]] QString title() const;
     [[nodiscard]] QString currentWorkingDirectory() const;
 

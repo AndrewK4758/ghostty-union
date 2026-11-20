@@ -5,6 +5,7 @@
 #include "TerminalTabPane.h"
 #include "TerminalWidget.h"
 
+#include <QAbstractButton>
 #include <QApplication> // IWYU pragma: keep
 #include <QClipboard>
 #include <QCoreApplication>
@@ -14,13 +15,16 @@
 #include <QImage>
 #include <QKeyEvent> // IWYU pragma: keep
 #include <QLayout>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPointer>
+#include <QPushButton>
 #include <QSysInfo>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTemporaryDir> // IWYU pragma: keep
 #include <QTest>
+#include <QTimer>
 #include <QUrl>
 #include <algorithm>
 #include <cmath>
@@ -1317,6 +1321,112 @@ private Q_SLOTS:
         QTest::keyClicks(tC, QStringLiteral("echo __AFTER_DETACH__"));
         QTest::keyClick(tC, Qt::Key_Return);
         QTRY_VERIFY_WITH_TIMEOUT(tC->plainTextSnapshot().contains(QLatin1String("__AFTER_DETACH__")), 5000);
+    }
+
+    [[maybe_unused]] static void testTabCloseConfirmationDialog() {
+        MainWindow win;
+        win.resize(900, 600);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(pane0 != nullptr);
+        TerminalWidget *term0 = pane0->activeTerminal();
+        QVERIFY(term0 != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // Open a second tab
+        QTest::keyClick(term0, Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+        auto *pane1 = qobject_cast<TerminalTabPane *>(tabs->widget(1));
+        QVERIFY(pane1 != nullptr);
+        QCOMPARE(pane1->terminalCount(), 1);
+        TerminalWidget *term1 = pane1->activeTerminal();
+        QVERIFY(term1 != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        auto scheduleModalAction = [](bool confirmClose, bool *sawDialogOut, QString *textOut, bool *cancelIsDefaultOut) {
+            *sawDialogOut = false;
+            if (textOut) {
+                textOut->clear();
+            }
+            if (cancelIsDefaultOut) {
+                *cancelIsDefaultOut = false;
+            }
+            QTimer::singleShot(0, [confirmClose, sawDialogOut, textOut, cancelIsDefaultOut]() {
+                auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                if (!box) {
+                    return;
+                }
+                *sawDialogOut = true;
+                if (textOut) {
+                    *textOut = box->text();
+                }
+                QAbstractButton *cancelBtn = box->button(QMessageBox::Cancel);
+                if (cancelIsDefaultOut) {
+                    *cancelIsDefaultOut = (cancelBtn != nullptr &&
+                                           box->defaultButton() == cancelBtn &&
+                                           box->escapeButton() == cancelBtn);
+                }
+                if (confirmClose) {
+                    for (QAbstractButton *btn : box->buttons()) {
+                        if (btn && btn != cancelBtn) {
+                            btn->click();
+                            return;
+                        }
+                    }
+                } else if (cancelBtn) {
+                    cancelBtn->click();
+                }
+            });
+        };
+
+        // 1. Clicking tab close (tabCloseRequested) prompts and Cancel keeps tab open + restores focus
+        bool sawDialog = false;
+        QString dialogText;
+        bool cancelIsDefault = false;
+        scheduleModalAction(/*confirmClose=*/false, &sawDialog, &dialogText, &cancelIsDefault);
+        Q_EMIT tabs->tabCloseRequested(1);
+        QVERIFY(sawDialog);
+        QVERIFY(cancelIsDefault);
+        QVERIFY(dialogText.contains(QLatin1String("Close tab")));
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        // 2. Multi-split tab: tabCloseRequested warns about split pane count; Ctrl+Shift+W closes split without dialog
+        pane1->splitActive(Qt::Horizontal);
+        QCOMPARE(pane1->terminalCount(), 2);
+        scheduleModalAction(/*confirmClose=*/false, &sawDialog, &dialogText, &cancelIsDefault);
+        Q_EMIT tabs->tabCloseRequested(1);
+        QVERIFY(sawDialog);
+        QVERIFY(cancelIsDefault);
+        QVERIFY(dialogText.contains(QLatin1String("2 split panes")));
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(pane1->terminalCount(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
+
+        QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(pane1->terminalCount(), 1, 2000);
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
+
+        // 3. Ctrl+Shift+W on a single-pane tab prompts: Cancel keeps it, Close Tab removes it
+        scheduleModalAction(/*confirmClose=*/false, &sawDialog, &dialogText, &cancelIsDefault);
+        QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(sawDialog);
+        QVERIFY(cancelIsDefault);
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
+
+        scheduleModalAction(/*confirmClose=*/true, &sawDialog, &dialogText, &cancelIsDefault);
+        QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(sawDialog);
+        QCOMPARE(tabs->count(), 1);
+        QCOMPARE(tabs->currentWidget(), static_cast<QWidget *>(pane0));
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
     }
 };
 

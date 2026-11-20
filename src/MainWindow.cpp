@@ -6,6 +6,8 @@
 
 #include <QDir>
 #include <QKeySequence>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QShortcut>
 #include <QShowEvent>
 #include <QSignalBlocker>
@@ -55,7 +57,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     connect(newTabBtn, &QToolButton::clicked, this, [this]() { addNewTab(); });
     m_tabs->setCornerWidget(newTabBtn, Qt::TopRightCorner);
 
-    connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::closeTabAt);
+    connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::requestCloseTabAt);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
         if (auto *p = currentPane()) {
             recordTabVisit(p);
@@ -139,6 +141,76 @@ void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
     updateWindowTitle();
 }
 
+bool MainWindow::confirmCloseTab(const QString &tabTitle, int paneCount) {
+    const QString trimmed = tabTitle.trimmed();
+    const QString displayTitle = trimmed.isEmpty() ? QStringLiteral("zsh") : trimmed;
+    const QString promptText = (paneCount > 1)
+        ? QStringLiteral("Close tab \"%1\" and its %2 split panes?\n\nAny running processes in this tab will be terminated.")
+              .arg(displayTitle)
+              .arg(paneCount)
+        : QStringLiteral("Close tab \"%1\"?\n\nAny running process in this tab will be terminated.")
+              .arg(displayTitle);
+
+    QPointer<QMessageBox> box(new QMessageBox(QMessageBox::Question,
+                                              QStringLiteral("Confirm Close Tab"),
+                                              promptText,
+                                              QMessageBox::NoButton,
+                                              this));
+    const QPushButton *closeBtn = box->addButton(QStringLiteral("Close Tab"), QMessageBox::DestructiveRole);
+    QPushButton *cancelBtn = box->addButton(QMessageBox::Cancel);
+    box->setDefaultButton(cancelBtn);
+    box->setEscapeButton(cancelBtn);
+    box->exec();
+    if (!box) {
+        return false;
+    }
+    const bool accepted = (box->clickedButton() == closeBtn);
+    delete box;
+    return accepted;
+}
+
+void MainWindow::requestCloseTabAt(int index) {
+    if (m_confirmingTabClose || index < 0 || index >= m_tabs->count()) {
+        return;
+    }
+    const QPointer<MainWindow> self(this);
+    const QPointer<TerminalTabPane> targetPane(qobject_cast<TerminalTabPane *>(m_tabs->widget(index)));
+    if (!targetPane) {
+        return;
+    }
+
+    const QString tabTitle = m_tabs->tabText(index);
+    const int paneCount = targetPane->terminalCount();
+
+    m_confirmingTabClose = true;
+    const bool confirmed = confirmCloseTab(tabTitle, paneCount);
+    if (!self) {
+        return;
+    }
+    m_confirmingTabClose = false;
+
+    if (!confirmed) {
+        activateWindow();
+        if (auto *active = currentPane()) {
+            active->focusActive();
+        }
+        return;
+    }
+
+    if (!targetPane) {
+        return;
+    }
+    if (const int currentIdx = m_tabs->indexOf(targetPane.data()); currentIdx >= 0) {
+        closeTabAt(currentIdx);
+        if (self && m_tabs->count() > 0) {
+            activateWindow();
+            if (auto *active = currentPane()) {
+                active->focusActive();
+            }
+        }
+    }
+}
+
 void MainWindow::closeTabAt(int index) {
     if (index < 0 || index >= m_tabs->count()) {
         return;
@@ -219,7 +291,7 @@ void MainWindow::wireShortcuts() {
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_W), [this]() {
         if (auto *p = currentPane()) {
             if (!p->closeActive()) {
-                closeTabAt(m_tabs->currentIndex());
+                requestCloseTabAt(m_tabs->currentIndex());
             }
         }
     });
