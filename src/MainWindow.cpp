@@ -4,10 +4,7 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
-#include <QAction>
 #include <QDir>
-#include <QEvent>
-#include <QHideEvent>
 #include <QKeySequence>
 #include <QShortcut>
 #include <QShowEvent>
@@ -30,7 +27,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     vbox->setContentsMargins(0, 0, 0, 0);
     vbox->setSpacing(0);
 
-    // Mounted right below KWin's SSD titlebar, directly above the tab bar
+    // Mounted right below KWin's SSD title bar, directly above the tab bar
     m_statsBar = new StatsBarWidget(central);
     vbox->addWidget(m_statsBar);
 
@@ -82,10 +79,10 @@ void MainWindow::recordTabVisit(TerminalTabPane *pane) {
     if (!pane) {
         return;
     }
-    m_tabHistory.erase(
-        std::remove_if(m_tabHistory.begin(), m_tabHistory.end(),
-                       [pane](const QPointer<TerminalTabPane> &p) { return p.isNull() || p.data() == pane; }),
-        m_tabHistory.end());
+    const auto removed = std::ranges::remove_if(
+        m_tabHistory,
+        [pane](const QPointer<TerminalTabPane> &p) { return p.isNull() || p.data() == pane; });
+    m_tabHistory.erase(removed.begin(), removed.end());
     m_tabHistory.prepend(QPointer<TerminalTabPane>(pane));
 }
 
@@ -150,18 +147,18 @@ void MainWindow::closeTabAt(int index) {
     QWidget *w = m_tabs->widget(index);
     auto *closingPane = qobject_cast<TerminalTabPane *>(w);
 
-    m_tabHistory.erase(
-        std::remove_if(m_tabHistory.begin(), m_tabHistory.end(),
-                       [closingPane](const QPointer<TerminalTabPane> &p) {
-                           return p.isNull() || p.data() == closingPane;
-                       }),
-        m_tabHistory.end());
+    const auto removed = std::ranges::remove_if(
+        m_tabHistory,
+        [closingPane](const QPointer<TerminalTabPane> &p) {
+            return p.isNull() || p.data() == closingPane;
+        });
+    m_tabHistory.erase(removed.begin(), removed.end());
 
     TerminalTabPane *nextMru = nullptr;
     if (wasCurrent) {
-        for (const QPointer<TerminalTabPane> &cand : m_tabHistory) {
-            if (cand && cand.data() != closingPane && m_tabs->indexOf(cand.data()) >= 0) {
-                nextMru = cand.data();
+        for (const QPointer<TerminalTabPane> &candidate : m_tabHistory) {
+            if (candidate && candidate.data() != closingPane && m_tabs->indexOf(candidate.data()) >= 0) {
+                nextMru = candidate.data();
                 break;
             }
         }

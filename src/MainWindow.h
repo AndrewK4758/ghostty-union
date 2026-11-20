@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QList>
 #include <QMainWindow>
 #include <QPointer>
 
@@ -12,7 +11,7 @@ class TerminalTabPane;
 
 /**
  * Top-level Union-styled KDE window stacking the live StatsBarWidget directly
- * below KWin's titlebar and above the always-visible QTabWidget terminal panes.
+ * below KWin's title bar and above the always-visible QTabWidget terminal panes.
  */
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -27,7 +26,7 @@ protected:
     void showEvent(QShowEvent *event) override;
 
 private:
-    TerminalTabPane *currentPane() const;
+    [[nodiscard]] TerminalTabPane *currentPane() const;
     void addNewTab(const QString &cwd = {});
     void adoptTerminalInNewTab(TerminalWidget *term);
     void wirePaneSignals(TerminalTabPane *pane);

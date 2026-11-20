@@ -1,11 +1,6 @@
 #pragma once
 
-#include <QFont>
-#include <QHash>
-#include <QList>
 #include <QPointer>
-#include <QStringList>
-#include <QVariant>
 #include <QWidget>
 
 #include <systemstats/SensorInfo.h>
@@ -26,10 +21,10 @@ class DBusInterface;
  * Visual single-row telemetry bar (`40px`) mounted directly above the terminal tabs.
  *
  * Renders full-width Union/Solar-Forge rounded telemetry cards across CPU, RAM,
- * 1..N dynamically enumerated GPU cards, NET, VPN, and ClockPill with equal `±Δpx` growth/shrinkage,
- * 1Hz scrolling sparklines, progress gauges, thermal/load color thresholds, private &
- * public IPv4 readout, glowing VPN status badge, click-to-copy IPs, and a 1-second
- * local clock fed by KDE `org.kde.ksystemstats1` + QNetworkInterface + async public IPv4 lookup.
+ * 1 to N dynamically enumerated GPU cards, NET, VPN, and ClockPill with equal
+ * growth and shrinkage. Displays 1Hz sparklines, progress gauges, thermal/load
+ * thresholds, private/public IPs, a VPN badge, and a 1-second clock fed by KDE
+ * `org.kde.ksystemstats1` and network interfaces.
  */
 class StatsBarWidget final : public QWidget {
     Q_OBJECT
@@ -48,23 +43,23 @@ public:
     /// Subscribe or unsubscribe from ksystemstats D-Bus updates (e.g. when hidden/minimized).
     void setSensorsEnabled(bool enabled);
 
-    /// Current primary display strings of the active telemetry cards (CPU, RAM, 1..N GPUs, NET, VPN).
-    QStringList summaryTexts() const;
+    /// Current primary display strings of the active telemetry cards (CPU, RAM, 1 to N GPUs, NET, VPN).
+    [[nodiscard]] QStringList summaryTexts() const;
 
-    /// Number of currently active GPU cards (`1..N`).
-    int gpuCardCount() const { return static_cast<int>(m_gpuEntries.size()); }
+    /// Number of currently active GPU cards (1 to N).
+    [[nodiscard]] int gpuCardCount() const { return static_cast<int>(m_gpuEntries.size()); }
 
     /// Short display tags of the currently active GPU cards in bar order.
-    QStringList gpuTags() const;
+    [[nodiscard]] QStringList gpuTags() const;
 
     /// Override active GPU descriptors deterministically for testing.
     void setGpusForTesting(const QList<GpuDescriptor> &gpus);
 
     /// Current number of recorded 1Hz sparkline history samples.
-    int historySampleCount() const;
+    [[nodiscard]] int historySampleCount() const;
 
-    QString privateIp() const { return m_lastPrivateIp; }
-    QString publicIp() const { return m_lastPublicIp; }
+    [[nodiscard]] QString privateIp() const { return m_lastPrivateIp; }
+    [[nodiscard]] QString publicIp() const { return m_lastPublicIp; }
     void setPublicIpForTesting(const QString &ip);
 
     static bool isIntegratedGpuName(const QString &name);
@@ -109,10 +104,10 @@ private:
     void pushHistorySample();
     void requestPublicIpEndpoint(int endpointIndex);
     void schedulePublicIpRefresh();
-    void updateNetToolTip();
-    QString formatPercentValue(const QString &sensorId) const;
-    QString formatTempValue(const QString &sensorId) const;
-    QString formatRateCompact(const QString &sensorId) const;
+    void updateNetToolTip() const;
+    [[nodiscard]] QString formatPercentValue(const QString &sensorId) const;
+    [[nodiscard]] QString formatTempValue(const QString &sensorId) const;
+    [[nodiscard]] QString formatRateCompact(const QString &sensorId) const;
     static QString queryIpv4ForInterface(const QString &ifName);
 
     KSysGuard::SystemStats::DBusInterface *m_dbus = nullptr;

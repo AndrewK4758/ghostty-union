@@ -1,12 +1,9 @@
 #pragma once
 
-#include <QList>
-#include <QString>
-#include <QSysInfo>
+#include <QSysInfo> // IWYU pragma: keep
 #include <QUrl>
 #include <QVector>
 
-#include <cstdint>
 #include <ghostty/vt.h>
 
 namespace GhosttyUnionLink {
@@ -20,15 +17,15 @@ struct LinkCellSpan {
 struct ResolvedLink {
     QString rawText;
     QString target;       // canonical local path (if isLocalFile) or full URL string
-    int line = 0;         // 1-based line (>0 when :line or #Lline present)
+    int line = 0;         // 1-based line (>0 when :line or #L<line> present)
     int column = 0;       // 1-based column (>0 when :line:col present)
     bool isLocalFile = false;
     bool isOsc8 = false;
     QVector<LinkCellSpan> spans;
 
-    bool isValid() const { return !target.isEmpty() && !spans.isEmpty(); }
-    QString previewText() const;
-    bool sameDestination(const ResolvedLink &other) const;
+    [[nodiscard]] bool isValid() const { return !target.isEmpty() && !spans.isEmpty(); }
+    [[nodiscard]] QString previewText() const;
+    [[nodiscard]] bool sameDestination(const ResolvedLink &other) const;
 };
 
 /// Decode OSC 7 `file://host/path` and `kitty-shell-cwd://host/path` strings for local hosts.

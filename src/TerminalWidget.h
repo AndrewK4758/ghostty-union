@@ -1,17 +1,13 @@
 #pragma once
 
 #include <QElapsedTimer>
-#include <QFont>
-#include <QHash>
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPoint>
 #include <QSize>
 #include <QTimer>
-#include <QVector>
 #include <QWidget>
 
-#include <cstdint>
 #include <functional>
 #include <ghostty/vt.h>
 
@@ -40,17 +36,17 @@ public:
                             bool startShell = true);
     ~TerminalWidget() override;
 
-    QString title() const { return m_title; }
-    QString currentWorkingDirectory() const { return m_pwd; }
-    QString plainTextSnapshot() const;
+    [[nodiscard]] QString title() const { return m_title; }
+    [[nodiscard]] QString currentWorkingDirectory() const { return m_pwd; }
+    [[nodiscard]] QString plainTextSnapshot() const;
     void feedVtBytes(const QByteArray &bytes);
-    QSize cellSize() const { return QSize(m_cellWidth, m_cellHeight); }
-    static constexpr QPoint viewportOffset() { return QPoint(kPadX, kPadY); }
-    GhosttyTerminalScrollbar scrollbarState() const { return m_scrollbar; }
+    [[nodiscard]] QSize cellSize() const { return {m_cellWidth, m_cellHeight}; }
+    static constexpr QPoint viewportOffset() { return {kPadX, kPadY}; }
+    [[nodiscard]] GhosttyTerminalScrollbar scrollbarState() const { return m_scrollbar; }
 
     using LinkOpenHandler = std::function<bool(const GhosttyUnionLink::ResolvedLink &)>;
 
-    void copySelection();
+    void copySelection() const;
     void pasteClipboard(bool selectionOnly = false);
     void pasteText(const QString &text,
                    GhosttyClipboardLocation location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
@@ -60,12 +56,12 @@ public:
     void zoomOut();
     void zoomReset();
 
-    GhosttyUnionLink::ResolvedLink hoveredLink() const { return m_hoveredLink; }
+    [[nodiscard]] GhosttyUnionLink::ResolvedLink hoveredLink() const { return m_hoveredLink; }
     void setUnfocusedSplitDimmed(bool dimmed);
-    bool isUnfocusedSplitDimmed() const { return m_unfocusedSplitDimmed; }
+    [[nodiscard]] bool isUnfocusedSplitDimmed() const { return m_unfocusedSplitDimmed; }
     void setSplitRearrangeable(bool rearrangeable);
-    bool isSplitRearrangeable() const { return m_splitRearrangeable; }
-    QRectF splitGripRect() const;
+    [[nodiscard]] bool isSplitRearrangeable() const { return m_splitRearrangeable; }
+    [[nodiscard]] QRectF splitGripRect() const;
     void setLinkOpenHandlerForTesting(LinkOpenHandler handler);
     void setPtyOutputSpyForTesting(std::function<void(const QByteArray &)> spy);
 
@@ -122,35 +118,35 @@ private:
     void ensureShellSpawned();
     void updateFontMetrics();
     void resizeTerminalToWidget();
-    void flushPtyBytes(const uint8_t *data, size_t len);
+    void flushPtyBytes(const uint8_t *data, size_t len) const;
     void updateRenderState(bool forceAllDirty = false);
     void renderRowToCache(int y, GhosttyRenderStateRowIterator rowIter,
                           const GhosttyRenderStateColors &colors,
                           int selStart, int selEnd, qreal dpr);
-    void clearSelection();
-    void sendKeyToPty(QKeyEvent *event, GhosttyKeyAction action);
-    bool sendMouseToPty(QMouseEvent *event, GhosttyMouseAction action, Qt::MouseButton qtBtn);
-    void handleSelectionMousePress(QMouseEvent *event);
-    void handleSelectionMouseMove(QMouseEvent *event);
-    void handleSelectionMouseRelease(QMouseEvent *event);
-    void updatePrimaryClipboardFromSelection();
+    void clearSelection() const;
+    void sendKeyToPty(const QKeyEvent *event, GhosttyKeyAction action);
+    bool sendMouseToPty(const QMouseEvent *event, GhosttyMouseAction action, Qt::MouseButton qtBtn) const;
+    void handleSelectionMousePress(const QMouseEvent *event);
+    void handleSelectionMouseMove(const QMouseEvent *event);
+    void handleSelectionMouseRelease(const QMouseEvent *event);
+    void updatePrimaryClipboardFromSelection() const;
     bool cellPointAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const;
     bool strictCellAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const;
-    bool hasScrollbar() const;
-    bool isInScrollbarZone(const QPointF &pos) const;
-    bool isInSplitGripZone(const QPointF &pos) const;
-    bool isNearSplitGripZone(const QPointF &pos) const;
+    [[nodiscard]] bool hasScrollbar() const;
+    [[nodiscard]] bool isInScrollbarZone(const QPointF &pos) const;
+    [[nodiscard]] bool isInSplitGripZone(const QPointF &pos) const;
+    [[nodiscard]] bool isNearSplitGripZone(const QPointF &pos) const;
     bool computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const;
     void scrollViewportToThumbTop(qreal desiredThumbTop);
     void updateScrollbarHoverState(const QPointF &pos);
     void updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers mods);
     void clearHoveredLink();
     void refreshMouseCursor();
-    bool activateLink(const GhosttyUnionLink::ResolvedLink &link);
+    void activateLink(const GhosttyUnionLink::ResolvedLink &link) const;
     void showContextMenu(const QPointF &localPos, const QPoint &globalPos);
-    bool tryClickToMovePromptCursor(const QPointF &pos);
-    void sendFocusEventToPty(GhosttyFocusEvent ev);
-    void applyTerminalPalette();
+    [[nodiscard]] bool tryClickToMovePromptCursor(const QPointF &pos) const;
+    void sendFocusEventToPty(GhosttyFocusEvent ev) const;
+    void applyTerminalPalette() const;
 
     // libghostty-vt C callbacks
     static void onWritePty(GhosttyTerminal terminal, void *userdata, const uint8_t *data, size_t len);

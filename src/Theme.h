@@ -2,7 +2,6 @@
 
 #include <QColor>
 #include <array>
-#include <cstdint>
 #include <ghostty/vt.h>
 
 namespace GhosttyUnionTheme {
@@ -45,11 +44,11 @@ inline constexpr std::array<GhosttyColorRgb, 16> kOllieAnsi16{{
 }};
 
 inline QColor toQColor(const GhosttyColorRgb &c) {
-    return QColor(c.r, c.g, c.b);
+    return {c.r, c.g, c.b};
 }
 
 inline QColor withAlpha(const GhosttyColorRgb &c, int alpha) {
-    return QColor(c.r, c.g, c.b, alpha);
+    return {c.r, c.g, c.b, alpha};
 }
 
 } // namespace GhosttyUnionTheme
