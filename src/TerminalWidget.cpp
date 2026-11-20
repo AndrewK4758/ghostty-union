@@ -2,12 +2,20 @@
 #include "KeyMap.h"
 #include "Theme.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QClipboard>
+#include <QCursor>
+#include <QDBusConnection>
+#include <QDBusInterface>
 #include <QDir>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QEvent>
+#include <QFileInfo>
 #include <QFontMetricsF>
 #include <QKeyEvent>
+#include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -16,8 +24,11 @@
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QSocketNotifier>
+#include <QSysInfo>
 #include <QTransform>
 #include <QUrl>
+#include <QVariantList>
+#include <QVariantMap>
 #include <QWheelEvent>
 
 #include <algorithm>
@@ -645,6 +656,86 @@ void drawPowerlineSymbol(QPainter &p, uint32_t cp, int x, int w, int h, const QC
     p.restore();
 }
 
+QString sanitizeNotificationText(const QString &s) {
+    QString out;
+    out.reserve(s.size());
+    for (const QChar ch : s) {
+        const ushort uc = ch.unicode();
+        if (uc < 0x20U || uc == 0x7fU) {
+            if (uc == '\n' || uc == '\t') {
+                out.append(QLatin1Char(' '));
+            }
+            continue;
+        }
+        // Strip directional override / isolate formatting characters
+        if ((uc >= 0x202AU && uc <= 0x202EU) ||
+            (uc >= 0x2066U && uc <= 0x2069U) ||
+            uc == 0x200EU || uc == 0x200FU) {
+            continue;
+        }
+        out.append(ch);
+    }
+    return out;
+}
+
+Qt::CursorShape mapGhosttyMouseShape(GhosttyMouseShape shape) {
+    switch (shape) {
+    case GHOSTTY_MOUSE_SHAPE_DEFAULT:
+    case GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU:
+    case GHOSTTY_MOUSE_SHAPE_ZOOM_IN:
+    case GHOSTTY_MOUSE_SHAPE_ZOOM_OUT:
+        return Qt::ArrowCursor;
+    case GHOSTTY_MOUSE_SHAPE_HELP:
+        return Qt::WhatsThisCursor;
+    case GHOSTTY_MOUSE_SHAPE_POINTER:
+        return Qt::PointingHandCursor;
+    case GHOSTTY_MOUSE_SHAPE_PROGRESS:
+        return Qt::BusyCursor;
+    case GHOSTTY_MOUSE_SHAPE_WAIT:
+        return Qt::WaitCursor;
+    case GHOSTTY_MOUSE_SHAPE_CELL:
+    case GHOSTTY_MOUSE_SHAPE_CROSSHAIR:
+        return Qt::CrossCursor;
+    case GHOSTTY_MOUSE_SHAPE_TEXT:
+    case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT:
+        return Qt::IBeamCursor;
+    case GHOSTTY_MOUSE_SHAPE_ALIAS:
+        return Qt::DragLinkCursor;
+    case GHOSTTY_MOUSE_SHAPE_COPY:
+        return Qt::DragCopyCursor;
+    case GHOSTTY_MOUSE_SHAPE_MOVE:
+    case GHOSTTY_MOUSE_SHAPE_ALL_SCROLL:
+        return Qt::SizeAllCursor;
+    case GHOSTTY_MOUSE_SHAPE_NO_DROP:
+    case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED:
+        return Qt::ForbiddenCursor;
+    case GHOSTTY_MOUSE_SHAPE_GRAB:
+        return Qt::OpenHandCursor;
+    case GHOSTTY_MOUSE_SHAPE_GRABBING:
+        return Qt::ClosedHandCursor;
+    case GHOSTTY_MOUSE_SHAPE_COL_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_E_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_W_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_EW_RESIZE:
+        return Qt::SizeHorCursor;
+    case GHOSTTY_MOUSE_SHAPE_ROW_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_N_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_S_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_NS_RESIZE:
+        return Qt::SizeVerCursor;
+    case GHOSTTY_MOUSE_SHAPE_NE_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_SW_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_NESW_RESIZE:
+        return Qt::SizeBDiagCursor;
+    case GHOSTTY_MOUSE_SHAPE_NW_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_SE_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE:
+        return Qt::SizeFDiagCursor;
+    default:
+        return Qt::IBeamCursor;
+    }
+}
+
 } // namespace
 
 TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent, bool startShell)
@@ -655,6 +746,7 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_InputMethodEnabled, false);
     setMouseTracking(true);
+    setAcceptDrops(true);
 
     m_clock.start();
 
@@ -671,6 +763,7 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
         return;
     }
     updateRenderState(true);
+    refreshMouseCursor();
 }
 
 TerminalWidget::~TerminalWidget() {
@@ -759,8 +852,12 @@ bool TerminalWidget::initGhostty() {
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_XTVERSION, reinterpret_cast<const void *>(&TerminalWidget::onXtversionQuery));
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE, reinterpret_cast<const void *>(&TerminalWidget::onClipboardWrite));
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, reinterpret_cast<const void *>(&TerminalWidget::onRenderHold));
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_RESET, reinterpret_cast<const void *>(&TerminalWidget::onReset));
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, reinterpret_cast<const void *>(&TerminalWidget::onSemanticPrompt));
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, reinterpret_cast<const void *>(&TerminalWidget::onDesktopNotification));
 
-    const char *terminfoName = "xterm-256color";
+    const bool hasGhosttyTerminfo = QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty"));
+    const char *terminfoName = hasGhosttyTerminfo ? "xterm-ghostty" : "xterm-256color";
     const GhosttyString ti{reinterpret_cast<const uint8_t *>(terminfoName), std::strlen(terminfoName)};
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &ti);
 
@@ -843,6 +940,16 @@ bool TerminalWidget::spawnShell(const QString &workingDirectory) {
     const QByteArray shellEnv = qgetenv("SHELL");
     const char *shellPath = shellEnv.isEmpty() ? "/bin/zsh" : shellEnv.constData();
 
+    const bool hasGhosttyTerminfo = QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty"));
+    const QByteArray termEnv = hasGhosttyTerminfo ? QByteArrayLiteral("xterm-ghostty")
+                                                  : QByteArrayLiteral("xterm-256color");
+    const bool hasGhosttyResources = QFileInfo(QStringLiteral("/usr/share/ghostty")).isDir();
+    const QString shellBase = QFileInfo(QString::fromLocal8Bit(shellPath)).fileName();
+    const bool hasGhosttyZshIntegration =
+        (shellBase == QStringLiteral("zsh")) &&
+        QFileInfo(QStringLiteral("/usr/share/ghostty/shell-integration/zsh/.zshenv")).isReadable();
+    const QByteArray existingZdotdir = qgetenv("ZDOTDIR");
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         ::close(masterFd);
@@ -872,9 +979,27 @@ bool TerminalWidget::spawnShell(const QString &workingDirectory) {
             ::chdir(cwdBytes.constData());
         }
 
-        ::setenv("TERM", "xterm-256color", 1);
+        ::setenv("TERM", termEnv.constData(), 1);
+        if (hasGhosttyTerminfo) {
+            ::setenv("TERMINFO", "/usr/share/terminfo", 0);
+        }
         ::setenv("COLORTERM", "truecolor", 1);
-        ::setenv("TERM_PROGRAM", "ghostty-union", 1);
+        ::setenv("TERM_PROGRAM", "ghostty", 1);
+        ::setenv("TERM_PROGRAM_VERSION", "1.4.0", 1);
+        if (hasGhosttyResources) {
+            ::setenv("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty", 1);
+            ::setenv("GHOSTTY_BIN_DIR", "/usr/bin", 1);
+            ::setenv("GHOSTTY_SHELL_FEATURES", "cursor,sudo,title,path", 1);
+        }
+        if (hasGhosttyZshIntegration) {
+            static constexpr const char kGhosttyZshDir[] = "/usr/share/ghostty/shell-integration/zsh";
+            if (!existingZdotdir.isEmpty() && existingZdotdir != kGhosttyZshDir) {
+                ::setenv("GHOSTTY_ZSH_ZDOTDIR", existingZdotdir.constData(), 1);
+            } else {
+                ::unsetenv("GHOSTTY_ZSH_ZDOTDIR");
+            }
+            ::setenv("ZDOTDIR", kGhosttyZshDir, 1);
+        }
         ::unsetenv("LINES");
         ::unsetenv("COLUMNS");
 
@@ -956,7 +1081,13 @@ void TerminalWidget::onPtyReadable() {
 }
 
 void TerminalWidget::flushPtyBytes(const uint8_t *data, size_t len) {
-    if (m_ptyMasterFd < 0 || !data || len == 0) {
+    if (!data || len == 0) {
+        return;
+    }
+    if (m_ptyOutputSpy) {
+        m_ptyOutputSpy(QByteArray(reinterpret_cast<const char *>(data), static_cast<qsizetype>(len)));
+    }
+    if (m_ptyMasterFd < 0) {
         return;
     }
     size_t sent = 0;
@@ -1081,7 +1212,6 @@ void TerminalWidget::updateRenderState(bool forceAllDirty) {
     if (!hasScrollbar() && (m_scrollbarHovered || m_scrollbarDragging)) {
         m_scrollbarHovered = false;
         m_scrollbarDragging = false;
-        unsetCursor();
     }
 
     uint16_t rsRows = 0;
@@ -1142,6 +1272,14 @@ void TerminalWidget::updateRenderState(bool forceAllDirty) {
     }
 
     ghostty_render_state_clean(m_renderState);
+    if (dirtyState != GHOSTTY_RENDER_STATE_DIRTY_FALSE && m_hoveredLink.isValid()) {
+        if (m_mouseInside) {
+            updateHoveredLink(m_lastMousePos, QApplication::keyboardModifiers());
+        } else {
+            clearHoveredLink();
+        }
+    }
+    refreshMouseCursor();
 }
 
 void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIter,
@@ -1438,6 +1576,24 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         }
     }
 
+    // Ctrl+Hover link underline overlay
+    if (m_hoveredLink.isValid()) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setPen(QPen(QColor(GhosttyUnionTheme::kCyanHex), 1.0));
+        const int underlineOffset = std::min(m_ascent + 2, m_cellHeight - 2);
+        for (const auto &span : m_hoveredLink.spans) {
+            if (span.row >= m_rows) {
+                continue;
+            }
+            const int ux0 = kPadX + static_cast<int>(span.startCol) * m_cellWidth;
+            const int ux1 = kPadX + static_cast<int>(span.endCol + 1) * m_cellWidth - 1;
+            const int uy = kPadY + static_cast<int>(span.row) * m_cellHeight + underlineOffset;
+            p.drawLine(ux0, uy, ux1, uy);
+        }
+        p.restore();
+    }
+
     // Draw cursor over rendered rows (blink applies only when focused)
     const bool showCursor = m_cursor.visible && m_cursor.viewport_has_value &&
                             (!hasFocus() || !m_cursor.blinking || m_blinkVisible);
@@ -1463,6 +1619,11 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         }
     }
 
+    // Ghostty `unfocused-split-opacity = 0.88` wash on inactive split panes
+    if (m_unfocusedSplitDimmed) {
+        p.fillRect(rect(), GhosttyUnionTheme::withAlpha(m_colors.background, 31));
+    }
+
     // Interactive Solar Forge / Ollie scrollbar gutter when scrollback exists
     QRectF trackRect;
     QRectF thumbRect;
@@ -1481,10 +1642,50 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         p.drawRoundedRect(thumbRect, radius, radius);
         p.restore();
     }
+
+    // Ghostty `link-previews = true` pill overlay
+    if (m_hoveredLink.isValid()) {
+        const QString rawPreview = m_hoveredLink.previewText();
+        if (!rawPreview.isEmpty()) {
+            p.save();
+            QFont uiFont = QApplication::font();
+            uiFont.setPointSizeF(std::max(8.5, uiFont.pointSizeF() - 0.5));
+            p.setFont(uiFont);
+            const QFontMetrics fm(uiFont);
+
+            const int maxPillW = std::max(80, width() - 28);
+            const int hPad = 9;
+            const int vPad = 4;
+            const QString elided = fm.elidedText(rawPreview, Qt::ElideMiddle, maxPillW - 2 * hPad);
+            const int pillW = std::min(maxPillW, fm.horizontalAdvance(elided) + 2 * hPad);
+            const int pillH = fm.height() + 2 * vPad;
+
+            bool bottomBlocked = false;
+            const uint16_t bottomThreshold = (m_rows >= 2) ? static_cast<uint16_t>(m_rows - 2) : 0;
+            for (const auto &span : m_hoveredLink.spans) {
+                if (span.row >= bottomThreshold) {
+                    bottomBlocked = true;
+                    break;
+                }
+            }
+            const int pillY = bottomBlocked ? 6 : std::max(6, height() - pillH - 6);
+            const QRectF pillRect(8.0, static_cast<qreal>(pillY),
+                                  static_cast<qreal>(pillW), static_cast<qreal>(pillH));
+
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.setPen(QPen(QColor(GhosttyUnionTheme::kDividerHex), 1.0));
+            p.setBrush(QColor(0x18, 0x17, 0x1b, 238));
+            p.drawRoundedRect(pillRect, 5.0, 5.0);
+
+            p.setPen(QColor(GhosttyUnionTheme::kCyanHex));
+            p.drawText(pillRect.adjusted(hPad, 0, -hPad, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
+            p.restore();
+        }
+    }
 }
 
 void TerminalWidget::keyPressEvent(QKeyEvent *event) {
-    // Font zoom & copy/paste shortcuts
+    // Font zoom, prompt jump & copy/paste shortcuts
     const auto baseMods = event->modifiers() & ~Qt::KeypadModifier;
     if (baseMods == (Qt::ControlModifier | Qt::ShiftModifier)) {
         if (event->key() == Qt::Key_C) {
@@ -1499,6 +1700,18 @@ void TerminalWidget::keyPressEvent(QKeyEvent *event) {
         }
         if (event->key() == Qt::Key_Plus) {
             zoomIn();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down) {
+            if (m_terminal) {
+                GhosttyTerminalScrollViewport sb{};
+                sb.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT;
+                sb.value.delta_prompt = (event->key() == Qt::Key_Up) ? -1 : 1;
+                ghostty_terminal_scroll_viewport(m_terminal, sb);
+                updateRenderState(false);
+                update();
+            }
             event->accept();
             return;
         }
@@ -1548,18 +1761,47 @@ void TerminalWidget::keyPressEvent(QKeyEvent *event) {
         }
     }
 
+    if (m_mouseInside) {
+        Qt::KeyboardModifiers hoverMods = event->modifiers();
+        if (event->key() == Qt::Key_Control) {
+            hoverMods |= Qt::ControlModifier;
+        } else if (event->key() == Qt::Key_Shift) {
+            hoverMods |= Qt::ShiftModifier;
+        } else if (event->key() == Qt::Key_Alt) {
+            hoverMods |= Qt::AltModifier;
+        } else if (event->key() == Qt::Key_Meta) {
+            hoverMods |= Qt::MetaModifier;
+        }
+        updateHoveredLink(m_lastMousePos, hoverMods);
+    }
+
     sendKeyToPty(event, event->isAutoRepeat() ? GHOSTTY_KEY_ACTION_REPEAT : GHOSTTY_KEY_ACTION_PRESS);
     event->accept();
 }
 
 void TerminalWidget::keyReleaseEvent(QKeyEvent *event) {
+    if (m_mouseInside) {
+        Qt::KeyboardModifiers hoverMods = event->modifiers();
+        if (!event->isAutoRepeat()) {
+            if (event->key() == Qt::Key_Control) {
+                hoverMods &= ~Qt::ControlModifier;
+            } else if (event->key() == Qt::Key_Shift) {
+                hoverMods &= ~Qt::ShiftModifier;
+            } else if (event->key() == Qt::Key_Alt) {
+                hoverMods &= ~Qt::AltModifier;
+            } else if (event->key() == Qt::Key_Meta) {
+                hoverMods &= ~Qt::MetaModifier;
+            }
+        }
+        updateHoveredLink(m_lastMousePos, hoverMods);
+    }
     sendKeyToPty(event, GHOSTTY_KEY_ACTION_RELEASE);
     event->accept();
 }
 
 void TerminalWidget::sendKeyToPty(QKeyEvent *event, GhosttyKeyAction action) {
     ensureShellSpawned();
-    if (!m_terminal || !m_keyEncoder || !m_keyEvent || m_ptyMasterFd < 0) {
+    if (!m_terminal || !m_keyEncoder || !m_keyEvent || (m_ptyMasterFd < 0 && !m_ptyOutputSpy)) {
         return;
     }
 
@@ -1598,6 +1840,22 @@ bool TerminalWidget::cellPointAt(const QPointF &pos, uint16_t &colOut, uint16_t 
     const int yPx = static_cast<int>(pos.y()) - kPadY;
     colOut = static_cast<uint16_t>(std::clamp(xPx / m_cellWidth, 0, m_cols - 1));
     rowOut = static_cast<uint16_t>(std::clamp(yPx / m_cellHeight, 0, m_rows - 1));
+    return true;
+}
+
+bool TerminalWidget::strictCellAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const {
+    if (m_cols == 0 || m_rows == 0 || m_cellWidth <= 0 || m_cellHeight <= 0) {
+        return false;
+    }
+    const int xPx = static_cast<int>(std::floor(pos.x())) - kPadX;
+    const int yPx = static_cast<int>(std::floor(pos.y())) - kPadY;
+    if (xPx < 0 || yPx < 0 ||
+        xPx >= static_cast<int>(m_cols) * m_cellWidth ||
+        yPx >= static_cast<int>(m_rows) * m_cellHeight) {
+        return false;
+    }
+    colOut = static_cast<uint16_t>(xPx / m_cellWidth);
+    rowOut = static_cast<uint16_t>(yPx / m_cellHeight);
     return true;
 }
 
@@ -1685,16 +1943,170 @@ void TerminalWidget::updateScrollbarHoverState(const QPointF &pos) {
         m_scrollbarHovered = hovered;
         update();
     }
-    if (m_scrollbarDragging || m_scrollbarHovered) {
-        setCursor(Qt::ArrowCursor);
-    } else {
-        unsetCursor();
+    refreshMouseCursor();
+}
+
+void TerminalWidget::clearHoveredLink() {
+    if (m_hoveredLink.isValid()) {
+        m_hoveredLink = {};
+        refreshMouseCursor();
+        update();
     }
+}
+
+void TerminalWidget::updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers mods) {
+    const auto nonKeypadMods = mods & ~Qt::KeypadModifier;
+    const bool ctrlOnly = (nonKeypadMods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == Qt::ControlModifier;
+
+    GhosttyUnionLink::ResolvedLink resolved;
+    uint16_t col = 0;
+    uint16_t row = 0;
+    if (m_terminal && m_mouseInside && ctrlOnly && !m_selecting && !m_scrollbarDragging &&
+        !isInScrollbarZone(pos) && strictCellAt(pos, col, row)) {
+        resolved = GhosttyUnionLink::resolveAt(
+            m_terminal, m_cols, m_rows, col, row, m_pwd, /*allowBareCwdFiles=*/true);
+    }
+
+    bool changed = (resolved.isValid() != m_hoveredLink.isValid());
+    if (!changed && resolved.isValid()) {
+        changed = !resolved.sameDestination(m_hoveredLink) ||
+                  resolved.spans.size() != m_hoveredLink.spans.size() ||
+                  (!resolved.spans.isEmpty() && !m_hoveredLink.spans.isEmpty() &&
+                   (resolved.spans.first().row != m_hoveredLink.spans.first().row ||
+                    resolved.spans.first().startCol != m_hoveredLink.spans.first().startCol));
+    }
+    if (changed) {
+        m_hoveredLink = std::move(resolved);
+        refreshMouseCursor();
+        update();
+    }
+}
+
+void TerminalWidget::refreshMouseCursor() {
+    Qt::CursorShape desired = Qt::IBeamCursor;
+    if (m_scrollbarDragging || m_scrollbarHovered) {
+        desired = Qt::ArrowCursor;
+    } else if (m_hoveredLink.isValid()) {
+        desired = Qt::PointingHandCursor;
+    } else if (m_terminal) {
+        GhosttyMouseShape shape = GHOSTTY_MOUSE_SHAPE_TEXT;
+        if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE, &shape) == GHOSTTY_SUCCESS) {
+            desired = mapGhosttyMouseShape(shape);
+        }
+    }
+    if (cursor().shape() != desired) {
+        setCursor(desired);
+    }
+}
+
+bool TerminalWidget::activateLink(const GhosttyUnionLink::ResolvedLink &link) {
+    if (!link.isValid()) {
+        return false;
+    }
+    if (m_linkOpenHandler) {
+        return m_linkOpenHandler(link);
+    }
+    return GhosttyUnionLink::openLink(link);
+}
+
+void TerminalWidget::setUnfocusedSplitDimmed(bool dimmed) {
+    if (m_unfocusedSplitDimmed != dimmed) {
+        m_unfocusedSplitDimmed = dimmed;
+        update();
+    }
+}
+
+void TerminalWidget::setLinkOpenHandlerForTesting(LinkOpenHandler handler) {
+    m_linkOpenHandler = std::move(handler);
+}
+
+void TerminalWidget::setPtyOutputSpyForTesting(std::function<void(const QByteArray &)> spy) {
+    m_ptyOutputSpy = std::move(spy);
+}
+
+void TerminalWidget::resetTerminal() {
+    if (!m_terminal) {
+        return;
+    }
+    m_hoveredLink = {};
+    m_pressedLink = {};
+    m_linkClickPending = false;
+    m_selecting = false;
+    m_renderHeld = false;
+    m_renderHoldTimer.stop();
+    ghostty_terminal_reset(m_terminal);
+    updateRenderState(true);
+    update();
+}
+
+void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &globalPos) {
+    auto *menu = new QMenu(this);
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+
+    uint16_t col = 0;
+    uint16_t row = 0;
+    GhosttyUnionLink::ResolvedLink ctxLink;
+    if (m_terminal && strictCellAt(localPos, col, row)) {
+        ctxLink = GhosttyUnionLink::resolveAt(
+            m_terminal, m_cols, m_rows, col, row, m_pwd, /*allowBareCwdFiles=*/true);
+    }
+
+    if (ctxLink.isValid()) {
+        const QString openLabel = ctxLink.isLocalFile ? QStringLiteral("Open File") : QStringLiteral("Open Link");
+        QAction *openAct = menu->addAction(openLabel);
+        connect(openAct, &QAction::triggered, this, [this, ctxLink]() {
+            activateLink(ctxLink);
+        });
+
+        const QString copyLabel = ctxLink.isLocalFile ? QStringLiteral("Copy File Path") : QStringLiteral("Copy Link Address");
+        QAction *copyLinkAct = menu->addAction(copyLabel);
+        connect(copyLinkAct, &QAction::triggered, this, [ctxLink]() {
+            if (QClipboard *cb = QApplication::clipboard()) {
+                cb->setText(ctxLink.target, QClipboard::Clipboard);
+            }
+        });
+        menu->addSeparator();
+    }
+
+    GhosttySelection activeSel = GHOSTTY_INIT_SIZED(GhosttySelection);
+    const bool hasSelection = m_terminal &&
+        ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_SELECTION, &activeSel) == GHOSTTY_SUCCESS;
+
+    QAction *copyAct = menu->addAction(QStringLiteral("Copy\tCtrl+Shift+C"));
+    copyAct->setEnabled(hasSelection);
+    connect(copyAct, &QAction::triggered, this, &TerminalWidget::copySelection);
+
+    const QClipboard *cb = QApplication::clipboard();
+    const bool hasClipboardText = cb && !cb->text(QClipboard::Clipboard).isEmpty();
+    QAction *pasteAct = menu->addAction(QStringLiteral("Paste\tCtrl+Shift+V"));
+    pasteAct->setEnabled(hasClipboardText);
+    connect(pasteAct, &QAction::triggered, this, [this]() { pasteClipboard(false); });
+
+    menu->addSeparator();
+
+    QAction *splitRightAct = menu->addAction(QStringLiteral("Split Right\tCtrl+Shift+}"));
+    connect(splitRightAct, &QAction::triggered, this, [this]() {
+        Q_EMIT splitRequested(Qt::Horizontal);
+    });
+    QAction *splitDownAct = menu->addAction(QStringLiteral("Split Down\tCtrl+Shift+{"));
+    connect(splitDownAct, &QAction::triggered, this, [this]() {
+        Q_EMIT splitRequested(Qt::Vertical);
+    });
+
+    menu->addSeparator();
+
+    QAction *resetAct = menu->addAction(QStringLiteral("Clear / Reset Terminal"));
+    connect(resetAct, &QAction::triggered, this, &TerminalWidget::resetTerminal);
+
+    menu->popup(globalPos);
 }
 
 void TerminalWidget::mousePressEvent(QMouseEvent *event) {
     setFocus(Qt::MouseFocusReason);
     Q_EMIT focused(this);
+
+    m_lastMousePos = event->position();
+    m_mouseInside = true;
 
     if (isInScrollbarZone(event->position())) {
         if (event->button() == Qt::LeftButton) {
@@ -1717,10 +2129,37 @@ void TerminalWidget::mousePressEvent(QMouseEvent *event) {
         return;
     }
 
+    const auto nonKeypadMods = event->modifiers() & ~Qt::KeypadModifier;
+    const bool ctrlOnly = (nonKeypadMods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == Qt::ControlModifier;
+    if (event->button() == Qt::LeftButton && ctrlOnly && m_terminal) {
+        uint16_t col = 0;
+        uint16_t row = 0;
+        if (strictCellAt(event->position(), col, row)) {
+            const auto link = GhosttyUnionLink::resolveAt(
+                m_terminal, m_cols, m_rows, col, row, m_pwd, /*allowBareCwdFiles=*/true);
+            if (link.isValid()) {
+                m_linkClickPending = true;
+                m_pressedLink = link;
+                m_pressPos = event->position();
+                m_hoveredLink = link;
+                refreshMouseCursor();
+                update();
+                event->accept();
+                return;
+            }
+        }
+    }
+
     const bool shiftBypass = event->modifiers().testFlag(Qt::ShiftModifier);
     bool tracking = false;
     if (!shiftBypass && m_terminal) {
         ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking);
+    }
+
+    if (event->button() == Qt::RightButton && (!tracking || shiftBypass)) {
+        showContextMenu(event->position(), event->globalPosition().toPoint());
+        event->accept();
+        return;
     }
 
     if (tracking && sendMouseToPty(event, GHOSTTY_MOUSE_ACTION_PRESS, event->button())) {
@@ -1738,10 +2177,31 @@ void TerminalWidget::mousePressEvent(QMouseEvent *event) {
 }
 
 void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
+    m_lastMousePos = event->position();
+
     if (m_scrollbarDragging && event->button() == Qt::LeftButton) {
         m_scrollbarDragging = false;
         updateScrollbarHoverState(event->position());
         update();
+        event->accept();
+        return;
+    }
+
+    if (m_linkClickPending && event->button() == Qt::LeftButton) {
+        const auto pressed = m_pressedLink;
+        m_linkClickPending = false;
+        m_pressedLink = {};
+
+        uint16_t col = 0;
+        uint16_t row = 0;
+        if (m_terminal && strictCellAt(event->position(), col, row)) {
+            const auto released = GhosttyUnionLink::resolveAt(
+                m_terminal, m_cols, m_rows, col, row, m_pwd, /*allowBareCwdFiles=*/true);
+            if (released.sameDestination(pressed)) {
+                activateLink(pressed);
+            }
+        }
+        updateHoveredLink(event->position(), event->modifiers());
         event->accept();
         return;
     }
@@ -1762,6 +2222,9 @@ void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
 }
 
 void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
+    m_lastMousePos = event->position();
+    m_mouseInside = true;
+
     if (m_scrollbarDragging) {
         if (!event->buttons().testFlag(Qt::LeftButton)) {
             m_scrollbarDragging = false;
@@ -1774,11 +2237,24 @@ void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
         return;
     }
 
+    if (m_linkClickPending) {
+        if ((event->position() - m_pressPos).manhattanLength() > 6.0) {
+            m_linkClickPending = false;
+            m_pressedLink = {};
+        } else {
+            event->accept();
+            return;
+        }
+    }
+
     updateScrollbarHoverState(event->position());
     if (m_scrollbarHovered && !m_selecting && event->buttons() == Qt::NoButton) {
+        clearHoveredLink();
         event->accept();
         return;
     }
+
+    updateHoveredLink(event->position(), event->modifiers());
 
     const bool shiftBypass = event->modifiers().testFlag(Qt::ShiftModifier);
     bool tracking = false;
@@ -1805,13 +2281,13 @@ void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
 }
 
 void TerminalWidget::leaveEvent(QEvent *event) {
+    m_mouseInside = false;
     if (m_scrollbarHovered) {
         m_scrollbarHovered = false;
-        if (!m_scrollbarDragging) {
-            unsetCursor();
-        }
         update();
     }
+    clearHoveredLink();
+    refreshMouseCursor();
     QWidget::leaveEvent(event);
 }
 
@@ -1986,11 +2462,179 @@ void TerminalWidget::handleSelectionMouseRelease(QMouseEvent *event) {
 
     if (clicks <= 1 && !dragged) {
         clearSelection();
+        if (event->modifiers() == Qt::NoModifier) {
+            tryClickToMovePromptCursor(event->position());
+        }
     } else {
         updatePrimaryClipboardFromSelection();
     }
     updateRenderState(false);
     update();
+}
+
+bool TerminalWidget::tryClickToMovePromptCursor(const QPointF &pos) {
+    if (!m_terminal || !m_keyEncoder || !m_keyEvent || (m_ptyMasterFd < 0 && !m_ptyOutputSpy)) {
+        return false;
+    }
+    GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_ALTERNATE;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen) != GHOSTTY_SUCCESS ||
+        screen != GHOSTTY_TERMINAL_SCREEN_PRIMARY) {
+        return false;
+    }
+    bool tracking = true;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking) != GHOSTTY_SUCCESS || tracking) {
+        return false;
+    }
+    bool activeVp = false;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &activeVp) != GHOSTTY_SUCCESS || !activeVp) {
+        return false;
+    }
+    bool atPrompt = false;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT, &atPrompt) != GHOSTTY_SUCCESS || !atPrompt) {
+        return false;
+    }
+    if (!m_cursor.viewport_has_value) {
+        return false;
+    }
+
+    uint16_t clickCol = 0;
+    uint16_t clickRow = 0;
+    if (!strictCellAt(pos, clickCol, clickRow)) {
+        return false;
+    }
+
+    const uint16_t curCol = m_cursor.viewport_x;
+    const uint16_t curRow = m_cursor.viewport_y;
+    if (curCol >= m_cols || curRow >= m_rows) {
+        return false;
+    }
+
+    auto rowWrapFlag = [&](uint16_t r, GhosttyRowData key) -> bool {
+        GhosttyPoint pt{};
+        pt.tag = GHOSTTY_POINT_TAG_VIEWPORT;
+        pt.value.coordinate = GhosttyPointCoordinate{0, r};
+        GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        if (ghostty_terminal_grid_ref(m_terminal, pt, &ref) != GHOSTTY_SUCCESS) {
+            return false;
+        }
+        GhosttyRow grow{};
+        if (ghostty_grid_ref_row(&ref, &grow) != GHOSTTY_SUCCESS) {
+            return false;
+        }
+        bool flag = false;
+        ghostty_row_get(grow, key, &flag);
+        return flag;
+    };
+    auto rowsWrapped = [&](uint16_t upper, uint16_t lower) -> bool {
+        return lower == upper + 1 &&
+               (rowWrapFlag(upper, GHOSTTY_ROW_DATA_WRAP) || rowWrapFlag(lower, GHOSTTY_ROW_DATA_WRAP_CONTINUATION));
+    };
+
+    uint16_t clusterStart = curRow;
+    while (clusterStart > 0 && rowsWrapped(static_cast<uint16_t>(clusterStart - 1), clusterStart)) {
+        --clusterStart;
+    }
+    uint16_t clusterEnd = curRow;
+    while (clusterEnd + 1 < m_rows && rowsWrapped(clusterEnd, static_cast<uint16_t>(clusterEnd + 1))) {
+        ++clusterEnd;
+    }
+    if (clickRow < clusterStart || clickRow > clusterEnd) {
+        return false;
+    }
+
+    struct PromptCellInfo {
+        bool isInput = false;
+        bool hasText = false;
+    };
+    std::vector<PromptCellInfo> cells;
+    cells.reserve(static_cast<size_t>(clusterEnd - clusterStart + 1) * m_cols);
+    int cursorIdx = -1;
+    int clickIdx = -1;
+
+    for (uint16_t r = clusterStart; r <= clusterEnd; ++r) {
+        for (uint16_t c = 0; c < m_cols; ++c) {
+            GhosttyPoint pt{};
+            pt.tag = GHOSTTY_POINT_TAG_VIEWPORT;
+            pt.value.coordinate = GhosttyPointCoordinate{c, r};
+            GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+            if (ghostty_terminal_grid_ref(m_terminal, pt, &ref) != GHOSTTY_SUCCESS) {
+                continue;
+            }
+            GhosttyCell cell{};
+            if (ghostty_grid_ref_cell(&ref, &cell) != GHOSTTY_SUCCESS) {
+                continue;
+            }
+            GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide);
+            if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL) {
+                if (r == curRow && c == curCol && !cells.empty()) {
+                    cursorIdx = static_cast<int>(cells.size()) - 1;
+                }
+                if (r == clickRow && c == clickCol && !cells.empty()) {
+                    clickIdx = static_cast<int>(cells.size()) - 1;
+                }
+                continue;
+            }
+            if (wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) {
+                continue;
+            }
+
+            GhosttyCellSemanticContent semantic = GHOSTTY_CELL_SEMANTIC_OUTPUT;
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, &semantic);
+            bool hasText = false;
+            ghostty_cell_get(cell, GHOSTTY_CELL_DATA_HAS_TEXT, &hasText);
+
+            const int idx = static_cast<int>(cells.size());
+            if (r == curRow && c == curCol) {
+                cursorIdx = idx;
+            }
+            if (r == clickRow && c == clickCol) {
+                clickIdx = idx;
+            }
+            cells.push_back(PromptCellInfo{semantic == GHOSTTY_CELL_SEMANTIC_INPUT, hasText});
+        }
+    }
+
+    if (cursorIdx < 0 || clickIdx < 0 || cursorIdx == clickIdx) {
+        return false;
+    }
+
+    const int lo = std::min(cursorIdx, clickIdx);
+    const int hi = std::max(cursorIdx, clickIdx);
+    for (int i = lo; i < hi; ++i) {
+        if (!cells[static_cast<size_t>(i)].isInput) {
+            return false;
+        }
+    }
+    const PromptCellInfo &hiCell = cells[static_cast<size_t>(hi)];
+    if (!hiCell.isInput) {
+        if (hiCell.hasText || hi == 0 || !cells[static_cast<size_t>(hi - 1)].isInput) {
+            return false;
+        }
+    }
+
+    const bool goLeft = (clickIdx < cursorIdx);
+    const int steps = hi - lo;
+    ghostty_key_encoder_setopt_from_terminal(m_keyEncoder, m_terminal);
+
+    const int qtArrow = goLeft ? Qt::Key_Left : Qt::Key_Right;
+    const QKeyEvent pressEv(QEvent::KeyPress, qtArrow, Qt::NoModifier);
+    QByteArray utf8Storage;
+    GhosttyUnionKeyMap::populateGhosttyKeyEvent(m_keyEvent, &pressEv, GHOSTTY_KEY_ACTION_PRESS, utf8Storage);
+
+    char seqBuf[64];
+    size_t seqLen = 0;
+    if (ghostty_key_encoder_encode(m_keyEncoder, m_keyEvent, seqBuf, sizeof(seqBuf), &seqLen) != GHOSTTY_SUCCESS || seqLen == 0) {
+        return false;
+    }
+
+    QByteArray out;
+    out.reserve(steps * static_cast<int>(seqLen));
+    for (int i = 0; i < steps; ++i) {
+        out.append(seqBuf, static_cast<qsizetype>(seqLen));
+    }
+    flushPtyBytes(reinterpret_cast<const uint8_t *>(out.constData()), static_cast<size_t>(out.size()));
+    return true;
 }
 
 void TerminalWidget::clearSelection() {
@@ -2061,15 +2705,21 @@ QString TerminalWidget::plainTextSnapshot() const {
 
 void TerminalWidget::pasteClipboard(bool selectionOnly) {
     ensureShellSpawned();
-    if (!m_terminal) {
-        return;
-    }
     const QClipboard *cb = QApplication::clipboard();
     if (!cb) {
         return;
     }
     const QString text = cb->text(selectionOnly ? QClipboard::Selection : QClipboard::Clipboard);
-    if (text.isEmpty()) {
+    pasteText(text,
+              selectionOnly ? GHOSTTY_CLIPBOARD_LOCATION_SELECTION : GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
+              GHOSTTY_PASTE_SOURCE_CLIPBOARD);
+}
+
+void TerminalWidget::pasteText(const QString &text,
+                               GhosttyClipboardLocation location,
+                               GhosttyPasteSource source) {
+    ensureShellSpawned();
+    if (!m_terminal || text.isEmpty()) {
         return;
     }
 
@@ -2078,8 +2728,8 @@ void TerminalWidget::pasteClipboard(bool selectionOnly) {
     const GhosttyString mime{reinterpret_cast<const uint8_t *>(mimeStr), std::strlen(mimeStr)};
 
     GhosttyPaste req = GHOSTTY_INIT_SIZED(GhosttyPaste);
-    req.location = selectionOnly ? GHOSTTY_CLIPBOARD_LOCATION_SELECTION : GHOSTTY_CLIPBOARD_LOCATION_STANDARD;
-    req.source = GHOSTTY_PASTE_SOURCE_CLIPBOARD;
+    req.location = location;
+    req.source = source;
     req.mimes = &mime;
     req.mimes_len = 1;
     req.reader = GhosttyMimeReader{&pasteMimeReader, &ctx};
@@ -2119,16 +2769,67 @@ void TerminalWidget::zoomReset() {
     resizeTerminalToWidget();
 }
 
+void TerminalWidget::sendFocusEventToPty(GhosttyFocusEvent ev) {
+    if (!m_terminal || (m_ptyMasterFd < 0 && !m_ptyOutputSpy)) {
+        return;
+    }
+    GhosttyTerminalModeConfig cfg{};
+    cfg.mode = GHOSTTY_MODE_FOCUS_EVENT;
+    cfg.value = false;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_MODE, &cfg) != GHOSTTY_SUCCESS || !cfg.value) {
+        return;
+    }
+    char buf[16];
+    size_t written = 0;
+    if (ghostty_focus_encode(ev, buf, sizeof(buf), &written) == GHOSTTY_SUCCESS && written > 0) {
+        flushPtyBytes(reinterpret_cast<const uint8_t *>(buf), written);
+    }
+}
+
 void TerminalWidget::focusInEvent(QFocusEvent *event) {
     QWidget::focusInEvent(event);
     m_blinkVisible = true;
+    sendFocusEventToPty(GHOSTTY_FOCUS_GAINED);
     Q_EMIT focused(this);
     update();
 }
 
 void TerminalWidget::focusOutEvent(QFocusEvent *event) {
     QWidget::focusOutEvent(event);
+    m_linkClickPending = false;
+    m_pressedLink = {};
+    clearHoveredLink();
+    sendFocusEventToPty(GHOSTTY_FOCUS_LOST);
     update();
+}
+
+void TerminalWidget::dragEnterEvent(QDragEnterEvent *event) {
+    if (event->mimeData() && (event->mimeData()->hasUrls() || event->mimeData()->hasText())) {
+        event->acceptProposedAction();
+    } else {
+        QWidget::dragEnterEvent(event);
+    }
+}
+
+void TerminalWidget::dropEvent(QDropEvent *event) {
+    const QMimeData *mime = event->mimeData();
+    if (!mime) {
+        QWidget::dropEvent(event);
+        return;
+    }
+    QString payload;
+    if (mime->hasUrls()) {
+        payload = GhosttyUnionLink::shellQuotePaths(mime->urls());
+    }
+    if (payload.isEmpty() && mime->hasText()) {
+        payload = mime->text();
+    }
+    if (!payload.isEmpty()) {
+        pasteText(payload, GHOSTTY_CLIPBOARD_LOCATION_STANDARD, GHOSTTY_PASTE_SOURCE_TEXT);
+        event->acceptProposedAction();
+        return;
+    }
+    QWidget::dropEvent(event);
 }
 
 bool TerminalWidget::focusNextPrevChild(bool /*next*/) {
@@ -2184,15 +2885,11 @@ void TerminalWidget::onPwdChanged(GhosttyTerminal terminal, void *userdata) {
     GhosttyString s{};
     if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_PWD, &s) == GHOSTTY_SUCCESS && s.len > 0) {
         const QString raw = QString::fromUtf8(reinterpret_cast<const char *>(s.ptr), static_cast<qsizetype>(s.len));
-        if (raw.startsWith(QStringLiteral("file://"))) {
-            const QString decoded = QUrl(raw).toLocalFile();
-            if (!decoded.isEmpty()) {
-                self->m_pwd = decoded;
-            }
-        } else {
-            self->m_pwd = raw;
+        const QString parsed = GhosttyUnionLink::parseOsc7Pwd(raw);
+        if (!parsed.isEmpty()) {
+            self->m_pwd = parsed;
+            Q_EMIT self->pwdChanged(self->m_pwd);
         }
-        Q_EMIT self->pwdChanged(self->m_pwd);
     }
 }
 
@@ -2297,4 +2994,62 @@ void TerminalWidget::onRenderHold(GhosttyTerminal terminal, void *userdata, bool
         self->m_renderHeld = false;
         self->m_renderHoldTimer.stop();
     }
+}
+
+void TerminalWidget::onReset(GhosttyTerminal /*terminal*/, void *userdata) {
+    auto *self = static_cast<TerminalWidget *>(userdata);
+    if (!self) {
+        return;
+    }
+    self->m_hoveredLink = {};
+    self->m_pressedLink = {};
+    self->m_linkClickPending = false;
+    self->m_renderHeld = false;
+    self->m_renderHoldTimer.stop();
+    self->m_blinkVisible = true;
+    self->m_rowCache.clear();
+}
+
+void TerminalWidget::onSemanticPrompt(GhosttyTerminal /*terminal*/,
+                                      void * /*userdata*/,
+                                      const GhosttyTerminalSemanticPrompt * /*event*/) {
+}
+
+void TerminalWidget::onDesktopNotification(GhosttyTerminal /*terminal*/,
+                                           void * /*userdata*/,
+                                           const GhosttyTerminalDesktopNotification *notification) {
+    if (!notification) {
+        return;
+    }
+    const QString title = sanitizeNotificationText(
+        notification->title.len > 0
+            ? QString::fromUtf8(reinterpret_cast<const char *>(notification->title.ptr),
+                                static_cast<qsizetype>(notification->title.len))
+            : QStringLiteral("ghostty-union"));
+    const QString body = sanitizeNotificationText(
+        notification->body.len > 0
+            ? QString::fromUtf8(reinterpret_cast<const char *>(notification->body.ptr),
+                                static_cast<qsizetype>(notification->body.len))
+            : QString());
+    if (body.isEmpty() && title.isEmpty()) {
+        return;
+    }
+
+    QDBusInterface iface(QStringLiteral("org.freedesktop.Notifications"),
+                         QStringLiteral("/org/freedesktop/Notifications"),
+                         QStringLiteral("org.freedesktop.Notifications"),
+                         QDBusConnection::sessionBus());
+    if (!iface.isValid()) {
+        return;
+    }
+    iface.call(QDBus::NoBlock,
+               QStringLiteral("Notify"),
+               QStringLiteral("ghostty-union"),
+               static_cast<quint32>(0),
+               QStringLiteral("com.mitchellh.ghostty"),
+               title,
+               body,
+               QStringList{},
+               QVariantMap{},
+               static_cast<qint32>(-1));
 }

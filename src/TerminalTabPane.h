@@ -41,6 +41,7 @@ private:
     void collapseSingleChildSplitter(QSplitter *splitter);
     void collectTerminals(QSplitter *root, QList<TerminalWidget *> &out) const;
     void setSplitTreeVisibility(QWidget *node, bool unzoomed);
+    void updateSplitDimming();
 
     QSplitter *m_rootSplitter = nullptr;
     TerminalWidget *m_active = nullptr;

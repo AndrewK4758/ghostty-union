@@ -132,6 +132,13 @@ void MainWindow::wireShortcuts() {
         connect(sc, &QShortcut::activated, this, fn);
     };
 
+    addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), [this]() {
+        const QString cwd = currentPane() ? currentPane()->currentWorkingDirectory() : QDir::homePath();
+        auto *win = new MainWindow(cwd);
+        win->setAttribute(Qt::WA_DeleteOnClose);
+        win->show();
+    });
+
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T), [this]() { addNewTab(); });
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_W), [this]() {
         if (auto *p = currentPane()) {
@@ -196,13 +203,23 @@ void MainWindow::wireShortcuts() {
         if (auto *p = currentPane()) p->toggleZoom();
     });
 
-    // Tab switching (`Ctrl+Tab`, `Ctrl+Shift+Tab`, `Alt+1..9`)
+    // Tab switching (`Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PageUp/PageDown`, `Alt+1..9`)
     addBind(QKeySequence(Qt::CTRL | Qt::Key_Tab), [this]() {
         if (m_tabs->count() > 1) {
             m_tabs->setCurrentIndex((m_tabs->currentIndex() + 1) % m_tabs->count());
         }
     });
+    addBind(QKeySequence(Qt::CTRL | Qt::Key_PageDown), [this]() {
+        if (m_tabs->count() > 1) {
+            m_tabs->setCurrentIndex((m_tabs->currentIndex() + 1) % m_tabs->count());
+        }
+    });
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Tab), [this]() {
+        if (m_tabs->count() > 1) {
+            m_tabs->setCurrentIndex((m_tabs->currentIndex() - 1 + m_tabs->count()) % m_tabs->count());
+        }
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::Key_PageUp), [this]() {
         if (m_tabs->count() > 1) {
             m_tabs->setCurrentIndex((m_tabs->currentIndex() - 1 + m_tabs->count()) % m_tabs->count());
         }

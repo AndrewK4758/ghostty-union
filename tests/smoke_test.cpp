@@ -1,6 +1,7 @@
 #include "KeyMap.h"
 #include "MainWindow.h"
 #include "StatsBarWidget.h"
+#include "TerminalLink.h"
 #include "TerminalTabPane.h"
 #include "TerminalWidget.h"
 
@@ -9,15 +10,18 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QImage>
 #include <QKeyEvent>
 #include <QLayout>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QSysInfo>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QUrl>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -777,6 +781,313 @@ private Q_SLOTS:
         term.feedVtBytes(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
         QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, QPoint(term.width() - 6, 8));
         QCOMPARE(term.scrollbarState().offset, uint64_t{0});
+    }
+
+    void testOsc7AndKittyPwdTracking() {
+        QCOMPARE(GhosttyUnionLink::parseOsc7Pwd(
+                     QStringLiteral("file://arch_laptop/home/ak/projects%20dir"),
+                     QStringLiteral("arch_laptop")),
+                 QStringLiteral("/home/ak/projects dir"));
+        QCOMPARE(GhosttyUnionLink::parseOsc7Pwd(
+                     QStringLiteral("kitty-shell-cwd://arch_laptop/home/ak/100%20literal"),
+                     QStringLiteral("arch_laptop")),
+                 QStringLiteral("/home/ak/100%20literal"));
+        QCOMPARE(GhosttyUnionLink::parseOsc7Pwd(
+                     QStringLiteral("file:///tmp"),
+                     QStringLiteral("arch_laptop")),
+                 QStringLiteral("/tmp"));
+        QCOMPARE(GhosttyUnionLink::parseOsc7Pwd(
+                     QStringLiteral("/var/tmp"),
+                     QStringLiteral("arch_laptop")),
+                 QStringLiteral("/var/tmp"));
+        QCOMPARE(GhosttyUnionLink::parseOsc7Pwd(
+                     QStringLiteral("file://prod_box/etc/hosts"),
+                     QStringLiteral("arch_laptop")),
+                 QString());
+
+        TerminalWidget term(QStringLiteral("/"), nullptr, /*startShell=*/false);
+        const QString host = QSysInfo::machineHostName();
+        QVERIFY(!host.isEmpty());
+
+        term.feedVtBytes(QStringLiteral("\x1b]7;file://%1/tmp\x1b\\").arg(host).toUtf8());
+        QCOMPARE(term.currentWorkingDirectory(), QStringLiteral("/tmp"));
+
+        term.feedVtBytes(QStringLiteral("\x1b]7;kitty-shell-cwd://%1/var/tmp\x07").arg(host).toUtf8());
+        QCOMPARE(term.currentWorkingDirectory(), QStringLiteral("/var/tmp"));
+
+        term.feedVtBytes(QByteArrayLiteral("\x1b]7;file://untrusted_remote_host/etc\x07"));
+        QCOMPARE(term.currentWorkingDirectory(), QStringLiteral("/var/tmp"));
+    }
+
+    void testCtrlHoverAndCtrlClickLinksAndFiles() {
+        QTemporaryDir tmpDir;
+        QVERIFY(tmpDir.isValid());
+        QVERIFY(QDir().mkpath(tmpDir.filePath(QStringLiteral("src"))));
+        {
+            QFile f1(tmpDir.filePath(QStringLiteral("CMakeLists.txt")));
+            QVERIFY(f1.open(QIODevice::WriteOnly));
+            f1.write("cmake_minimum_required(VERSION 3.24)\n");
+        }
+        {
+            QFile f2(tmpDir.filePath(QStringLiteral("src/Widget.cpp")));
+            QVERIFY(f2.open(QIODevice::WriteOnly));
+            f2.write("int widget() { return 0; }\n");
+        }
+
+        TerminalWidget term(tmpDir.path(), nullptr, /*startShell=*/false);
+        term.resize(760, 360);
+        term.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&term));
+
+        const QSize cs = term.cellSize();
+        const int cw = cs.width();
+        const int ch = cs.height();
+        const QPoint pad = TerminalWidget::viewportOffset();
+        const int cols = std::max(20, (term.width() - 6 - 12) / cw);
+        auto cellCenter = [&](int col, int row) {
+            return QPoint(pad.x() + col * cw + cw / 2, pad.y() + row * ch + ch / 2);
+        };
+
+        const QString host = QSysInfo::machineHostName();
+        const QString canonicalWidget = QFileInfo(tmpDir.filePath(QStringLiteral("src/Widget.cpp"))).canonicalFilePath();
+        const QString canonicalCmake = QFileInfo(tmpDir.filePath(QStringLiteral("CMakeLists.txt"))).canonicalFilePath();
+
+        // Row 0: OSC 8 link
+        // Row 1..2: soft-wrapped https:// URL
+        // Row 3: src/Widget.cpp:128:9: error:
+        // Row 4: ./CMakeLists.txt:15
+        // Row 5: CMakeLists.txt
+        // Row 6: origin/develop (non-existent, must not match)
+        const int wrapSlugLen = std::max(20, cols - 10);
+        const QString longUrl = QStringLiteral("https://example.com/") + QString(wrapSlugLen, QLatin1Char('a'));
+        QByteArray vt;
+        vt.append(QStringLiteral("\x1b]7;file://%1%2\x1b\\").arg(host, tmpDir.path()).toUtf8());
+        vt.append(QStringLiteral("\x1b]8;;file://%1%2#L42\x1b\\Widget\x1b]8;;\x1b\\\r\n")
+                      .arg(host, canonicalWidget).toUtf8());
+        vt.append(longUrl.toUtf8());
+        vt.append("\r\n");
+        vt.append("src/Widget.cpp:128:9: error:\r\n");
+        vt.append("./CMakeLists.txt:15\r\n");
+        vt.append("CMakeLists.txt\r\n");
+        vt.append("origin/develop\r\n");
+        term.feedVtBytes(vt);
+
+        QList<GhosttyUnionLink::ResolvedLink> openedLinks;
+        term.setLinkOpenHandlerForTesting([&](const GhosttyUnionLink::ResolvedLink &lnk) {
+            openedLinks.push_back(lnk);
+            return true;
+        });
+
+        QByteArray ptyBytes;
+        term.setPtyOutputSpyForTesting([&](const QByteArray &b) {
+            ptyBytes.append(b);
+        });
+
+        auto sendMove = [&](const QPoint &pt, Qt::KeyboardModifiers mods) {
+            QMouseEvent ev(QEvent::MouseMove, QPointF(pt), QPointF(term.mapToGlobal(pt)),
+                           Qt::NoButton, Qt::NoButton, mods);
+            QCoreApplication::sendEvent(&term, &ev);
+        };
+
+        // 1. Hover OSC 8 on row 0
+        sendMove(cellCenter(2, 0), Qt::ControlModifier);
+        QVERIFY(term.hoveredLink().isValid());
+        QVERIFY(term.hoveredLink().isOsc8);
+        QVERIFY(term.hoveredLink().isLocalFile);
+        QCOMPARE(term.hoveredLink().target, canonicalWidget);
+        QCOMPARE(term.hoveredLink().line, 42);
+        QCOMPARE(term.cursor().shape(), Qt::PointingHandCursor);
+
+        // 2. Hover soft-wrapped URL on row 2 (continuation of row 1)
+        sendMove(cellCenter(4, 2), Qt::ControlModifier);
+        QVERIFY(term.hoveredLink().isValid());
+        QVERIFY(!term.hoveredLink().isLocalFile);
+        QCOMPARE(term.hoveredLink().target, longUrl);
+        QCOMPARE(term.hoveredLink().spans.size(), 2);
+
+        // 3. Hover src/Widget.cpp:128:9 on row 3 -> line 128, col 9
+        sendMove(cellCenter(4, 3), Qt::ControlModifier);
+        QVERIFY(term.hoveredLink().isValid());
+        QCOMPARE(term.hoveredLink().target, canonicalWidget);
+        QCOMPARE(term.hoveredLink().line, 128);
+        QCOMPARE(term.hoveredLink().column, 9);
+        QVERIFY(!term.grab().toImage().isNull());
+
+        // 4. Stationary Ctrl press & release updates hover state
+        sendMove(cellCenter(4, 4), Qt::NoModifier);
+        QVERIFY(!term.hoveredLink().isValid());
+        QCOMPARE(term.cursor().shape(), Qt::IBeamCursor);
+
+        QKeyEvent ctrlPress(QEvent::KeyPress, Qt::Key_Control, Qt::NoModifier);
+        QCoreApplication::sendEvent(&term, &ctrlPress);
+        QVERIFY(term.hoveredLink().isValid());
+        QCOMPARE(term.hoveredLink().target, canonicalCmake);
+        QCOMPARE(term.hoveredLink().line, 15);
+        QCOMPARE(term.cursor().shape(), Qt::PointingHandCursor);
+
+        QKeyEvent ctrlRelease(QEvent::KeyRelease, Qt::Key_Control, Qt::ControlModifier);
+        QCoreApplication::sendEvent(&term, &ctrlRelease);
+        QVERIFY(!term.hoveredLink().isValid());
+        QCOMPARE(term.cursor().shape(), Qt::IBeamCursor);
+
+        // 5. Bare CMakeLists.txt on row 5 resolves in cwd
+        sendMove(cellCenter(3, 5), Qt::ControlModifier);
+        QVERIFY(term.hoveredLink().isValid());
+        QCOMPARE(term.hoveredLink().target, canonicalCmake);
+
+        // 6. Non-existent origin/develop on row 6 must NOT match
+        sendMove(cellCenter(3, 6), Qt::ControlModifier);
+        QVERIFY(!term.hoveredLink().isValid());
+
+        // 7. Ctrl+Click opens src/Widget.cpp:128:9 (normal mode)
+        openedLinks.clear();
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::ControlModifier, cellCenter(4, 3));
+        QCOMPARE(openedLinks.size(), 1);
+        QCOMPARE(openedLinks.back().target, canonicalWidget);
+        QCOMPARE(openedLinks.back().line, 128);
+        QCOMPARE(openedLinks.back().column, 9);
+
+        // 8. Under mouse tracking (?1000h + ?1006h), Ctrl+Click on link still opens link without leaking to PTY,
+        //    whereas Ctrl+Click on non-link cell forwards SGR mouse sequence to PTY.
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h"));
+        ptyBytes.clear();
+        openedLinks.clear();
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::ControlModifier, cellCenter(4, 3));
+        QCOMPARE(openedLinks.size(), 1);
+        QVERIFY(ptyBytes.isEmpty());
+
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::ControlModifier, cellCenter(3, 6));
+        QCOMPARE(openedLinks.size(), 1);
+        QVERIFY(ptyBytes.contains("\x1b[<"));
+    }
+
+    void testGhosttySurfaceParityFeatures() {
+        // 1. Unfocused split dimming (`unfocused-split-opacity = 0.88`)
+        TerminalTabPane pane;
+        pane.resize(800, 400);
+        pane.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&pane));
+
+        TerminalWidget *t1 = pane.activeTerminal();
+        QVERIFY(t1 != nullptr);
+        QVERIFY(!t1->isUnfocusedSplitDimmed());
+
+        pane.splitActive(Qt::Horizontal);
+        TerminalWidget *t2 = pane.activeTerminal();
+        QVERIFY(t2 != nullptr && t2 != t1);
+        QVERIFY(t1->isUnfocusedSplitDimmed());
+        QVERIFY(!t2->isUnfocusedSplitDimmed());
+
+        QTest::mouseClick(t1, Qt::LeftButton, Qt::NoModifier, QPoint(20, 20));
+        QVERIFY(!t1->isUnfocusedSplitDimmed());
+        QVERIFY(t2->isUnfocusedSplitDimmed());
+
+        pane.toggleZoom();
+        QVERIFY(!t1->isUnfocusedSplitDimmed());
+        pane.toggleZoom();
+        QVERIFY(!t1->isUnfocusedSplitDimmed());
+        QVERIFY(t2->isUnfocusedSplitDimmed());
+
+        // 2. DEC mode 1004 focus events, OSC 22 pointer shapes, OSC 133 click-to-move & prompt jump
+        TerminalWidget term(QString(), nullptr, /*startShell=*/false);
+        term.resize(640, 240);
+        term.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&term));
+
+        QByteArray ptyBytes;
+        term.setPtyOutputSpyForTesting([&](const QByteArray &b) {
+            ptyBytes.append(b);
+        });
+
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1004h"));
+        {
+            QFocusEvent fin(QEvent::FocusIn, Qt::ActiveWindowFocusReason);
+            QCoreApplication::sendEvent(&term, &fin);
+            QFocusEvent fout(QEvent::FocusOut, Qt::ActiveWindowFocusReason);
+            QCoreApplication::sendEvent(&term, &fout);
+        }
+        QCOMPARE(ptyBytes, QByteArrayLiteral("\x1b[I\x1b[O"));
+
+        ptyBytes.clear();
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1004l"));
+        {
+            QFocusEvent fin(QEvent::FocusIn, Qt::ActiveWindowFocusReason);
+            QCoreApplication::sendEvent(&term, &fin);
+        }
+        QVERIFY(ptyBytes.isEmpty());
+
+        // OSC 22 cursor shapes
+        term.feedVtBytes(QByteArrayLiteral("\x1b]22;pointer\x07"));
+        QCOMPARE(term.cursor().shape(), Qt::PointingHandCursor);
+        term.feedVtBytes(QByteArrayLiteral("\x1b]22;text\x07"));
+        QCOMPARE(term.cursor().shape(), Qt::IBeamCursor);
+
+        // OSC 133 click-to-move
+        const QSize cs = term.cellSize();
+        const int cw = cs.width();
+        const int ch = cs.height();
+        const QPoint pad = TerminalWidget::viewportOffset();
+        auto cellCenter = [&](int col, int row) {
+            return QPoint(pad.x() + col * cw + cw / 2, pad.y() + row * ch + ch / 2);
+        };
+
+        term.feedVtBytes(QByteArrayLiteral("\x1b]133;A\x07$ \x1b]133;B\x07" "abcdef"));
+        ptyBytes.clear();
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, cellCenter(3, 0));
+        QCOMPARE(ptyBytes, QByteArrayLiteral("\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D"));
+
+        // Clicking prompt cells or alt-screen must not send arrow keys
+        ptyBytes.clear();
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, cellCenter(0, 0));
+        QVERIFY(ptyBytes.isEmpty());
+
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1049h\x1b]133;A\x07$ \x1b]133;B\x07" "abcdef"));
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, cellCenter(3, 0));
+        QVERIFY(ptyBytes.isEmpty());
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1049l"));
+
+        // Prompt jump (Ctrl+Shift+Up)
+        QByteArray promptLines = QByteArrayLiteral("\r\n\x1b]133;A\x07prompt1\r\n\x1b]133;C\x07");
+        for (int i = 0; i < 60; ++i) {
+            promptLines.append(QStringLiteral("output %1\r\n").arg(i).toUtf8());
+        }
+        promptLines.append("\x1b]133;A\x07prompt2 ");
+        term.feedVtBytes(promptLines);
+        const auto sbBefore = term.scrollbarState();
+        QVERIFY(sbBefore.total > sbBefore.len);
+        const uint64_t maxOffset = sbBefore.total - sbBefore.len;
+        QCOMPARE(sbBefore.offset, maxOffset);
+        QTest::keyClick(&term, Qt::Key_Up, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(term.scrollbarState().offset < maxOffset);
+
+        // Shell quoting for drag-and-drop paths
+        QCOMPARE(GhosttyUnionLink::shellQuotePaths({QUrl::fromLocalFile(QStringLiteral("/tmp/a b/c'd.txt"))}),
+                 QStringLiteral("'/tmp/a b/c'\\''d.txt'"));
+
+        // Live shell integration check: cd updates m_pwd via kitty-shell-cwd / OSC 7 on arch_laptop
+        QTemporaryDir cdTarget;
+        QVERIFY(cdTarget.isValid());
+        const QString canonicalTarget = QFileInfo(cdTarget.path()).canonicalFilePath();
+
+        MainWindow win;
+        win.resize(900, 600);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+
+        const auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        auto *mainPane = qobject_cast<TerminalTabPane *>(tabs->currentWidget());
+        QVERIFY(mainPane != nullptr);
+        TerminalWidget *liveTerm = mainPane->activeTerminal();
+        QVERIFY(liveTerm != nullptr);
+
+        QTest::keyClicks(liveTerm, QStringLiteral("cd %1 && echo __ZSH_CD_DONE__")
+                                       .arg(GhosttyUnionLink::shellQuoteSingle(cdTarget.path())));
+        QTest::keyClick(liveTerm, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            liveTerm->plainTextSnapshot().contains(QLatin1String("__ZSH_CD_DONE__")),
+            5000);
+        QTRY_COMPARE_WITH_TIMEOUT(liveTerm->currentWorkingDirectory(), canonicalTarget, 5000);
     }
 };
 

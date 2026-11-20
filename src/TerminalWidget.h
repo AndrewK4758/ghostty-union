@@ -12,9 +12,14 @@
 #include <QWidget>
 
 #include <cstdint>
+#include <functional>
 #include <ghostty/vt.h>
 
+#include "TerminalLink.h"
+
 class QClipboard;
+class QDragEnterEvent;
+class QDropEvent;
 class QEvent;
 class QShowEvent;
 class QSocketNotifier;
@@ -43,17 +48,30 @@ public:
     static constexpr QPoint viewportOffset() { return QPoint(kPadX, kPadY); }
     GhosttyTerminalScrollbar scrollbarState() const { return m_scrollbar; }
 
+    using LinkOpenHandler = std::function<bool(const GhosttyUnionLink::ResolvedLink &)>;
+
     void copySelection();
     void pasteClipboard(bool selectionOnly = false);
+    void pasteText(const QString &text,
+                   GhosttyClipboardLocation location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
+                   GhosttyPasteSource source = GHOSTTY_PASTE_SOURCE_CLIPBOARD);
+    void resetTerminal();
     void zoomIn();
     void zoomOut();
     void zoomReset();
+
+    GhosttyUnionLink::ResolvedLink hoveredLink() const { return m_hoveredLink; }
+    void setUnfocusedSplitDimmed(bool dimmed);
+    bool isUnfocusedSplitDimmed() const { return m_unfocusedSplitDimmed; }
+    void setLinkOpenHandlerForTesting(LinkOpenHandler handler);
+    void setPtyOutputSpyForTesting(std::function<void(const QByteArray &)> spy);
 
 Q_SIGNALS:
     void titleChanged(const QString &title);
     void pwdChanged(const QString &pwd);
     void focused(TerminalWidget *self);
     void exited(TerminalWidget *self, int exitCode);
+    void splitRequested(Qt::Orientation orientation);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -68,6 +86,8 @@ protected:
     void leaveEvent(QEvent *event) override;
     void focusInEvent(QFocusEvent *event) override;
     void focusOutEvent(QFocusEvent *event) override;
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
     bool focusNextPrevChild(bool next) override;
 
 private Q_SLOTS:
@@ -105,11 +125,19 @@ private:
     void handleSelectionMouseRelease(QMouseEvent *event);
     void updatePrimaryClipboardFromSelection();
     bool cellPointAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const;
+    bool strictCellAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const;
     bool hasScrollbar() const;
     bool isInScrollbarZone(const QPointF &pos) const;
     bool computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const;
     void scrollViewportToThumbTop(qreal desiredThumbTop);
     void updateScrollbarHoverState(const QPointF &pos);
+    void updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers mods);
+    void clearHoveredLink();
+    void refreshMouseCursor();
+    bool activateLink(const GhosttyUnionLink::ResolvedLink &link);
+    void showContextMenu(const QPointF &localPos, const QPoint &globalPos);
+    bool tryClickToMovePromptCursor(const QPointF &pos);
+    void sendFocusEventToPty(GhosttyFocusEvent ev);
     void applyTerminalPalette();
 
     // libghostty-vt C callbacks
@@ -123,6 +151,9 @@ private:
     static GhosttyString onXtversionQuery(GhosttyTerminal terminal, void *userdata);
     static void onClipboardWrite(GhosttyTerminal terminal, void *userdata, const GhosttyClipboardWrite *write);
     static void onRenderHold(GhosttyTerminal terminal, void *userdata, bool held);
+    static void onReset(GhosttyTerminal terminal, void *userdata);
+    static void onSemanticPrompt(GhosttyTerminal terminal, void *userdata, const GhosttyTerminalSemanticPrompt *event);
+    static void onDesktopNotification(GhosttyTerminal terminal, void *userdata, const GhosttyTerminalDesktopNotification *notification);
 
     GhosttyTerminal m_terminal = nullptr;
     GhosttyRenderState m_renderState = nullptr;
@@ -179,4 +210,14 @@ private:
 
     QString m_title = QStringLiteral("zsh");
     QString m_pwd;
+
+    QPointF m_lastMousePos{-1.0, -1.0};
+    bool m_mouseInside = false;
+    GhosttyUnionLink::ResolvedLink m_hoveredLink;
+    GhosttyUnionLink::ResolvedLink m_pressedLink;
+    QPointF m_pressPos;
+    bool m_linkClickPending = false;
+    bool m_unfocusedSplitDimmed = false;
+    LinkOpenHandler m_linkOpenHandler;
+    std::function<void(const QByteArray &)> m_ptyOutputSpy;
 };

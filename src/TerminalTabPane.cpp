@@ -27,6 +27,7 @@ TerminalTabPane::TerminalTabPane(const QString &workingDirectory, QWidget *paren
     TerminalWidget *first = createTerminal(workingDirectory);
     m_rootSplitter->addWidget(first);
     m_active = first;
+    updateSplitDimming();
 }
 
 TerminalWidget *TerminalTabPane::createTerminal(const QString &cwd) {
@@ -38,6 +39,7 @@ TerminalWidget *TerminalTabPane::createTerminal(const QString &cwd) {
 void TerminalTabPane::wireTerminal(TerminalWidget *term) {
     connect(term, &TerminalWidget::focused, this, [this](TerminalWidget *w) {
         m_active = w;
+        updateSplitDimming();
         Q_EMIT titleChanged(title());
     });
     connect(term, &TerminalWidget::titleChanged, this, [this, term](const QString &) {
@@ -47,6 +49,10 @@ void TerminalTabPane::wireTerminal(TerminalWidget *term) {
     });
     connect(term, &TerminalWidget::exited, this, [this](TerminalWidget *w, int /*code*/) {
         removeTerminalWidget(w, true);
+    });
+    connect(term, &TerminalWidget::splitRequested, this, [this, term](Qt::Orientation orient) {
+        m_active = term;
+        splitActive(orient);
     });
 }
 
@@ -114,6 +120,7 @@ void TerminalTabPane::splitActive(Qt::Orientation orientation) {
 
     m_active = child;
     child->setFocus();
+    updateSplitDimming();
 }
 
 bool TerminalTabPane::closeActive() {
@@ -171,6 +178,7 @@ void TerminalTabPane::removeTerminalWidget(TerminalWidget *term, bool deleteIt) 
         m_active = remaining.first();
         m_active->setFocus();
     }
+    updateSplitDimming();
     Q_EMIT titleChanged(title());
 }
 
@@ -240,6 +248,7 @@ void TerminalTabPane::navigateSplit(int dx, int dy) {
     if (best) {
         m_active = best;
         best->setFocus();
+        updateSplitDimming();
         Q_EMIT titleChanged(title());
     }
 }
@@ -300,4 +309,14 @@ void TerminalTabPane::toggleZoom() {
     m_zoomed = !m_zoomed;
     setSplitTreeVisibility(m_rootSplitter, !m_zoomed);
     m_active->setFocus();
+    updateSplitDimming();
+}
+
+void TerminalTabPane::updateSplitDimming() {
+    QList<TerminalWidget *> all;
+    collectTerminals(m_rootSplitter, all);
+    const bool dimInactive = !m_zoomed && all.size() > 1;
+    for (TerminalWidget *w : all) {
+        w->setUnfocusedSplitDimmed(dimInactive && w != m_active);
+    }
 }
