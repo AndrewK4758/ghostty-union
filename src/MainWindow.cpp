@@ -4,6 +4,7 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
+#include <QAbstractButton>
 #include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDir>
@@ -44,6 +45,88 @@
 
 namespace {
 
+class SolarForgeTabCloseButton final : public QAbstractButton {
+public:
+    explicit SolarForgeTabCloseButton(QWidget *parent = nullptr)
+        : QAbstractButton(parent) {
+        setObjectName(QStringLiteral("tabCloseButton"));
+        setFixedSize(18, 18);
+        setFocusPolicy(Qt::NoFocus);
+        setCursor(Qt::PointingHandCursor);
+        setToolTip(QStringLiteral("Close Tab"));
+        setAttribute(Qt::WA_Hover, true);
+
+        m_hoverAnim = new QVariantAnimation(this);
+        m_hoverAnim->setDuration(120);
+        m_hoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_hoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_hoverProgress = v.toReal();
+            update();
+        });
+    }
+
+    [[nodiscard]] QSize sizeHint() const override { return {18, 18}; }
+
+protected:
+    void enterEvent(QEnterEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(1.0);
+        m_hoverAnim->start();
+        QAbstractButton::enterEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(0.0);
+        m_hoverAnim->start();
+        QAbstractButton::leaveEvent(event);
+    }
+
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const QRectF pill = QRectF(rect()).adjusted(1.0, 1.0, -1.0, -1.0);
+        const qreal t = isDown() ? 1.0 : m_hoverProgress;
+
+        // Always draw a subtle glass backing pill, transitioning to Solar Forge crimson on hover
+        if (t > 0.01) {
+            QLinearGradient bgGrad(pill.topLeft(), pill.bottomRight());
+            if (isDown()) {
+                bgGrad.setColorAt(0.0, QColor(0xC9, 0x2A, 0x2A, 235));
+                bgGrad.setColorAt(1.0, QColor(0x9C, 0x1E, 0x24, 240));
+            } else {
+                bgGrad.setColorAt(0.0, QColor(0xFF, 0x5A, 0x1F, static_cast<int>(18 + 204 * t)));
+                bgGrad.setColorAt(1.0, QColor(0xD6, 0x28, 0x28, static_cast<int>(16 + 210 * t)));
+            }
+            p.setBrush(bgGrad);
+            p.setPen(QPen(QColor(255, 168, 96, static_cast<int>(28 + 142 * t)), 0.9));
+        } else {
+            p.setBrush(QColor(255, 255, 255, 16));
+            p.setPen(QPen(QColor(255, 255, 255, 30), 0.8));
+        }
+        p.drawRoundedRect(pill, 5.0, 5.0);
+
+        // Crisp always-visible antialiased vector "×"
+        const QPointF c = pill.center();
+        constexpr qreal half = 3.5;
+        const QColor xCol(
+            static_cast<int>(0xC8 + (0xFF - 0xC8) * t),
+            static_cast<int>(0xCB + (0xFF - 0xCB) * t),
+            static_cast<int>(0xDC + (0xFF - 0xDC) * t),
+            static_cast<int>(225 + 30 * t));
+        p.setPen(QPen(xCol, 1.55 + 0.25 * t, Qt::SolidLine, Qt::RoundCap));
+        p.drawLine(QPointF(c.x() - half, c.y() - half), QPointF(c.x() + half, c.y() + half));
+        p.drawLine(QPointF(c.x() + half, c.y() - half), QPointF(c.x() - half, c.y() + half));
+    }
+
+private:
+    QVariantAnimation *m_hoverAnim = nullptr;
+    qreal m_hoverProgress = 0.0;
+};
+
 class AdaptiveTabBar final : public QTabBar {
 public:
     static constexpr int kPreferredTabWidth = 200;
@@ -68,6 +151,7 @@ public:
             animateIndicatorToTab(idx);
         });
         connect(this, &QTabBar::tabMoved, this, [this](int, int) {
+            alignCloseButtonsInsideTabs();
             snapIndicatorToCurrent();
         });
     }
@@ -84,22 +168,26 @@ public:
         QEvent ev(QEvent::FontChange);
         QCoreApplication::sendEvent(this, &ev);
         updateGeometry();
+        alignCloseButtonsInsideTabs();
         snapIndicatorToCurrent();
     }
 
 protected:
     [[nodiscard]] QSize tabSizeHint(int index) const override {
         const QSize base = QTabBar::tabSizeHint(index);
-        return {targetTabWidth(), std::max(30, base.height())};
+        return {targetTabWidth(), std::max(32, base.height())};
     }
 
     [[nodiscard]] QSize minimumTabSizeHint(int index) const override {
         const QSize base = QTabBar::minimumTabSizeHint(index);
-        return {std::min(kMinTabWidth, targetTabWidth()), std::max(30, base.height())};
+        return {std::min(kMinTabWidth, targetTabWidth()), std::max(32, base.height())};
     }
 
     void tabInserted(int index) override {
         QTabBar::tabInserted(index);
+        if (tabsClosable()) {
+            installCloseButton(index);
+        }
         updateGeometry();
         snapIndicatorToCurrent();
     }
@@ -112,6 +200,7 @@ protected:
 
     void tabLayoutChange() override {
         QTabBar::tabLayoutChange();
+        alignCloseButtonsInsideTabs();
         if (m_indicatorAnim->state() != QAbstractAnimation::Running) {
             snapIndicatorToCurrent();
         }
@@ -119,6 +208,7 @@ protected:
 
     void resizeEvent(QResizeEvent *event) override {
         QTabBar::resizeEvent(event);
+        alignCloseButtonsInsideTabs();
         snapIndicatorToCurrent();
     }
 
@@ -180,6 +270,49 @@ protected:
     }
 
 private:
+    void installCloseButton(int index) {
+        if (index < 0 || index >= count()) {
+            return;
+        }
+        if (dynamic_cast<SolarForgeTabCloseButton *>(tabButton(index, QTabBar::RightSide))) {
+            return;
+        }
+        if (qobject_cast<QAbstractButton *>(tabButton(index, QTabBar::LeftSide))) {
+            setTabButton(index, QTabBar::LeftSide, nullptr);
+        }
+        auto *btn = new SolarForgeTabCloseButton(this);
+        connect(btn, &QAbstractButton::clicked, this, [this, btn]() {
+            for (int i = 0; i < count(); ++i) {
+                if (tabButton(i, QTabBar::RightSide) == btn || tabButton(i, QTabBar::LeftSide) == btn) {
+                    Q_EMIT tabCloseRequested(i);
+                    return;
+                }
+            }
+        });
+        setTabButton(index, QTabBar::RightSide, btn);
+        alignCloseButtonsInsideTabs();
+    }
+
+    void alignCloseButtonsInsideTabs() {
+        for (int i = 0; i < count(); ++i) {
+            auto *btn = dynamic_cast<SolarForgeTabCloseButton *>(tabButton(i, QTabBar::RightSide));
+            if (!btn) {
+                continue;
+            }
+            const QRect r = tabRect(i);
+            if (!r.isValid() || r.width() < btn->width() + 8) {
+                continue;
+            }
+            const int visualRight = r.right() - 3;
+            const int targetX = std::max(r.left() + 4, visualRight - 6 - btn->width() + 1);
+            const int visualTop = r.top() + 3;
+            const int visualH = std::max(btn->height(), r.height() - 5);
+            const int targetY = visualTop + (visualH - btn->height()) / 2;
+            btn->move(targetX, targetY);
+            btn->raise();
+        }
+    }
+
     void snapIndicatorToCurrent() {
         const int idx = currentIndex();
         if (idx < 0 || idx >= count()) {
@@ -1388,7 +1521,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
         "  border-bottom: none;"
         "  border-top-left-radius: 8px;"
         "  border-top-right-radius: 8px;"
-        "  padding: 5px 12px 6px 12px;"
+        "  padding: 5px 10px 6px 12px;"
         "  margin-top: 3px;"
         "  margin-right: 3px;"
         "}"
@@ -1404,14 +1537,6 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
         "  font-weight: 600;"
         "  border: 1px solid rgba(255, 211, 0, 72);"
         "  border-bottom: none;"
-        "}"
-        "QTabBar::close-button {"
-        "  subcontrol-position: right;"
-        "  margin-left: 4px;"
-        "  border-radius: 4px;"
-        "}"
-        "QTabBar::close-button:hover {"
-        "  background: rgba(255, 61, 0, 68);"
         "}"
         "QToolButton#newTabButton {"
         "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #272530, stop:1 #1C1B22);"

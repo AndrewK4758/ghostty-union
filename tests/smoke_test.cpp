@@ -198,7 +198,7 @@ private Q_SLOTS:
         StatsBarWidget bar;
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
-        QCOMPARE(bar.height(), 40);
+        QCOMPARE(bar.height(), 74);
 
         const QStringList procNvidia = StatsBarWidget::readConnectedNvidiaModelsFromProc();
         if (!procNvidia.isEmpty()) {
@@ -248,10 +248,10 @@ private Q_SLOTS:
         QVERIFY(!StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("enp3s0")));
 
         StatsBarWidget bar;
-        bar.resize(1200, 40);
+        bar.resize(1200, 74);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
-        QCOMPARE(bar.height(), 40);
+        QCOMPARE(bar.height(), 74);
 
         bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
         QCOMPARE(bar.publicIp(), QStringLiteral("203.0.113.42"));
@@ -267,7 +267,7 @@ private Q_SLOTS:
         QVERIFY(bar.layout() != nullptr);
         QWidget *netCard = bar.layout()->itemAt(netIdx) ? bar.layout()->itemAt(netIdx)->widget() : nullptr;
         QVERIFY(netCard != nullptr);
-        QCOMPARE(netCard->height(), 32);
+        QCOMPARE(netCard->height(), 64);
 
         if (!bar.privateIp().isEmpty()) {
             QApplication::clipboard()->setText(QStringLiteral("stale"));
@@ -284,7 +284,7 @@ private Q_SLOTS:
 
     [[maybe_unused]] static void testStatsBarFullWidthEvenGrowthAndShrink() {
         StatsBarWidget bar;
-        bar.resize(1220, 40);
+        bar.resize(1220, 74);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
         bar.setGpusForTesting({
@@ -308,7 +308,7 @@ private Q_SLOTS:
         QCOMPARE(bar.layout()->itemAt(itemCount - 1)->widget()->objectName(), QStringLiteral("ClockPill"));
 
         auto snapshotWidths = [&](int targetW) -> std::vector<int> {
-            bar.resize(targetW, 40);
+            bar.resize(targetW, 74);
             bar.layout()->invalidate();
             bar.layout()->activate();
             QApplication::processEvents();
@@ -325,7 +325,7 @@ private Q_SLOTS:
             std::vector<QWidget *> cur(static_cast<size_t>(itemCount), nullptr);
             for (int i = 0; i < itemCount; ++i) {
                 QWidget *w = bar.layout()->itemAt(i)->widget();
-                if (!w || w->height() != 32 || w->width() <= 0) {
+                if (!w || w->height() != 64 || w->width() <= 0) {
                     QTest::qFail("invalid item geometry", __FILE__, __LINE__);
                     return widths;
                 }
@@ -412,13 +412,14 @@ private Q_SLOTS:
 
         bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
         for (const int w : {900, 1220, 2000}) {
-            bar.resize(w, 40);
+            bar.resize(w, 74);
             bar.layout()->invalidate();
             bar.layout()->activate();
             QApplication::processEvents();
             const QImage img = bar.grab().toImage();
             QVERIFY(!img.isNull());
             QCOMPARE(img.width(), qRound(w * img.devicePixelRatio()));
+            QCOMPARE(img.height(), qRound(74 * img.devicePixelRatio()));
         }
 
         QApplication::clipboard()->setText(QStringLiteral("stale"));
@@ -532,7 +533,7 @@ private Q_SLOTS:
 
         // Live UI reconciliation across 1 -> 2 -> 3 -> 1 GPUs
         StatsBarWidget bar;
-        bar.resize(1600, 40);
+        bar.resize(1600, 74);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
 
@@ -1625,15 +1626,57 @@ private Q_SLOTS:
         QVERIFY(bar != nullptr);
         QCOMPARE(bar->elideMode(), Qt::ElideMiddle);
 
+        auto verifyCloseButtonsInsideTabs = [&](int expectedCount) {
+            for (int i = 0; i < expectedCount; ++i) {
+                auto *btn = qobject_cast<QAbstractButton *>(bar->tabButton(i, QTabBar::RightSide));
+                QVERIFY2(btn != nullptr, qPrintable(QStringLiteral("Missing close button on tab %1").arg(i)));
+                QCOMPARE(btn->objectName(), QStringLiteral("tabCloseButton"));
+                const QRect tr = bar->tabRect(i);
+                const QRect br = btn->geometry();
+                if (bar->rect().contains(tr)) {
+                    QVERIFY(btn->isVisible());
+                }
+                QVERIFY2(tr.contains(br),
+                         qPrintable(QStringLiteral("Close button %1,%2 %3x%4 outside tab %5,%6 %7x%8")
+                                        .arg(br.x()).arg(br.y()).arg(br.width()).arg(br.height())
+                                        .arg(tr.x()).arg(tr.y()).arg(tr.width()).arg(tr.height())));
+                QVERIFY2(tr.right() - br.right() >= 6,
+                         qPrintable(QStringLiteral("Close button too close to right edge: tr.right=%1 br.right=%2")
+                                        .arg(tr.right()).arg(br.right())));
+            }
+        };
+
         // Short path title must NOT shrink tab below preferred width (200px)
         tabs->setTabText(0, QStringLiteral("~"));
         QApplication::processEvents();
         QCOMPARE(bar->tabRect(0).width(), 200);
+        verifyCloseButtonsInsideTabs(1);
+
+        // Verify unhovered close button renders visible bright "×" pixels
+        {
+            auto *btn0 = qobject_cast<QAbstractButton *>(bar->tabButton(0, QTabBar::RightSide));
+            QVERIFY(btn0 != nullptr);
+            const QImage btnImg = btn0->grab().toImage().convertToFormat(QImage::Format_ARGB32);
+            QVERIFY(!btnImg.isNull());
+            int brightGlyphPx = 0;
+            for (int y = 0; y < btnImg.height(); ++y) {
+                for (int x = 0; x < btnImg.width(); ++x) {
+                    const QColor c = btnImg.pixelColor(x, y);
+                    if (c.alpha() >= 180 && (c.red() + c.green() + c.blue()) >= 480) {
+                        ++brightGlyphPx;
+                    }
+                }
+            }
+            QVERIFY2(brightGlyphPx >= 8,
+                     qPrintable(QStringLiteral("Unhovered close button lacks visible × glyph pixels (got %1)")
+                                    .arg(brightGlyphPx)));
+        }
 
         // Very long path title must stay capped at preferred width (200px)
         tabs->setTabText(0, QStringLiteral("/home/ak/projects/very/deeply/nested/workspace/directory/path"));
         QApplication::processEvents();
         QCOMPARE(bar->tabRect(0).width(), 200);
+        verifyCloseButtonsInsideTabs(1);
 
         // 3 tabs on 1000px window still have plenty of space -> all remain 200px
         for (int i = 0; i < 2; ++i) {
@@ -1646,6 +1689,7 @@ private Q_SLOTS:
         for (int i = 0; i < 3; ++i) {
             QCOMPARE(bar->tabRect(i).width(), 200);
         }
+        verifyCloseButtonsInsideTabs(3);
 
         // Add 3 more tabs (total 6 -> 1200px > ~970px container): tabs shrink evenly to fit
         for (int i = 0; i < 3; ++i) {
@@ -1660,6 +1704,7 @@ private Q_SLOTS:
             QCOMPARE(bar->tabRect(i).width(), shrunkWidth);
         }
         QVERIFY(shrunkWidth * 6 <= tabs->width());
+        verifyCloseButtonsInsideTabs(6);
 
         // Widening window so 6 * 200 fits restores tabs back to 200px
         win.resize(1400, 600);
@@ -1667,10 +1712,12 @@ private Q_SLOTS:
         for (int i = 1; i < 6; ++i) {
             QCOMPARE(bar->tabRect(i).width(), 200);
         }
+        verifyCloseButtonsInsideTabs(6);
 
         // Narrowing window below 6 * 90 clamps tabs to minimum floor (90px)
         win.resize(450, 600);
         QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 90, 2000);
+        verifyCloseButtonsInsideTabs(6);
     }
 
     [[maybe_unused]] static void testTabRenamingModalContextMenusAndSolarForgeChrome() {
@@ -1795,6 +1842,23 @@ private Q_SLOTS:
         QTest::mouseClick(renameSaveBtn, Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
         QCOMPARE(tabs->tabText(1), QStringLiteral("Logs"));
+
+        // 6. Reordering tabs keeps custom close buttons inside tabs and dynamically targets moved tab
+        bar->moveTab(1, 0);
+        QApplication::processEvents();
+        QCOMPARE(tabs->tabText(0), QStringLiteral("Logs"));
+        auto *movedCloseBtn = qobject_cast<QAbstractButton *>(bar->tabButton(0, QTabBar::RightSide));
+        QVERIFY(movedCloseBtn != nullptr);
+        QVERIFY(bar->tabRect(0).contains(movedCloseBtn->geometry()));
+        QTest::mouseClick(movedCloseBtn, Qt::LeftButton);
+        auto *closeModal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+        auto *closeTargetLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTarget"));
+        auto *closeCancelBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseCancelButton"));
+        QVERIFY(closeModal && closeTargetLbl && closeCancelBtn);
+        QTRY_VERIFY_WITH_TIMEOUT(closeModal->isVisible(), 2000);
+        QVERIFY(closeTargetLbl->text().contains(QLatin1String("Logs")));
+        QTest::mouseClick(closeCancelBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!closeModal->isVisible(), 2000);
     }
 };
 
