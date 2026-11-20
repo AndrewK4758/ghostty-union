@@ -4,8 +4,12 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
+#include <QCoreApplication>
 #include <QDir>
+#include <QEvent>
 #include <QKeySequence>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QShortcut>
 #include <QShowEvent>
 #include <QSignalBlocker>
@@ -16,6 +20,94 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+
+namespace {
+
+class AdaptiveTabBar final : public QTabBar {
+public:
+    static constexpr int kPreferredTabWidth = 200;
+    static constexpr int kMinTabWidth = 90;
+
+    explicit AdaptiveTabBar(QWidget *parent = nullptr)
+        : QTabBar(parent) {
+        setElideMode(Qt::ElideMiddle);
+    }
+
+    void refreshTabGeometry() {
+        QEvent ev(QEvent::FontChange);
+        QCoreApplication::sendEvent(this, &ev);
+        updateGeometry();
+    }
+
+protected:
+    [[nodiscard]] QSize tabSizeHint(int index) const override {
+        const QSize base = QTabBar::tabSizeHint(index);
+        return {targetTabWidth(), base.height()};
+    }
+
+    [[nodiscard]] QSize minimumTabSizeHint(int index) const override {
+        const QSize base = QTabBar::minimumTabSizeHint(index);
+        return {std::min(kMinTabWidth, targetTabWidth()), base.height()};
+    }
+
+    void tabInserted(int index) override {
+        QTabBar::tabInserted(index);
+        updateGeometry();
+    }
+
+    void tabRemoved(int index) override {
+        QTabBar::tabRemoved(index);
+        updateGeometry();
+    }
+
+private:
+    [[nodiscard]] int availableContainerWidth() const {
+        const auto *tw = qobject_cast<const QTabWidget *>(parentWidget());
+        if (!tw) {
+            return width();
+        }
+        int avail = tw->width();
+        if (const QWidget *rightCorner = tw->cornerWidget(Qt::TopRightCorner)) {
+            avail -= std::max(rightCorner->width(), rightCorner->sizeHint().width());
+        }
+        if (const QWidget *leftCorner = tw->cornerWidget(Qt::TopLeftCorner)) {
+            avail -= std::max(leftCorner->width(), leftCorner->sizeHint().width());
+        }
+        return std::max(0, avail - 4);
+    }
+
+    [[nodiscard]] int targetTabWidth() const {
+        const int n = std::max(1, count());
+        const int avail = availableContainerWidth();
+        if (avail <= 0) {
+            return kPreferredTabWidth;
+        }
+        const int floorW = std::min(kMinTabWidth, avail);
+        return std::clamp(avail / n, floorW, kPreferredTabWidth);
+    }
+};
+
+class TerminalTabWidget final : public QTabWidget {
+public:
+    explicit TerminalTabWidget(QWidget *parent = nullptr)
+        : QTabWidget(parent)
+        , m_adaptiveTabBar(new AdaptiveTabBar(this)) {
+        setTabBar(m_adaptiveTabBar);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        if (m_adaptiveTabBar) {
+            m_adaptiveTabBar->refreshTabGeometry();
+        }
+        QTabWidget::resizeEvent(event);
+    }
+
+private:
+    AdaptiveTabBar *m_adaptiveTabBar = nullptr;
+};
+
+} // namespace
 
 MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     : QMainWindow(parent) {
@@ -31,7 +123,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     m_statsBar = new StatsBarWidget(central);
     vbox->addWidget(m_statsBar);
 
-    m_tabs = new QTabWidget(central);
+    m_tabs = new TerminalTabWidget(central);
     m_tabs->setDocumentMode(true);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
@@ -55,7 +147,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     connect(newTabBtn, &QToolButton::clicked, this, [this]() { addNewTab(); });
     m_tabs->setCornerWidget(newTabBtn, Qt::TopRightCorner);
 
-    connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::closeTabAt);
+    connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::requestCloseTabAt);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
         if (auto *p = currentPane()) {
             recordTabVisit(p);
@@ -91,6 +183,7 @@ void MainWindow::wirePaneSignals(TerminalTabPane *pane) {
         const int tabIdx = m_tabs->indexOf(pane);
         if (tabIdx >= 0) {
             m_tabs->setTabText(tabIdx, t);
+            m_tabs->setTabToolTip(tabIdx, t);
         }
         if (pane == currentPane()) {
             updateWindowTitle();
@@ -118,6 +211,7 @@ void MainWindow::addNewTab(const QString &cwd) {
     auto *pane = new TerminalTabPane(dir, m_tabs);
     wirePaneSignals(pane);
     const int idx = m_tabs->addTab(pane, pane->title());
+    m_tabs->setTabToolTip(idx, pane->title());
 
     m_tabs->setCurrentIndex(idx);
     recordTabVisit(pane);
@@ -132,11 +226,82 @@ void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
     auto *pane = new TerminalTabPane(term, m_tabs);
     wirePaneSignals(pane);
     const int idx = m_tabs->addTab(pane, pane->title());
+    m_tabs->setTabToolTip(idx, pane->title());
 
     m_tabs->setCurrentIndex(idx);
     recordTabVisit(pane);
     pane->focusActive();
     updateWindowTitle();
+}
+
+bool MainWindow::confirmCloseTab(const QString &tabTitle, int paneCount) {
+    const QString trimmed = tabTitle.trimmed();
+    const QString displayTitle = trimmed.isEmpty() ? QStringLiteral("zsh") : trimmed;
+    const QString promptText = (paneCount > 1)
+        ? QStringLiteral("Close tab \"%1\" and its %2 split panes?\n\nAny running processes in this tab will be terminated.")
+              .arg(displayTitle)
+              .arg(paneCount)
+        : QStringLiteral("Close tab \"%1\"?\n\nAny running process in this tab will be terminated.")
+              .arg(displayTitle);
+
+    QPointer<QMessageBox> box(new QMessageBox(QMessageBox::Question,
+                                              QStringLiteral("Confirm Close Tab"),
+                                              promptText,
+                                              QMessageBox::NoButton,
+                                              this));
+    const QPushButton *closeBtn = box->addButton(QStringLiteral("Close Tab"), QMessageBox::DestructiveRole);
+    QPushButton *cancelBtn = box->addButton(QMessageBox::Cancel);
+    box->setDefaultButton(cancelBtn);
+    box->setEscapeButton(cancelBtn);
+    box->exec();
+    if (!box) {
+        return false;
+    }
+    const bool accepted = (box->clickedButton() == closeBtn);
+    delete box;
+    return accepted;
+}
+
+void MainWindow::requestCloseTabAt(int index) {
+    if (m_confirmingTabClose || index < 0 || index >= m_tabs->count()) {
+        return;
+    }
+    const QPointer<MainWindow> self(this);
+    const QPointer<TerminalTabPane> targetPane(qobject_cast<TerminalTabPane *>(m_tabs->widget(index)));
+    if (!targetPane) {
+        return;
+    }
+
+    const QString tabTitle = m_tabs->tabText(index);
+    const int paneCount = targetPane->terminalCount();
+
+    m_confirmingTabClose = true;
+    const bool confirmed = confirmCloseTab(tabTitle, paneCount);
+    if (!self) {
+        return;
+    }
+    m_confirmingTabClose = false;
+
+    if (!confirmed) {
+        activateWindow();
+        if (auto *active = currentPane()) {
+            active->focusActive();
+        }
+        return;
+    }
+
+    if (!targetPane) {
+        return;
+    }
+    if (const int currentIdx = m_tabs->indexOf(targetPane.data()); currentIdx >= 0) {
+        closeTabAt(currentIdx);
+        if (self && m_tabs->count() > 0) {
+            activateWindow();
+            if (auto *active = currentPane()) {
+                active->focusActive();
+            }
+        }
+    }
 }
 
 void MainWindow::closeTabAt(int index) {
@@ -219,7 +384,7 @@ void MainWindow::wireShortcuts() {
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_W), [this]() {
         if (auto *p = currentPane()) {
             if (!p->closeActive()) {
-                closeTabAt(m_tabs->currentIndex());
+                requestCloseTabAt(m_tabs->currentIndex());
             }
         }
     });

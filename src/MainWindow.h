@@ -31,6 +31,8 @@ private:
     void adoptTerminalInNewTab(TerminalWidget *term);
     void wirePaneSignals(TerminalTabPane *pane);
     void recordTabVisit(TerminalTabPane *pane);
+    [[nodiscard]] bool confirmCloseTab(const QString &tabTitle, int paneCount);
+    void requestCloseTabAt(int index);
     void closeTabAt(int index);
     void wireShortcuts();
     void updateWindowTitle();
@@ -38,4 +40,5 @@ private:
     StatsBarWidget *m_statsBar = nullptr;
     QTabWidget *m_tabs = nullptr;
     QList<QPointer<TerminalTabPane>> m_tabHistory;
+    bool m_confirmingTabClose = false;
 };
