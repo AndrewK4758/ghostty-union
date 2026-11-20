@@ -7,9 +7,16 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QEvent>
+#include <QFrame>
+#include <QGraphicsDropShadowEffect>
+#include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QKeySequence>
-#include <QMessageBox>
+#include <QLabel>
+#include <QMouseEvent>
+#include <QPainter>
 #include <QPushButton>
+#include <QResizeEvent> // IWYU pragma: keep
 #include <QShortcut>
 #include <QShowEvent>
 #include <QSignalBlocker>
@@ -18,8 +25,10 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 
 #include <algorithm>
+#include <functional>
 
 namespace {
 
@@ -109,6 +118,265 @@ private:
 
 } // namespace
 
+class MainWindow::TabCloseModalOverlay final : public QWidget {
+public:
+    explicit TabCloseModalOverlay(QWidget *parent)
+        : QWidget(parent) {
+        setObjectName(QStringLiteral("tabCloseConfirmModal"));
+        setAttribute(Qt::WA_NoSystemBackground);
+        setFocusPolicy(Qt::StrongFocus);
+        hide();
+
+        auto *outerLayout = new QVBoxLayout(this);
+        outerLayout->setContentsMargins(24, 24, 24, 24);
+        outerLayout->addStretch(1);
+
+        auto *centerRow = new QHBoxLayout();
+        centerRow->addStretch(1);
+
+        m_card = new QFrame(this);
+        m_card->setObjectName(QStringLiteral("tabCloseConfirmCard"));
+        m_card->setMinimumWidth(340);
+        m_card->setMaximumWidth(400);
+        m_card->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        m_card->setStyleSheet(QStringLiteral(
+            "QFrame#tabCloseConfirmCard {"
+            "  background-color: #26252B;"
+            "  border: 1px solid #44403B;"
+            "  border-radius: 12px;"
+            "}"
+            "QLabel#tabCloseModalTitle {"
+            "  color: #F2F1F7;"
+            "  font-size: 15px;"
+            "  font-weight: 700;"
+            "  background: transparent;"
+            "}"
+            "QLabel#tabCloseModalBody {"
+            "  color: #B4B7C9;"
+            "  font-size: 13px;"
+            "  background: transparent;"
+            "}"
+            "QPushButton#tabCloseCancelButton {"
+            "  background-color: #34333B;"
+            "  color: #ECEBF2;"
+            "  border: 1px solid #4B4954;"
+            "  border-radius: 8px;"
+            "  padding: 7px 16px;"
+            "  font-size: 13px;"
+            "  font-weight: 600;"
+            "  min-height: 20px;"
+            "}"
+            "QPushButton#tabCloseCancelButton:hover {"
+            "  background-color: #3F3E48;"
+            "}"
+            "QPushButton#tabCloseCancelButton:pressed {"
+            "  background-color: #2C2B33;"
+            "}"
+            "QPushButton#tabCloseCancelButton:focus {"
+            "  border: 2px solid %1;"
+            "}"
+            "QPushButton#tabCloseConfirmButton {"
+            "  background-color: #B93336;"
+            "  color: #FFFFFF;"
+            "  border: 1px solid #CF4246;"
+            "  border-radius: 8px;"
+            "  padding: 7px 16px;"
+            "  font-size: 13px;"
+            "  font-weight: 700;"
+            "  min-height: 20px;"
+            "}"
+            "QPushButton#tabCloseConfirmButton:hover {"
+            "  background-color: #CE3B3F;"
+            "}"
+            "QPushButton#tabCloseConfirmButton:pressed {"
+            "  background-color: #9A282B;"
+            "}"
+            "QPushButton#tabCloseConfirmButton:focus {"
+            "  border: 2px solid %1;"
+            "}"
+        ).arg(QString::fromLatin1(GhosttyUnionTheme::kGoldHex)));
+
+        auto *shadow = new QGraphicsDropShadowEffect(m_card);
+        shadow->setBlurRadius(28.0);
+        shadow->setOffset(0.0, 8.0);
+        shadow->setColor(QColor(0, 0, 0, 155));
+        m_card->setGraphicsEffect(shadow);
+
+        auto *cardLayout = new QVBoxLayout(m_card);
+        cardLayout->setContentsMargins(22, 20, 22, 20);
+        cardLayout->setSpacing(10);
+
+        m_titleLabel = new QLabel(QStringLiteral("Close Tab?"), m_card);
+        m_titleLabel->setObjectName(QStringLiteral("tabCloseModalTitle"));
+        m_titleLabel->setAlignment(Qt::AlignHCenter);
+        cardLayout->addWidget(m_titleLabel);
+
+        m_bodyLabel = new QLabel(m_card);
+        m_bodyLabel->setObjectName(QStringLiteral("tabCloseModalBody"));
+        m_bodyLabel->setAlignment(Qt::AlignHCenter);
+        m_bodyLabel->setWordWrap(true);
+        cardLayout->addWidget(m_bodyLabel);
+
+        cardLayout->addSpacing(8);
+
+        auto *btnRow = new QHBoxLayout();
+        btnRow->setSpacing(10);
+
+        m_cancelBtn = new QPushButton(QStringLiteral("Cancel"), m_card);
+        m_cancelBtn->setObjectName(QStringLiteral("tabCloseCancelButton"));
+        m_cancelBtn->setAutoDefault(false);
+        m_cancelBtn->setDefault(false);
+        m_cancelBtn->setCursor(Qt::PointingHandCursor);
+        m_cancelBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+        m_closeBtn = new QPushButton(QStringLiteral("Close"), m_card);
+        m_closeBtn->setObjectName(QStringLiteral("tabCloseConfirmButton"));
+        m_closeBtn->setAutoDefault(false);
+        m_closeBtn->setDefault(false);
+        m_closeBtn->setCursor(Qt::PointingHandCursor);
+        m_closeBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+        connect(m_cancelBtn, &QPushButton::clicked, this, [this]() { triggerCancel(); });
+        connect(m_closeBtn, &QPushButton::clicked, this, [this]() { triggerConfirm(); });
+
+        btnRow->addWidget(m_cancelBtn, 1);
+        btnRow->addWidget(m_closeBtn, 1);
+        cardLayout->addLayout(btnRow);
+
+        centerRow->addWidget(m_card);
+        centerRow->addStretch(1);
+        outerLayout->addLayout(centerRow);
+        outerLayout->addStretch(1);
+    }
+
+    void present(const QString &tabTitle,
+                 int paneCount,
+                 std::function<void()> onConfirm,
+                 std::function<void()> onCancel) {
+        m_onConfirm = std::move(onConfirm);
+        m_onCancel = std::move(onCancel);
+
+        const QString trimmed = tabTitle.trimmed();
+        const QString displayTitle = trimmed.isEmpty() ? QStringLiteral("zsh") : trimmed;
+        if (paneCount > 1) {
+            m_titleLabel->setText(QStringLiteral("Close Tab with %1 Panes?").arg(paneCount));
+            m_bodyLabel->setText(
+                QStringLiteral("Closing \"%1\" will terminate running processes in all %2 split panes of this tab.")
+                    .arg(displayTitle)
+                    .arg(paneCount));
+        } else {
+            m_titleLabel->setText(QStringLiteral("Close Tab?"));
+            m_bodyLabel->setText(
+                QStringLiteral("Closing \"%1\" will terminate any running process in this tab.")
+                    .arg(displayTitle));
+        }
+
+        if (const QWidget *pw = parentWidget()) {
+            setGeometry(pw->rect());
+        }
+        raise();
+        show();
+        m_cancelBtn->setFocus(Qt::PopupFocusReason);
+        update();
+    }
+
+    void dismiss() {
+        m_onConfirm = nullptr;
+        m_onCancel = nullptr;
+        hide();
+    }
+
+protected:
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(0x11, 0x10, 0x14, 175));
+    }
+
+    void mousePressEvent(QMouseEvent *event) override {
+        if (m_card && !m_card->geometry().contains(event->position().toPoint())) {
+            triggerCancel();
+        }
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        event->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override {
+        event->accept();
+    }
+
+    void wheelEvent(QWheelEvent *event) override {
+        event->accept();
+    }
+
+    bool focusNextPrevChild(bool /*next*/) override {
+        if (m_cancelBtn && m_closeBtn) {
+            if (m_cancelBtn->hasFocus()) {
+                m_closeBtn->setFocus(Qt::TabFocusReason);
+            } else {
+                m_cancelBtn->setFocus(Qt::TabFocusReason);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void keyPressEvent(QKeyEvent *event) override {
+        if (event->key() == Qt::Key_Escape) {
+            triggerCancel();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Left && m_cancelBtn) {
+            m_cancelBtn->setFocus(Qt::OtherFocusReason);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Right && m_closeBtn) {
+            m_closeBtn->setFocus(Qt::OtherFocusReason);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            if (m_closeBtn && m_closeBtn->hasFocus()) {
+                triggerConfirm();
+            } else {
+                triggerCancel();
+            }
+            event->accept();
+            return;
+        }
+        event->accept();
+    }
+
+private:
+    void triggerConfirm() {
+        auto cb = std::move(m_onConfirm);
+        dismiss();
+        if (cb) {
+            cb();
+        }
+    }
+
+    void triggerCancel() {
+        auto cb = std::move(m_onCancel);
+        dismiss();
+        if (cb) {
+            cb();
+        }
+    }
+
+    QFrame *m_card = nullptr;
+    QLabel *m_titleLabel = nullptr;
+    QLabel *m_bodyLabel = nullptr;
+    QPushButton *m_cancelBtn = nullptr;
+    QPushButton *m_closeBtn = nullptr;
+    std::function<void()> m_onConfirm;
+    std::function<void()> m_onCancel;
+};
+
 MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("ghostty-union"));
@@ -151,7 +419,9 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
         if (auto *p = currentPane()) {
             recordTabVisit(p);
-            p->focusActive();
+            if (!isTabCloseModalVisible()) {
+                p->focusActive();
+            }
         }
         updateWindowTitle();
     });
@@ -159,12 +429,19 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     vbox->addWidget(m_tabs, 1);
     setCentralWidget(central);
 
+    m_closeModal = new TabCloseModalOverlay(this);
+    m_closeModal->setGeometry(rect());
+
     wireShortcuts();
     addNewTab(initialCwd.isEmpty() ? QDir::currentPath() : initialCwd);
 }
 
 TerminalTabPane *MainWindow::currentPane() const {
     return qobject_cast<TerminalTabPane *>(m_tabs->currentWidget());
+}
+
+bool MainWindow::isTabCloseModalVisible() const {
+    return m_closeModal != nullptr && m_closeModal->isVisible();
 }
 
 void MainWindow::recordTabVisit(TerminalTabPane *pane) {
@@ -191,7 +468,7 @@ void MainWindow::wirePaneSignals(TerminalTabPane *pane) {
     });
     connect(pane, &TerminalTabPane::emptied, this, [this](const TerminalTabPane *emptyPane) {
         if (const int tabIdx = m_tabs->indexOf(emptyPane); tabIdx >= 0) {
-            closeTabAt(tabIdx);
+            closeTabAt(tabIdx, /*allowWindowClose=*/true);
         }
     });
     connect(pane, &TerminalTabPane::detachToNewTabRequested, this, &MainWindow::adoptTerminalInNewTab);
@@ -234,83 +511,65 @@ void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
     updateWindowTitle();
 }
 
-bool MainWindow::confirmCloseTab(const QString &tabTitle, int paneCount) {
-    const QString trimmed = tabTitle.trimmed();
-    const QString displayTitle = trimmed.isEmpty() ? QStringLiteral("zsh") : trimmed;
-    const QString promptText = (paneCount > 1)
-        ? QStringLiteral("Close tab \"%1\" and its %2 split panes?\n\nAny running processes in this tab will be terminated.")
-              .arg(displayTitle)
-              .arg(paneCount)
-        : QStringLiteral("Close tab \"%1\"?\n\nAny running process in this tab will be terminated.")
-              .arg(displayTitle);
-
-    QPointer<QMessageBox> box(new QMessageBox(QMessageBox::Question,
-                                              QStringLiteral("Confirm Close Tab"),
-                                              promptText,
-                                              QMessageBox::NoButton,
-                                              this));
-    const QPushButton *closeBtn = box->addButton(QStringLiteral("Close Tab"), QMessageBox::DestructiveRole);
-    QPushButton *cancelBtn = box->addButton(QMessageBox::Cancel);
-    box->setDefaultButton(cancelBtn);
-    box->setEscapeButton(cancelBtn);
-    box->exec();
-    if (!box) {
-        return false;
-    }
-    const bool accepted = (box->clickedButton() == closeBtn);
-    delete box;
-    return accepted;
-}
-
 void MainWindow::requestCloseTabAt(int index) {
-    if (m_confirmingTabClose || index < 0 || index >= m_tabs->count()) {
+    if (isTabCloseModalVisible() || index < 0 || index >= m_tabs->count()) {
         return;
     }
-    const QPointer<MainWindow> self(this);
-    const QPointer<TerminalTabPane> targetPane(qobject_cast<TerminalTabPane *>(m_tabs->widget(index)));
-    if (!targetPane) {
+    auto *targetPane = qobject_cast<TerminalTabPane *>(m_tabs->widget(index));
+    if (!targetPane || !m_closeModal) {
         return;
     }
 
+    m_pendingClosePane = targetPane;
     const QString tabTitle = m_tabs->tabText(index);
     const int paneCount = targetPane->terminalCount();
 
-    m_confirmingTabClose = true;
-    const bool confirmed = confirmCloseTab(tabTitle, paneCount);
-    if (!self) {
-        return;
-    }
-    m_confirmingTabClose = false;
+    m_closeModal->present(
+        tabTitle,
+        paneCount,
+        [this]() { confirmPendingTabClose(); },
+        [this]() { dismissTabCloseModal(/*restoreFocus=*/true); });
+}
 
-    if (!confirmed) {
-        activateWindow();
+void MainWindow::dismissTabCloseModal(bool restoreFocus) {
+    m_pendingClosePane = nullptr;
+    if (m_closeModal && m_closeModal->isVisible()) {
+        m_closeModal->dismiss();
+    }
+    if (restoreFocus) {
+        if (auto *active = currentPane()) {
+            active->focusActive();
+        }
+    }
+}
+
+void MainWindow::confirmPendingTabClose() {
+    const QPointer<TerminalTabPane> targetPane = m_pendingClosePane;
+    m_pendingClosePane = nullptr;
+    if (!targetPane) {
         if (auto *active = currentPane()) {
             active->focusActive();
         }
         return;
     }
-
-    if (!targetPane) {
-        return;
-    }
     if (const int currentIdx = m_tabs->indexOf(targetPane.data()); currentIdx >= 0) {
-        closeTabAt(currentIdx);
-        if (self && m_tabs->count() > 0) {
-            activateWindow();
-            if (auto *active = currentPane()) {
-                active->focusActive();
-            }
-        }
+        closeTabAt(currentIdx, /*allowWindowClose=*/false);
+    } else if (auto *active = currentPane()) {
+        active->focusActive();
     }
 }
 
-void MainWindow::closeTabAt(int index) {
+void MainWindow::closeTabAt(int index, bool allowWindowClose) {
     if (index < 0 || index >= m_tabs->count()) {
         return;
     }
     const bool wasCurrent = (index == m_tabs->currentIndex());
     QWidget *w = m_tabs->widget(index);
     auto *closingPane = qobject_cast<TerminalTabPane *>(w);
+
+    if (m_pendingClosePane && m_pendingClosePane.data() == closingPane) {
+        dismissTabCloseModal(/*restoreFocus=*/false);
+    }
 
     const auto removed = std::ranges::remove_if(
         m_tabHistory,
@@ -337,7 +596,11 @@ void MainWindow::closeTabAt(int index) {
         w->deleteLater();
     }
     if (m_tabs->count() == 0) {
-        close();
+        if (allowWindowClose) {
+            close();
+        } else {
+            addNewTab(QDir::homePath());
+        }
         return;
     }
 
@@ -347,13 +610,15 @@ void MainWindow::closeTabAt(int index) {
     }
     if (auto *active = currentPane()) {
         recordTabVisit(active);
-        active->focusActive();
-        const QPointer<TerminalTabPane> guard(active);
-        QTimer::singleShot(0, this, [guard]() {
-            if (guard && guard->isVisible()) {
-                guard->focusActive();
-            }
-        });
+        if (!isTabCloseModalVisible()) {
+            active->focusActive();
+            const QPointer<TerminalTabPane> guard(active);
+            QTimer::singleShot(0, this, [this, guard]() {
+                if (!isTabCloseModalVisible() && guard && guard->isVisible()) {
+                    guard->focusActive();
+                }
+            });
+        }
     }
     updateWindowTitle();
 }
@@ -370,7 +635,12 @@ void MainWindow::wireShortcuts() {
     auto addBind = [this](const QKeySequence &seq, auto fn) {
         auto *sc = new QShortcut(seq, this);
         sc->setContext(Qt::WindowShortcut);
-        connect(sc, &QShortcut::activated, this, fn);
+        connect(sc, &QShortcut::activated, this, [this, fn]() {
+            if (isTabCloseModalVisible()) {
+                return;
+            }
+            fn();
+        });
     };
 
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), [this]() {
@@ -520,5 +790,12 @@ void MainWindow::showEvent(QShowEvent *event) {
     QMainWindow::showEvent(event);
     if (m_statsBar) {
         m_statsBar->setSensorsEnabled(true);
+    }
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event) {
+    QMainWindow::resizeEvent(event);
+    if (m_closeModal) {
+        m_closeModal->setGeometry(rect());
     }
 }

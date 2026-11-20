@@ -14,8 +14,8 @@
 #include <QFileInfo>
 #include <QImage>
 #include <QKeyEvent> // IWYU pragma: keep
+#include <QLabel>
 #include <QLayout>
-#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QPushButton>
@@ -24,7 +24,6 @@
 #include <QTabWidget>
 #include <QTemporaryDir> // IWYU pragma: keep
 #include <QTest>
-#include <QTimer>
 #include <QUrl>
 #include <algorithm>
 #include <cmath>
@@ -1323,15 +1322,39 @@ private Q_SLOTS:
         QTRY_VERIFY_WITH_TIMEOUT(tC->plainTextSnapshot().contains(QLatin1String("__AFTER_DETACH__")), 5000);
     }
 
-    [[maybe_unused]] static void testTabCloseConfirmationDialog() {
+    [[maybe_unused]] static void testTabCloseCustomModalAndMultiTabIsolation() {
         MainWindow win;
-        win.resize(900, 600);
+        win.resize(960, 620);
         win.show();
         QVERIFY(QTest::qWaitForWindowExposed(&win));
         win.activateWindow();
 
         auto *tabs = win.findChild<QTabWidget *>();
         QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+
+        auto *modal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+        auto *card = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmCard"));
+        auto *titleLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTitle"));
+        auto *bodyLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalBody"));
+        auto *cancelBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseCancelButton"));
+        auto *confirmBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseConfirmButton"));
+        QVERIFY(modal != nullptr);
+        QVERIFY(card != nullptr);
+        QVERIFY(titleLbl != nullptr);
+        QVERIFY(bodyLbl != nullptr);
+        QVERIFY(cancelBtn != nullptr);
+        QVERIFY(confirmBtn != nullptr);
+        QVERIFY(!modal->isVisible());
+
+        auto findCloseButtonForTab = [bar](int idx) -> QAbstractButton * {
+            if (auto *btn = qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::RightSide))) {
+                return btn;
+            }
+            return qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::LeftSide));
+        };
+
         auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
         QVERIFY(pane0 != nullptr);
         TerminalWidget *term0 = pane0->activeTerminal();
@@ -1347,86 +1370,209 @@ private Q_SLOTS:
         TerminalWidget *term1 = pane1->activeTerminal();
         QVERIFY(term1 != nullptr);
         QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+        tabs->setTabText(1, QStringLiteral("work-tab"));
+        QApplication::processEvents();
 
-        auto scheduleModalAction = [](bool confirmClose, bool *sawDialogOut, QString *textOut, bool *cancelIsDefaultOut) {
-            *sawDialogOut = false;
-            if (textOut) {
-                textOut->clear();
-            }
-            if (cancelIsDefaultOut) {
-                *cancelIsDefaultOut = false;
-            }
-            QTimer::singleShot(0, [confirmClose, sawDialogOut, textOut, cancelIsDefaultOut]() {
-                auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
-                if (!box) {
-                    return;
-                }
-                *sawDialogOut = true;
-                if (textOut) {
-                    *textOut = box->text();
-                }
-                QAbstractButton *cancelBtn = box->button(QMessageBox::Cancel);
-                if (cancelIsDefaultOut) {
-                    *cancelIsDefaultOut = (cancelBtn != nullptr &&
-                                           box->defaultButton() == cancelBtn &&
-                                           box->escapeButton() == cancelBtn);
-                }
-                if (confirmClose) {
-                    for (QAbstractButton *btn : box->buttons()) {
-                        if (btn && btn != cancelBtn) {
-                            btn->click();
-                            return;
-                        }
-                    }
-                } else if (cancelBtn) {
-                    cancelBtn->click();
-                }
-            });
-        };
+        // 1. Clicking real QTabBar close button opens in-window custom modal (no OS QMessageBox)
+        QAbstractButton *closeTab1Btn = findCloseButtonForTab(1);
+        QVERIFY(closeTab1Btn != nullptr);
+        QTest::mouseClick(closeTab1Btn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QCOMPARE(QApplication::activeModalWidget(), static_cast<QWidget *>(nullptr));
+        QCOMPARE(modal->geometry(), win.rect());
+        QCOMPARE(titleLbl->text(), QStringLiteral("Close Tab?"));
+        QVERIFY(bodyLbl->text().contains(QLatin1String("work-tab")));
+        QTRY_VERIFY_WITH_TIMEOUT(cancelBtn->hasFocus(), 2000);
 
-        // 1. Clicking tab close (tabCloseRequested) prompts and Cancel keeps tab open + restores focus
-        bool sawDialog = false;
-        QString dialogText;
-        bool cancelIsDefault = false;
-        scheduleModalAction(/*confirmClose=*/false, &sawDialog, &dialogText, &cancelIsDefault);
-        Q_EMIT tabs->tabCloseRequested(1);
-        QVERIFY(sawDialog);
-        QVERIFY(cancelIsDefault);
-        QVERIFY(dialogText.contains(QLatin1String("Close tab")));
+        // Window shortcuts must be blocked while modal is open
+        QTest::keyClick(cancelBtn, Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QApplication::processEvents();
+        QCOMPARE(tabs->count(), 2);
+        QVERIFY(modal->isVisible());
+
+        // Modal tracks window resize and paints cleanly; clicking inside card does NOT dismiss it
+        win.resize(1040, 660);
+        QTRY_COMPARE_WITH_TIMEOUT(modal->geometry(), win.rect(), 2000);
+        QVERIFY(!win.grab().toImage().isNull());
+        QTest::mouseClick(titleLbl, Qt::LeftButton);
+        QApplication::processEvents();
+        QVERIFY(modal->isVisible());
+
+        // Accidental Enter/Return cancels safely (Cancel is focused by default)
+        QTest::keyClick(cancelBtn, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
         QCOMPARE(tabs->count(), 2);
         QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
 
-        // 2. Multi-split tab: tabCloseRequested warns about split pane count; Ctrl+Shift+W closes split without dialog
+        // 2. Escape and clicking backdrop scrim outside the card both cancel safely
+        QTest::mouseClick(closeTab1Btn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::keyClick(cancelBtn, Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        QTest::mouseClick(closeTab1Btn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::mouseClick(modal, Qt::LeftButton, Qt::NoModifier, QPoint(8, 8));
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QCOMPARE(tabs->count(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(term1->hasFocus(), 2000);
+
+        // 3. Multi-split tab: tab close shows pane count; Ctrl+Shift+W closes active split without modal
         pane1->splitActive(Qt::Horizontal);
         QCOMPARE(pane1->terminalCount(), 2);
-        scheduleModalAction(/*confirmClose=*/false, &sawDialog, &dialogText, &cancelIsDefault);
-        Q_EMIT tabs->tabCloseRequested(1);
-        QVERIFY(sawDialog);
-        QVERIFY(cancelIsDefault);
-        QVERIFY(dialogText.contains(QLatin1String("2 split panes")));
+        QTest::mouseClick(findCloseButtonForTab(1), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QCOMPARE(titleLbl->text(), QStringLiteral("Close Tab with 2 Panes?"));
+        QVERIFY(bodyLbl->text().contains(QLatin1String("2 split panes")));
+        QTest::mouseClick(cancelBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
         QCOMPARE(tabs->count(), 2);
         QCOMPARE(pane1->terminalCount(), 2);
         QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
 
         QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
         QTRY_COMPARE_WITH_TIMEOUT(pane1->terminalCount(), 1, 2000);
+        QVERIFY(!modal->isVisible());
         QCOMPARE(tabs->count(), 2);
         QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
 
-        // 3. Ctrl+Shift+W on a single-pane tab prompts: Cancel keeps it, Close Tab removes it
-        scheduleModalAction(/*confirmClose=*/false, &sawDialog, &dialogText, &cancelIsDefault);
-        QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
-        QVERIFY(sawDialog);
-        QVERIFY(cancelIsDefault);
-        QCOMPARE(tabs->count(), 2);
-        QTRY_VERIFY_WITH_TIMEOUT(pane1->activeTerminal() && pane1->activeTerminal()->hasFocus(), 2000);
+        // 4. Closing a non-active tab via its close button closes ONLY that tab, keeping active tab & app open
+        tabs->setTabText(0, QStringLiteral("main-tab"));
+        tabs->setTabText(1, QStringLiteral("build-tab"));
+        tabs->setCurrentIndex(0);
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+        const QPointer<TerminalTabPane> guardPane1(pane1);
+        QTest::mouseClick(findCloseButtonForTab(1), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QVERIFY(bodyLbl->text().contains(QLatin1String("build-tab")));
+        QVERIFY(!bodyLbl->text().contains(QLatin1String("main-tab")));
 
-        scheduleModalAction(/*confirmClose=*/true, &sawDialog, &dialogText, &cancelIsDefault);
-        QTest::keyClick(pane1->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
-        QVERIFY(sawDialog);
+        // Arrow-key navigation inside modal: Right focuses Close, Left focuses Cancel, Tab toggles
+        QTest::keyClick(cancelBtn, Qt::Key_Right);
+        QTRY_VERIFY_WITH_TIMEOUT(confirmBtn->hasFocus(), 2000);
+        QTest::keyClick(confirmBtn, Qt::Key_Left);
+        QTRY_VERIFY_WITH_TIMEOUT(cancelBtn->hasFocus(), 2000);
+        QTest::keyClick(cancelBtn, Qt::Key_Tab);
+        QTRY_VERIFY_WITH_TIMEOUT(confirmBtn->hasFocus(), 2000);
+
+        // Return while Close is focused confirms closing ONLY Tab 1
+        QTest::keyClick(confirmBtn, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
         QCOMPARE(tabs->count(), 1);
         QCOMPARE(tabs->currentWidget(), static_cast<QWidget *>(pane0));
+        QTRY_VERIFY_WITH_TIMEOUT(guardPane1.isNull(), 2000);
         QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+    }
+
+    [[maybe_unused]] static void testClosingLastTabNeverClosesApplication() {
+        MainWindow win;
+        win.resize(960, 620);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+
+        auto *modal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+        auto *cancelBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseCancelButton"));
+        auto *confirmBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseConfirmButton"));
+        QVERIFY(modal != nullptr && cancelBtn != nullptr && confirmBtn != nullptr);
+
+        auto findCloseButtonForTab = [bar](int idx) -> QAbstractButton * {
+            if (auto *btn = qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::RightSide))) {
+                return btn;
+            }
+            return qobject_cast<QAbstractButton *>(bar->tabButton(idx, QTabBar::LeftSide));
+        };
+
+        // 1. Closing the only tab via the tab's close button -> Cancel keeps it and app open
+        QCOMPARE(tabs->count(), 1);
+        const QPointer<TerminalTabPane> origPane(qobject_cast<TerminalTabPane *>(tabs->widget(0)));
+        QVERIFY(origPane);
+        QTRY_VERIFY_WITH_TIMEOUT(origPane->activeTerminal() && origPane->activeTerminal()->hasFocus(), 2000);
+
+        QAbstractButton *closeBtn0 = findCloseButtonForTab(0);
+        QVERIFY(closeBtn0 != nullptr);
+        QTest::mouseClick(closeBtn0, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::mouseClick(cancelBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
+        QCOMPARE(tabs->count(), 1);
+        QCOMPARE(tabs->widget(0), static_cast<QWidget *>(origPane.data()));
+
+        // 2. Confirming close on the ONLY tab must close that tab and open a fresh one, NOT close the window
+        QTest::mouseClick(findCloseButtonForTab(0), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::mouseClick(confirmBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY2(win.isVisible(), "Closing the last tab must NOT close the MainWindow/application");
+        QCOMPARE(tabs->count(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(origPane.isNull(), 2000);
+
+        const QPointer<TerminalTabPane> freshPane(qobject_cast<TerminalTabPane *>(tabs->widget(0)));
+        QVERIFY(freshPane);
+        QTRY_VERIFY_WITH_TIMEOUT(freshPane->activeTerminal() && freshPane->activeTerminal()->hasFocus(), 2000);
+
+        // 3. Confirming close via Ctrl+Shift+W on the last tab also keeps the app open with a fresh tab
+        QTest::keyClick(freshPane->activeTerminal(), Qt::Key_W, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        QTest::mouseClick(confirmBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY2(win.isVisible(), "Ctrl+Shift+W on the last tab must NOT close the MainWindow/application");
+        QCOMPARE(tabs->count(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(freshPane.isNull(), 2000);
+
+        auto *paneA = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(paneA != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(paneA->activeTerminal() && paneA->activeTerminal()->hasFocus(), 2000);
+
+        // 4. Stale index safety: open Tab 1, show close modal for Tab 1, let Tab 0 exit while modal is open
+        QTest::keyClick(paneA->activeTerminal(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+        const QPointer<TerminalTabPane> paneB(qobject_cast<TerminalTabPane *>(tabs->widget(1)));
+        QVERIFY(paneB);
+
+        QTest::mouseClick(findCloseButtonForTab(1), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+
+        // Tab 0 empties while modal is targeting Tab 1 -> Tab 1 shifts to index 0, modal stays open
+        Q_EMIT paneA->emptied(paneA);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 1, 2000);
+        QVERIFY(modal->isVisible());
+        QCOMPARE(tabs->widget(0), static_cast<QWidget *>(paneB.data()));
+
+        // Confirming now closes paneB cleanly without closing the application
+        QTest::mouseClick(confirmBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
+        QCOMPARE(tabs->count(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(paneB.isNull(), 2000);
+
+        // 5. Auto-dismiss safety: if the pending tab itself empties while its modal is open, modal dismisses
+        auto *paneC = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(paneC != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(paneC->activeTerminal() && paneC->activeTerminal()->hasFocus(), 2000);
+        QTest::keyClick(paneC->activeTerminal(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+        auto *paneD = qobject_cast<TerminalTabPane *>(tabs->widget(1));
+        QVERIFY(paneD != nullptr);
+
+        QTest::mouseClick(findCloseButtonForTab(1), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(modal->isVisible(), 2000);
+        Q_EMIT paneD->emptied(paneD);
+        QTRY_VERIFY_WITH_TIMEOUT(!modal->isVisible(), 2000);
+        QVERIFY(win.isVisible());
+        QCOMPARE(tabs->count(), 1);
+        QCOMPARE(tabs->widget(0), static_cast<QWidget *>(paneC));
+        QTRY_VERIFY_WITH_TIMEOUT(paneC->activeTerminal() && paneC->activeTerminal()->hasFocus(), 2000);
     }
 
     [[maybe_unused]] static void testAdaptiveTabBarSizing() {

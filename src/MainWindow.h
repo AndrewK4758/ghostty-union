@@ -24,21 +24,27 @@ protected:
     void changeEvent(QEvent *event) override;
     void hideEvent(QHideEvent *event) override;
     void showEvent(QShowEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
+    class TabCloseModalOverlay;
+
     [[nodiscard]] TerminalTabPane *currentPane() const;
+    [[nodiscard]] bool isTabCloseModalVisible() const;
     void addNewTab(const QString &cwd = {});
     void adoptTerminalInNewTab(TerminalWidget *term);
     void wirePaneSignals(TerminalTabPane *pane);
     void recordTabVisit(TerminalTabPane *pane);
-    [[nodiscard]] bool confirmCloseTab(const QString &tabTitle, int paneCount);
     void requestCloseTabAt(int index);
-    void closeTabAt(int index);
+    void dismissTabCloseModal(bool restoreFocus);
+    void confirmPendingTabClose();
+    void closeTabAt(int index, bool allowWindowClose);
     void wireShortcuts();
     void updateWindowTitle();
 
     StatsBarWidget *m_statsBar = nullptr;
     QTabWidget *m_tabs = nullptr;
     QList<QPointer<TerminalTabPane>> m_tabHistory;
-    bool m_confirmingTabClose = false;
+    TabCloseModalOverlay *m_closeModal = nullptr;
+    QPointer<TerminalTabPane> m_pendingClosePane;
 };
