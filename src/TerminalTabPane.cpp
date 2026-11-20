@@ -2,11 +2,14 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
+#include <QEasingCurve>
 #include <QLayout>
+#include <QLinearGradient>
 #include <QPainter>
 #include <QResizeEvent>
 #include <QSplitter>
 #include <QTimer>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -80,20 +83,38 @@ public:
         setAttribute(Qt::WA_NoSystemBackground);
         setFocusPolicy(Qt::NoFocus);
         hide();
+
+        m_fadeAnim = new QVariantAnimation(this);
+        m_fadeAnim->setDuration(130);
+        m_fadeAnim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_fadeAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_fadeProgress = v.toReal();
+            update();
+        });
     }
 
     void setPreview(const QRect &previewRect, const QString &label) {
         if (m_previewRect == previewRect && m_label == label && isVisible()) {
             return;
         }
+        const bool wasVisible = isVisible();
         m_previewRect = previewRect;
         m_label = label;
         raise();
         show();
+        if (!wasVisible) {
+            m_fadeProgress = 0.0;
+            m_fadeAnim->stop();
+            m_fadeAnim->setStartValue(0.0);
+            m_fadeAnim->setEndValue(1.0);
+            m_fadeAnim->start();
+        }
         update();
     }
 
     void clearPreview() {
+        m_fadeAnim->stop();
+        m_fadeProgress = 0.0;
         m_previewRect = QRect();
         m_label.clear();
         hide();
@@ -106,26 +127,39 @@ protected:
         }
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
+        const qreal t = std::clamp(m_fadeProgress, 0.25, 1.0);
+        p.setOpacity(t);
 
-        QColor fill(GhosttyUnionTheme::kGoldHex);
-        fill.setAlpha(46);
-        p.setPen(QPen(QColor(GhosttyUnionTheme::kGoldHex), 2.0));
-        p.setBrush(fill);
-        p.drawRoundedRect(QRectF(m_previewRect).adjusted(1.0, 1.0, -1.0, -1.0), 6.0, 6.0);
+        const QRectF r = QRectF(m_previewRect).adjusted(2.0, 2.0, -2.0, -2.0);
+        QLinearGradient fillGrad(r.topLeft(), r.bottomRight());
+        fillGrad.setColorAt(0.0, QColor(255, 211, 0, 56));
+        fillGrad.setColorAt(0.6, QColor(255, 152, 0, 40));
+        fillGrad.setColorAt(1.0, QColor(255, 61, 0, 30));
+
+        QLinearGradient borderGrad(r.topLeft(), r.bottomRight());
+        borderGrad.setColorAt(0.0, QColor(GhosttyUnionTheme::kGoldHex));
+        borderGrad.setColorAt(1.0, QColor(GhosttyUnionTheme::kAmberHex));
+
+        p.setPen(QPen(borderGrad, 2.0));
+        p.setBrush(fillGrad);
+        p.drawRoundedRect(r, 9.0, 9.0);
 
         if (!m_label.isEmpty()) {
             const QFontMetrics fm(font());
-            constexpr int padX = 10;
-            constexpr int padY = 5;
-            const int bw = std::min(std::max(60, m_previewRect.width() - 16),
+            constexpr int padX = 12;
+            constexpr int padY = 6;
+            const int bw = std::min(std::max(68, m_previewRect.width() - 16),
                                     fm.horizontalAdvance(m_label) + 2 * padX);
             const int bh = fm.height() + 2 * padY;
             const QPoint c = m_previewRect.center();
-            const QRect badge(c.x() - bw / 2, c.y() - bh / 2, bw, bh);
+            const QRectF badge(c.x() - bw * 0.5, c.y() - bh * 0.5, bw, bh);
 
-            p.setPen(QPen(QColor(GhosttyUnionTheme::kGoldHex), 1.0));
-            p.setBrush(QColor(0x18, 0x17, 0x1b, 235));
-            p.drawRoundedRect(QRectF(badge), 5.0, 5.0);
+            QLinearGradient badgeBg(badge.topLeft(), badge.bottomLeft());
+            badgeBg.setColorAt(0.0, QColor(0x2B, 0x29, 0x34, 245));
+            badgeBg.setColorAt(1.0, QColor(0x1B, 0x1A, 0x22, 248));
+            p.setPen(QPen(QColor(GhosttyUnionTheme::kGoldHex), 1.2));
+            p.setBrush(badgeBg);
+            p.drawRoundedRect(badge, 7.0, 7.0);
 
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
             p.drawText(badge, Qt::AlignCenter, m_label);
@@ -135,6 +169,8 @@ protected:
 private:
     QRect m_previewRect;
     QString m_label;
+    QVariantAnimation *m_fadeAnim = nullptr;
+    qreal m_fadeProgress = 1.0;
 };
 
 TerminalTabPane::TerminalTabPane(const QString &workingDirectory, QWidget *parent)
@@ -161,8 +197,11 @@ void TerminalTabPane::initLayout(TerminalWidget *firstTerminal) {
     m_rootSplitter->setChildrenCollapsible(false);
     m_rootSplitter->setFocusPolicy(Qt::NoFocus);
     m_rootSplitter->setStyleSheet(
-        QStringLiteral("QSplitter::handle { background: %1; }")
-            .arg(QString::fromLatin1(GhosttyUnionTheme::kDividerHex)));
+        QStringLiteral(
+            "QSplitter::handle { background: %1; }"
+            "QSplitter::handle:hover { background: %2; }")
+            .arg(QString::fromLatin1(GhosttyUnionTheme::kDividerHex),
+                 QString::fromLatin1(GhosttyUnionTheme::kGoldHex)));
     layout->addWidget(m_rootSplitter);
 
     m_rootSplitter->addWidget(firstTerminal);
@@ -230,6 +269,9 @@ void TerminalTabPane::wireTerminal(TerminalWidget *term) {
     connect(term, &TerminalWidget::moveToNewTabRequested, this, [this, term]() {
         detachTerminalToNewTab(term);
     });
+    connect(term, &TerminalWidget::renameTabRequested, this, [this]() {
+        Q_EMIT renameTabRequested(this);
+    });
 }
 
 void TerminalTabPane::recordFocusedTerminal(TerminalWidget *term) {
@@ -263,10 +305,22 @@ void TerminalTabPane::activateTerminal(TerminalWidget *term) {
 }
 
 QString TerminalTabPane::title() const {
+    if (!m_customTitle.isEmpty()) {
+        return m_customTitle;
+    }
     if (m_active && !m_active->title().isEmpty()) {
         return m_active->title();
     }
     return QStringLiteral("zsh");
+}
+
+void TerminalTabPane::setCustomTitle(const QString &name) {
+    const QString cleaned = name.trimmed();
+    if (m_customTitle == cleaned) {
+        return;
+    }
+    m_customTitle = cleaned;
+    Q_EMIT titleChanged(title());
 }
 
 int TerminalTabPane::terminalCount() const {
@@ -863,6 +917,7 @@ void TerminalTabPane::updateSplitDimming() const {
     const bool multiSplitVisible = !m_zoomed && all.size() > 1;
     for (TerminalWidget *w : all) {
         w->setUnfocusedSplitDimmed(multiSplitVisible && w != m_active);
+        w->setActiveSplitAccent(multiSplitVisible && w == m_active);
         w->setSplitRearrangeable(multiSplitVisible);
     }
 }

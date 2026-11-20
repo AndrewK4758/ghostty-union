@@ -18,13 +18,14 @@ class DBusInterface;
 }
 
 /**
- * Visual single-row telemetry bar (`40px`) mounted directly above the terminal tabs.
+ * Visual single-row telemetry bar (`74px`) mounted directly above the terminal tabs.
  *
- * Renders full-width Union/Solar-Forge rounded telemetry cards across CPU, RAM,
- * 1 to N dynamically enumerated GPU cards, NET, VPN, and ClockPill with equal
- * growth and shrinkage. Displays 1Hz sparklines, progress gauges, thermal/load
- * thresholds, private/public IPs, a VPN badge, and a 1-second clock fed by KDE
- * `org.kde.ksystemstats1` and network interfaces.
+ * Renders full-width Union/Solar-Forge obsidian-glass cockpit telemetry cards across
+ * CPU, RAM, 1 to N dynamically enumerated GPU cards, NET, VPN, and ClockPill with
+ * equal growth and shrinkage. Displays full-width recessed oscilloscope sparklines
+ * with neon bloom curves, animated progress gauges, thermal/load thresholds,
+ * private/public IPs, a live VPN beacon, and a stacked 1-second chronometer fed by
+ * KDE `org.kde.ksystemstats1` and network interfaces.
  */
 class StatsBarWidget final : public QWidget {
     Q_OBJECT

@@ -10,9 +10,11 @@
 #include <QDir>
 #include <QDragEnterEvent> // IWYU pragma: keep
 #include <QDropEvent> // IWYU pragma: keep
+#include <QEasingCurve>
 #include <QFileInfo>
 #include <QFontMetricsF>
 #include <QKeyEvent> // IWYU pragma: keep
+#include <QLinearGradient>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
@@ -21,6 +23,7 @@
 #include <QPainterPath>
 #include <QSocketNotifier>
 #include <QTransform>
+#include <QVariantAnimation>
 #include <QVariantList>
 #include <QVariantMap>
 #include <QEvent>
@@ -756,6 +759,22 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
     m_resizeCoalesceTimer.setSingleShot(true);
     m_resizeCoalesceTimer.setInterval(20);
     connect(&m_resizeCoalesceTimer, &QTimer::timeout, this, &TerminalWidget::resizeTerminalToWidget);
+
+    m_scrollbarHoverAnim = new QVariantAnimation(this);
+    m_scrollbarHoverAnim->setDuration(140);
+    m_scrollbarHoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+    connect(m_scrollbarHoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+        m_scrollbarHoverProgress = v.toReal();
+        update();
+    });
+
+    m_splitGripAnim = new QVariantAnimation(this);
+    m_splitGripAnim->setDuration(150);
+    m_splitGripAnim->setEasingCurve(QEasingCurve::OutCubic);
+    connect(m_splitGripAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+        m_splitGripProgress = v.toReal();
+        update();
+    });
 
     updateFontMetrics();
     if (!initGhostty()) {
@@ -1661,26 +1680,53 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         p.fillRect(rect(), GhosttyUnionTheme::withAlpha(m_colors.background, 31));
     }
 
-    // Interactive Solar Forge / Ollie scrollbar gutter when scrollback exists
+    // Subtle Solar Forge top luminous focus ribbon on the active pane when 2+ splits are visible
+    if (m_activeSplitAccent && !m_unfocusedSplitDimmed) {
+        QLinearGradient activeBar(0.0, 0.0, static_cast<qreal>(width()), 0.0);
+        activeBar.setColorAt(0.0, QColor(255, 211, 0, 20));
+        activeBar.setColorAt(0.3, QColor(255, 211, 0, 190));
+        activeBar.setColorAt(0.7, QColor(255, 152, 0, 165));
+        activeBar.setColorAt(1.0, QColor(255, 61, 0, 20));
+        p.fillRect(0, 0, width(), 2, activeBar);
+    }
+
+    // Animated Solar Forge interactive scrollbar gutter when scrollback exists
     QRectF trackRect;
     QRectF thumbRect;
     if (computeScrollbarGeometry(trackRect, thumbRect)) {
         p.save();
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setPen(Qt::NoPen);
-        if (m_scrollbarHovered || m_scrollbarDragging) {
-            p.setBrush(QColor(255, 255, 255, 20));
+        const qreal hoverT = m_scrollbarDragging ? 1.0 : m_scrollbarHoverProgress;
+        if (hoverT > 0.02) {
+            p.setBrush(QColor(255, 255, 255, static_cast<int>(24.0 * hoverT)));
             p.drawRoundedRect(trackRect, 4.0, 4.0);
+
+            // Soft Solar Forge halo behind active thumb
+            QColor haloCol(GhosttyUnionTheme::kGoldHex);
+            haloCol.setAlpha(static_cast<int>((m_scrollbarDragging ? 64.0 : 42.0) * hoverT));
+            p.setBrush(haloCol);
+            const QRectF haloRect = thumbRect.adjusted(-1.5, -1.0, 1.5, 1.0);
+            p.drawRoundedRect(haloRect, haloRect.width() * 0.5, haloRect.width() * 0.5);
         }
-        QColor barCol(GhosttyUnionTheme::kGoldHex);
-        barCol.setAlpha(m_scrollbarDragging ? 240 : (m_scrollbarHovered ? 210 : 120));
-        p.setBrush(barCol);
+
+        const int alpha = m_scrollbarDragging
+                              ? 248
+                              : static_cast<int>(125.0 + 100.0 * hoverT);
+        QLinearGradient thumbGrad(thumbRect.topLeft(), thumbRect.bottomLeft());
+        QColor topC(GhosttyUnionTheme::kGoldHex);
+        topC.setAlpha(alpha);
+        QColor botC(GhosttyUnionTheme::kAmberHex);
+        botC.setAlpha(alpha);
+        thumbGrad.setColorAt(0.0, topC);
+        thumbGrad.setColorAt(1.0, botC);
+        p.setBrush(thumbGrad);
         const qreal radius = thumbRect.width() * 0.5;
         p.drawRoundedRect(thumbRect, radius, radius);
         p.restore();
     }
 
-    // Ghostty `link-previews = true` pill overlay
+    // Solar Forge glassmorphic `link-previews = true` pill overlay
     if (m_hoveredLink.isValid()) {
         const QString rawPreview = m_hoveredLink.previewText();
         if (!rawPreview.isEmpty()) {
@@ -1691,10 +1737,13 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
             const QFontMetrics fm(uiFont);
 
             const int maxPillW = std::max(80, width() - 28);
-            constexpr int hPad = 9;
-            constexpr int vPad = 4;
-            const QString elided = fm.elidedText(rawPreview, Qt::ElideMiddle, maxPillW - 2 * hPad);
-            const int pillW = std::min(maxPillW, fm.horizontalAdvance(elided) + 2 * hPad);
+            constexpr int hPad = 10;
+            constexpr int vPad = 5;
+            const QString badgePrefix = QStringLiteral("↗ ");
+            const int prefixW = fm.horizontalAdvance(badgePrefix);
+            const QString elided = fm.elidedText(rawPreview, Qt::ElideMiddle,
+                                                 std::max(24, maxPillW - 2 * hPad - prefixW));
+            const int pillW = std::min(maxPillW, prefixW + fm.horizontalAdvance(elided) + 2 * hPad);
             const int pillH = fm.height() + 2 * vPad;
 
             bool bottomBlocked = false;
@@ -1705,30 +1754,45 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
                     break;
                 }
             }
-            const int pillY = bottomBlocked ? 6 : std::max(6, height() - pillH - 6);
+            const int pillY = bottomBlocked ? 8 : std::max(8, height() - pillH - 8);
             const QRectF pillRect(8.0, static_cast<qreal>(pillY),
                                   static_cast<qreal>(pillW), static_cast<qreal>(pillH));
 
             p.setRenderHint(QPainter::Antialiasing, true);
-            p.setPen(QPen(QColor(GhosttyUnionTheme::kDividerHex), 1.0));
-            p.setBrush(QColor(0x18, 0x17, 0x1b, 238));
-            p.drawRoundedRect(pillRect, 5.0, 5.0);
+            QLinearGradient pillBg(pillRect.topLeft(), pillRect.bottomLeft());
+            pillBg.setColorAt(0.0, QColor(0x2A, 0x28, 0x33, 245));
+            pillBg.setColorAt(1.0, QColor(0x1B, 0x1A, 0x21, 248));
+            p.setPen(QPen(QColor(255, 211, 0, 105), 1.0));
+            p.setBrush(pillBg);
+            p.drawRoundedRect(pillRect, 7.0, 7.0);
+
+            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
+            p.drawText(QRectF(pillRect.left() + hPad, pillRect.top(), prefixW, pillRect.height()),
+                       Qt::AlignVCenter | Qt::AlignLeft, badgePrefix);
 
             p.setPen(QColor(GhosttyUnionTheme::kCyanHex));
-            p.drawText(pillRect.adjusted(hPad, 0, -hPad, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
+            p.drawText(pillRect.adjusted(hPad + prefixW, 0, -hPad, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
             p.restore();
         }
     }
 
-    // Borderless hover drag grip pill when 2+ splits are visible
-    if (m_splitRearrangeable && (m_splitDragging || m_splitGripHovered || m_splitGripNear)) {
+    // Animated Solar Forge borderless hover drag grip pill when 2+ splits are visible
+    if (m_splitRearrangeable && (m_splitDragging || m_splitGripProgress > 0.01)) {
         const QRectF grip = splitGripRect();
+        const qreal t = m_splitDragging ? 1.0 : m_splitGripProgress;
         const bool activeGrip = m_splitDragging || m_splitGripHovered;
         p.save();
         p.setRenderHint(QPainter::Antialiasing, true);
-        p.setPen(QPen(QColor(activeGrip ? GhosttyUnionTheme::kGoldHex : GhosttyUnionTheme::kDividerHex), 1.0));
-        p.setBrush(QColor(0x2A, 0x29, 0x2E, activeGrip ? 245 : 225));
-        p.drawRoundedRect(grip, 3.5, 3.5);
+        p.setOpacity(std::clamp(t, 0.0, 1.0));
+
+        QLinearGradient gripBg(grip.topLeft(), grip.bottomLeft());
+        gripBg.setColorAt(0.0, QColor(0x31, 0x2F, 0x3B, activeGrip ? 248 : 225));
+        gripBg.setColorAt(1.0, QColor(0x21, 0x20, 0x27, activeGrip ? 248 : 225));
+        const QColor borderCol = activeGrip ? QColor(GhosttyUnionTheme::kGoldHex)
+                                            : QColor(GhosttyUnionTheme::kChromeBorderHex);
+        p.setPen(QPen(borderCol, 1.0));
+        p.setBrush(gripBg);
+        p.drawRoundedRect(grip, 4.0, 4.0);
 
         const QColor dotCol(activeGrip ? GhosttyUnionTheme::kGoldHex : GhosttyUnionTheme::kDimTextHex);
         p.setPen(Qt::NoPen);
@@ -1736,7 +1800,7 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         const qreal cy = grip.center().y();
         const qreal cx = grip.center().x();
         for (int i = -1; i <= 1; ++i) {
-            p.drawEllipse(QPointF(cx + i * 6.0, cy), 1.1, 1.1);
+            p.drawEllipse(QPointF(cx + i * 6.0, cy), activeGrip ? 1.3 : 1.1, activeGrip ? 1.3 : 1.1);
         }
         p.restore();
     }
@@ -1983,9 +2047,9 @@ bool TerminalWidget::computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thum
                            : 0.0;
     const qreal thumbY = trackTop + travel * frac;
 
-    const bool active = m_scrollbarHovered || m_scrollbarDragging;
-    const qreal barW = active ? 8.0 : 4.0;
-    const qreal rightInset = active ? 2.0 : 3.0;
+    const qreal hoverT = m_scrollbarDragging ? 1.0 : m_scrollbarHoverProgress;
+    const qreal barW = 4.0 + 4.0 * hoverT;
+    const qreal rightInset = 3.0 - 1.0 * hoverT;
     const qreal barX = static_cast<qreal>(width()) - rightInset - barW;
 
     trackRectOut = QRectF(static_cast<qreal>(width()) - 10.0, trackTop, 8.0, trackH);
@@ -2034,11 +2098,35 @@ void TerminalWidget::scrollViewportToThumbTop(qreal desiredThumbTop) {
     update();
 }
 
+void TerminalWidget::animateScrollbarHover(qreal target) {
+    if (!m_scrollbarHoverAnim) {
+        m_scrollbarHoverProgress = target;
+        update();
+        return;
+    }
+    m_scrollbarHoverAnim->stop();
+    m_scrollbarHoverAnim->setStartValue(m_scrollbarHoverProgress);
+    m_scrollbarHoverAnim->setEndValue(target);
+    m_scrollbarHoverAnim->start();
+}
+
+void TerminalWidget::animateSplitGrip(qreal target) {
+    if (!m_splitGripAnim) {
+        m_splitGripProgress = target;
+        update();
+        return;
+    }
+    m_splitGripAnim->stop();
+    m_splitGripAnim->setStartValue(m_splitGripProgress);
+    m_splitGripAnim->setEndValue(target);
+    m_splitGripAnim->start();
+}
+
 void TerminalWidget::updateScrollbarHoverState(const QPointF &pos) {
     const bool hovered = isInScrollbarZone(pos);
     if (hovered != m_scrollbarHovered) {
         m_scrollbarHovered = hovered;
-        update();
+        animateScrollbarHover((m_scrollbarHovered || m_scrollbarDragging) ? 1.0 : 0.0);
     }
     refreshMouseCursor();
 }
@@ -2118,6 +2206,13 @@ void TerminalWidget::setUnfocusedSplitDimmed(bool dimmed) {
     }
 }
 
+void TerminalWidget::setActiveSplitAccent(bool active) {
+    if (m_activeSplitAccent != active) {
+        m_activeSplitAccent = active;
+        update();
+    }
+}
+
 void TerminalWidget::setSplitRearrangeable(bool rearrangeable) {
     if (m_splitRearrangeable == rearrangeable) {
         return;
@@ -2128,10 +2223,12 @@ void TerminalWidget::setSplitRearrangeable(bool rearrangeable) {
         m_splitGripNear = false;
         m_splitDragArmed = false;
         m_splitDragging = false;
+        animateSplitGrip(0.0);
         refreshMouseCursor();
     } else if (m_mouseInside) {
         m_splitGripHovered = isInSplitGripZone(m_lastMousePos);
         m_splitGripNear = isNearSplitGripZone(m_lastMousePos);
+        animateSplitGrip((m_splitGripHovered || m_splitGripNear) ? 1.0 : 0.0);
         refreshMouseCursor();
     }
     update();
@@ -2162,7 +2259,14 @@ void TerminalWidget::resetTerminal() {
 
 void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &globalPos) {
     auto *menu = new QMenu(this);
+    menu->setObjectName(QStringLiteral("terminalContextMenu"));
     menu->setAttribute(Qt::WA_DeleteOnClose);
+    GhosttyUnionTheme::styleSolarForgeMenu(menu);
+
+    const QColor goldCol(GhosttyUnionTheme::kGoldHex);
+    const QColor cyanCol(GhosttyUnionTheme::kCyanHex);
+    const QColor amberCol(GhosttyUnionTheme::kAmberHex);
+    const QColor redCol(GhosttyUnionTheme::kRedOrangeHex);
 
     uint16_t col = 0;
     uint16_t row = 0;
@@ -2174,13 +2278,17 @@ void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &glob
 
     if (ctxLink.isValid()) {
         const QString openLabel = ctxLink.isLocalFile ? QStringLiteral("Open File") : QStringLiteral("Open Link");
-        QAction *openAct = menu->addAction(openLabel);
+        QAction *openAct = menu->addAction(
+            GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::OpenLink, cyanCol),
+            openLabel);
         connect(openAct, &QAction::triggered, this, [this, ctxLink]() {
             activateLink(ctxLink);
         });
 
         const QString copyLabel = ctxLink.isLocalFile ? QStringLiteral("Copy File Path") : QStringLiteral("Copy Link Address");
-        QAction *copyLinkAct = menu->addAction(copyLabel);
+        QAction *copyLinkAct = menu->addAction(
+            GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Copy, cyanCol),
+            copyLabel);
         connect(copyLinkAct, &QAction::triggered, this, [ctxLink]() {
             if (QClipboard *cb = QApplication::clipboard()) {
                 cb->setText(ctxLink.target, QClipboard::Clipboard);
@@ -2193,29 +2301,47 @@ void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &glob
     const bool hasSelection = m_terminal &&
         ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_SELECTION, &activeSel) == GHOSTTY_SUCCESS;
 
-    QAction *copyAct = menu->addAction(QStringLiteral("Copy\tCtrl+Shift+C"));
+    QAction *copyAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Copy, goldCol),
+        QStringLiteral("Copy\tCtrl+Shift+C"));
     copyAct->setEnabled(hasSelection);
     connect(copyAct, &QAction::triggered, this, &TerminalWidget::copySelection);
 
     const QClipboard *cb = QApplication::clipboard();
     const bool hasClipboardText = cb && !cb->text(QClipboard::Clipboard).isEmpty();
-    QAction *pasteAct = menu->addAction(QStringLiteral("Paste\tCtrl+Shift+V"));
+    QAction *pasteAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Paste, goldCol),
+        QStringLiteral("Paste\tCtrl+Shift+V"));
     pasteAct->setEnabled(hasClipboardText);
     connect(pasteAct, &QAction::triggered, this, [this]() { pasteClipboard(false); });
 
     menu->addSeparator();
 
-    QAction *splitRightAct = menu->addAction(QStringLiteral("Split Right\tCtrl+Shift+}"));
+    QAction *renameTabAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Rename, goldCol),
+        QStringLiteral("Rename Tab…\tCtrl+Shift+A"));
+    connect(renameTabAct, &QAction::triggered, this, &TerminalWidget::renameTabRequested);
+
+    menu->addSeparator();
+
+    QAction *splitRightAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::SplitRight, amberCol),
+        QStringLiteral("Split Right\tCtrl+Shift+}"));
     connect(splitRightAct, &QAction::triggered, this, [this]() {
         Q_EMIT splitRequested(Qt::Horizontal);
     });
-    QAction *splitDownAct = menu->addAction(QStringLiteral("Split Down\tCtrl+Shift+{"));
+    QAction *splitDownAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::SplitDown, amberCol),
+        QStringLiteral("Split Down\tCtrl+Shift+{"));
     connect(splitDownAct, &QAction::triggered, this, [this]() {
         Q_EMIT splitRequested(Qt::Vertical);
     });
 
     if (m_splitRearrangeable) {
-        QMenu *rearrangeMenu = menu->addMenu(QStringLiteral("Rearrange Split"));
+        QMenu *rearrangeMenu = menu->addMenu(
+            GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Rearrange, amberCol),
+            QStringLiteral("Rearrange Split"));
+        GhosttyUnionTheme::styleSolarForgeMenu(rearrangeMenu);
         QAction *mvLeft = rearrangeMenu->addAction(QStringLiteral("Move / Swap Left\tCtrl+Alt+Shift+Left"));
         connect(mvLeft, &QAction::triggered, this, [this]() { Q_EMIT moveSplitRequested(-1, 0); });
         QAction *mvRight = rearrangeMenu->addAction(QStringLiteral("Move / Swap Right\tCtrl+Alt+Shift+Right"));
@@ -2236,10 +2362,12 @@ void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &glob
 
     menu->addSeparator();
 
-    QAction *resetAct = menu->addAction(QStringLiteral("Clear / Reset Terminal"));
+    QAction *resetAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::ResetTerminal, redCol),
+        QStringLiteral("Clear / Reset Terminal"));
     connect(resetAct, &QAction::triggered, this, &TerminalWidget::resetTerminal);
 
-    menu->popup(globalPos);
+    GhosttyUnionTheme::popupSolarForgeMenuAnimated(menu, globalPos);
 }
 
 void TerminalWidget::mousePressEvent(QMouseEvent *event) {
@@ -2337,6 +2465,7 @@ void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
         m_splitDragging = false;
         m_splitGripHovered = isInSplitGripZone(event->position());
         m_splitGripNear = isNearSplitGripZone(event->position());
+        animateSplitGrip((m_splitGripHovered || m_splitGripNear) ? 1.0 : 0.0);
         refreshMouseCursor();
         update();
         if (wasDragging) {
@@ -2349,6 +2478,7 @@ void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
     if (m_scrollbarDragging && event->button() == Qt::LeftButton) {
         m_scrollbarDragging = false;
         updateScrollbarHoverState(event->position());
+        animateScrollbarHover(m_scrollbarHovered ? 1.0 : 0.0);
         update();
         event->accept();
         return;
@@ -2424,6 +2554,7 @@ void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
     if (gripHovered != m_splitGripHovered || gripNear != m_splitGripNear) {
         m_splitGripHovered = gripHovered;
         m_splitGripNear = gripNear;
+        animateSplitGrip((m_splitGripHovered || m_splitGripNear || m_splitDragging) ? 1.0 : 0.0);
         refreshMouseCursor();
         update();
     }
@@ -2487,12 +2618,12 @@ void TerminalWidget::leaveEvent(QEvent *event) {
     m_mouseInside = false;
     if (m_scrollbarHovered) {
         m_scrollbarHovered = false;
-        update();
+        animateScrollbarHover(m_scrollbarDragging ? 1.0 : 0.0);
     }
     if (m_splitGripHovered || m_splitGripNear) {
         m_splitGripHovered = false;
         m_splitGripNear = false;
-        update();
+        animateSplitGrip(m_splitDragging ? 1.0 : 0.0);
     }
     clearHoveredLink();
     refreshMouseCursor();

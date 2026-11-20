@@ -8,6 +8,7 @@
 #include <QAbstractButton>
 #include <QApplication> // IWYU pragma: keep
 #include <QClipboard>
+#include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDir> // IWYU pragma: keep
 #include <QFile>
@@ -16,6 +17,8 @@
 #include <QKeyEvent> // IWYU pragma: keep
 #include <QLabel>
 #include <QLayout>
+#include <QLineEdit>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QPushButton>
@@ -195,7 +198,7 @@ private Q_SLOTS:
         StatsBarWidget bar;
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
-        QCOMPARE(bar.height(), 40);
+        QCOMPARE(bar.height(), 74);
 
         const QStringList procNvidia = StatsBarWidget::readConnectedNvidiaModelsFromProc();
         if (!procNvidia.isEmpty()) {
@@ -245,10 +248,10 @@ private Q_SLOTS:
         QVERIFY(!StatsBarWidget::isVirtualOrTunnelInterface(QStringLiteral("enp3s0")));
 
         StatsBarWidget bar;
-        bar.resize(1200, 40);
+        bar.resize(1200, 74);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
-        QCOMPARE(bar.height(), 40);
+        QCOMPARE(bar.height(), 74);
 
         bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
         QCOMPARE(bar.publicIp(), QStringLiteral("203.0.113.42"));
@@ -264,7 +267,7 @@ private Q_SLOTS:
         QVERIFY(bar.layout() != nullptr);
         QWidget *netCard = bar.layout()->itemAt(netIdx) ? bar.layout()->itemAt(netIdx)->widget() : nullptr;
         QVERIFY(netCard != nullptr);
-        QCOMPARE(netCard->height(), 32);
+        QCOMPARE(netCard->height(), 64);
 
         if (!bar.privateIp().isEmpty()) {
             QApplication::clipboard()->setText(QStringLiteral("stale"));
@@ -281,7 +284,7 @@ private Q_SLOTS:
 
     [[maybe_unused]] static void testStatsBarFullWidthEvenGrowthAndShrink() {
         StatsBarWidget bar;
-        bar.resize(1220, 40);
+        bar.resize(1220, 74);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
         bar.setGpusForTesting({
@@ -305,7 +308,7 @@ private Q_SLOTS:
         QCOMPARE(bar.layout()->itemAt(itemCount - 1)->widget()->objectName(), QStringLiteral("ClockPill"));
 
         auto snapshotWidths = [&](int targetW) -> std::vector<int> {
-            bar.resize(targetW, 40);
+            bar.resize(targetW, 74);
             bar.layout()->invalidate();
             bar.layout()->activate();
             QApplication::processEvents();
@@ -322,7 +325,7 @@ private Q_SLOTS:
             std::vector<QWidget *> cur(static_cast<size_t>(itemCount), nullptr);
             for (int i = 0; i < itemCount; ++i) {
                 QWidget *w = bar.layout()->itemAt(i)->widget();
-                if (!w || w->height() != 32 || w->width() <= 0) {
+                if (!w || w->height() != 64 || w->width() <= 0) {
                     QTest::qFail("invalid item geometry", __FILE__, __LINE__);
                     return widths;
                 }
@@ -409,13 +412,14 @@ private Q_SLOTS:
 
         bar.setPublicIpForTesting(QStringLiteral("203.0.113.42"));
         for (const int w : {900, 1220, 2000}) {
-            bar.resize(w, 40);
+            bar.resize(w, 74);
             bar.layout()->invalidate();
             bar.layout()->activate();
             QApplication::processEvents();
             const QImage img = bar.grab().toImage();
             QVERIFY(!img.isNull());
             QCOMPARE(img.width(), qRound(w * img.devicePixelRatio()));
+            QCOMPARE(img.height(), qRound(74 * img.devicePixelRatio()));
         }
 
         QApplication::clipboard()->setText(QStringLiteral("stale"));
@@ -529,7 +533,7 @@ private Q_SLOTS:
 
         // Live UI reconciliation across 1 -> 2 -> 3 -> 1 GPUs
         StatsBarWidget bar;
-        bar.resize(1600, 40);
+        bar.resize(1600, 74);
         bar.show();
         QVERIFY(QTest::qWaitForWindowExposed(&bar));
 
@@ -1622,15 +1626,57 @@ private Q_SLOTS:
         QVERIFY(bar != nullptr);
         QCOMPARE(bar->elideMode(), Qt::ElideMiddle);
 
+        auto verifyCloseButtonsInsideTabs = [&](int expectedCount) {
+            for (int i = 0; i < expectedCount; ++i) {
+                auto *btn = qobject_cast<QAbstractButton *>(bar->tabButton(i, QTabBar::RightSide));
+                QVERIFY2(btn != nullptr, qPrintable(QStringLiteral("Missing close button on tab %1").arg(i)));
+                QCOMPARE(btn->objectName(), QStringLiteral("tabCloseButton"));
+                const QRect tr = bar->tabRect(i);
+                const QRect br = btn->geometry();
+                if (bar->rect().contains(tr)) {
+                    QVERIFY(btn->isVisible());
+                }
+                QVERIFY2(tr.contains(br),
+                         qPrintable(QStringLiteral("Close button %1,%2 %3x%4 outside tab %5,%6 %7x%8")
+                                        .arg(br.x()).arg(br.y()).arg(br.width()).arg(br.height())
+                                        .arg(tr.x()).arg(tr.y()).arg(tr.width()).arg(tr.height())));
+                QVERIFY2(tr.right() - br.right() >= 6,
+                         qPrintable(QStringLiteral("Close button too close to right edge: tr.right=%1 br.right=%2")
+                                        .arg(tr.right()).arg(br.right())));
+            }
+        };
+
         // Short path title must NOT shrink tab below preferred width (200px)
         tabs->setTabText(0, QStringLiteral("~"));
         QApplication::processEvents();
         QCOMPARE(bar->tabRect(0).width(), 200);
+        verifyCloseButtonsInsideTabs(1);
+
+        // Verify unhovered close button renders visible bright "×" pixels
+        {
+            auto *btn0 = qobject_cast<QAbstractButton *>(bar->tabButton(0, QTabBar::RightSide));
+            QVERIFY(btn0 != nullptr);
+            const QImage btnImg = btn0->grab().toImage().convertToFormat(QImage::Format_ARGB32);
+            QVERIFY(!btnImg.isNull());
+            int brightGlyphPx = 0;
+            for (int y = 0; y < btnImg.height(); ++y) {
+                for (int x = 0; x < btnImg.width(); ++x) {
+                    const QColor c = btnImg.pixelColor(x, y);
+                    if (c.alpha() >= 180 && (c.red() + c.green() + c.blue()) >= 480) {
+                        ++brightGlyphPx;
+                    }
+                }
+            }
+            QVERIFY2(brightGlyphPx >= 8,
+                     qPrintable(QStringLiteral("Unhovered close button lacks visible × glyph pixels (got %1)")
+                                    .arg(brightGlyphPx)));
+        }
 
         // Very long path title must stay capped at preferred width (200px)
         tabs->setTabText(0, QStringLiteral("/home/ak/projects/very/deeply/nested/workspace/directory/path"));
         QApplication::processEvents();
         QCOMPARE(bar->tabRect(0).width(), 200);
+        verifyCloseButtonsInsideTabs(1);
 
         // 3 tabs on 1000px window still have plenty of space -> all remain 200px
         for (int i = 0; i < 2; ++i) {
@@ -1643,6 +1689,7 @@ private Q_SLOTS:
         for (int i = 0; i < 3; ++i) {
             QCOMPARE(bar->tabRect(i).width(), 200);
         }
+        verifyCloseButtonsInsideTabs(3);
 
         // Add 3 more tabs (total 6 -> 1200px > ~970px container): tabs shrink evenly to fit
         for (int i = 0; i < 3; ++i) {
@@ -1657,6 +1704,7 @@ private Q_SLOTS:
             QCOMPARE(bar->tabRect(i).width(), shrunkWidth);
         }
         QVERIFY(shrunkWidth * 6 <= tabs->width());
+        verifyCloseButtonsInsideTabs(6);
 
         // Widening window so 6 * 200 fits restores tabs back to 200px
         win.resize(1400, 600);
@@ -1664,10 +1712,153 @@ private Q_SLOTS:
         for (int i = 1; i < 6; ++i) {
             QCOMPARE(bar->tabRect(i).width(), 200);
         }
+        verifyCloseButtonsInsideTabs(6);
 
         // Narrowing window below 6 * 90 clamps tabs to minimum floor (90px)
         win.resize(450, 600);
         QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 90, 2000);
+        verifyCloseButtonsInsideTabs(6);
+    }
+
+    [[maybe_unused]] static void testTabRenamingModalContextMenusAndSolarForgeChrome() {
+        MainWindow win;
+        win.resize(1100, 640);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+        auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(pane0 && pane0->activeTerminal());
+        TerminalWidget *term0 = pane0->activeTerminal();
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        auto *renameModal = win.findChild<QWidget *>(QStringLiteral("tabRenameModal"));
+        auto *renameInput = win.findChild<QLineEdit *>(QStringLiteral("tabRenameInput"));
+        auto *renameResetBtn = win.findChild<QPushButton *>(QStringLiteral("tabRenameResetButton"));
+        auto *renameSaveBtn = win.findChild<QPushButton *>(QStringLiteral("tabRenameSaveButton"));
+        QVERIFY(renameModal && renameInput && renameResetBtn && renameSaveBtn);
+        QVERIFY(!renameModal->isVisible());
+
+        // 1. Ctrl+Shift+A opens rename modal; Escape cancels and restores terminal focus
+        QTest::keyClick(term0, Qt::Key_A, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        QVERIFY(!renameResetBtn->isVisible());
+        QTRY_VERIFY_WITH_TIMEOUT(renameInput->hasFocus(), 2000);
+        QVERIFY(!win.grab().toImage().isNull());
+
+        QTest::keyClick(renameInput, Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QVERIFY(!pane0->hasCustomTitle());
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // 2. Double-clicking tab opens rename modal; saving sets persistent custom title
+        const QPoint tab0Center = bar->tabRect(0).center();
+        QTest::mouseDClick(bar, Qt::LeftButton, Qt::NoModifier, tab0Center);
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        renameInput->setText(QStringLiteral("API Server"));
+        QTest::keyClick(renameInput, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QVERIFY(pane0->hasCustomTitle());
+        QCOMPARE(pane0->customTitle(), QStringLiteral("API Server"));
+        QCOMPARE(tabs->tabText(0), QStringLiteral("API Server"));
+        QVERIFY(win.windowTitle().startsWith(QLatin1String("API Server")));
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // Dynamic shell OSC 2 title changes must NOT overwrite a custom tab name
+        term0->feedVtBytes(QByteArrayLiteral("\x1b]2;/tmp/dynamic-shell-title\x07"));
+        QApplication::processEvents();
+        QCOMPARE(tabs->tabText(0), QStringLiteral("API Server"));
+
+        // 3. Re-opening rename modal exposes Reset button; clicking Reset restores live shell title
+        QTest::keyClick(term0, Qt::Key_A, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        QVERIFY(renameResetBtn->isVisible());
+        QTest::mouseClick(renameResetBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QVERIFY(!pane0->hasCustomTitle());
+        QCOMPARE(tabs->tabText(0), QStringLiteral("/tmp/dynamic-shell-title"));
+        QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
+
+        // 4. Tab bar right-click opens Solar Forge context menu with Rename / Duplicate / Close
+        QContextMenuEvent tabCtxEv(QContextMenuEvent::Mouse, tab0Center, bar->mapToGlobal(tab0Center));
+        QCoreApplication::sendEvent(bar, &tabCtxEv);
+        auto *tabMenu = win.findChild<QMenu *>(QStringLiteral("tabBarContextMenu"));
+        QTRY_VERIFY_WITH_TIMEOUT((tabMenu = win.findChild<QMenu *>(QStringLiteral("tabBarContextMenu"))) != nullptr &&
+                                     tabMenu->isVisible(),
+                                 2000);
+        QVERIFY(tabMenu->styleSheet().contains(QLatin1String("#FFD300")));
+        bool hasRenameInTabMenu = false;
+        bool hasDuplicateInTabMenu = false;
+        QAction *dupAction = nullptr;
+        for (QAction *act : tabMenu->actions()) {
+            if (act->text().contains(QLatin1String("Rename Tab"))) {
+                hasRenameInTabMenu = true;
+            }
+            if (act->text().contains(QLatin1String("Duplicate Tab"))) {
+                hasDuplicateInTabMenu = true;
+                dupAction = act;
+            }
+        }
+        QVERIFY(hasRenameInTabMenu);
+        QVERIFY(hasDuplicateInTabMenu);
+        QVERIFY(dupAction != nullptr);
+        dupAction->trigger();
+        tabMenu->close();
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+
+        // Switching tabs drives sliding Solar Forge active indicator & paints cleanly
+        tabs->setCurrentIndex(0);
+        QApplication::processEvents();
+        tabs->setCurrentIndex(1);
+        QApplication::processEvents();
+        QVERIFY(!win.grab().toImage().isNull());
+
+        // 5. Terminal right-click opens Solar Forge menu with Rename Tab… wired to rename modal
+        auto *pane1 = qobject_cast<TerminalTabPane *>(tabs->widget(1));
+        QVERIFY(pane1 && pane1->activeTerminal());
+        TerminalWidget *term1 = pane1->activeTerminal();
+        QTest::mouseClick(term1, Qt::RightButton, Qt::NoModifier, QPoint(40, 40));
+        QMenu *termMenu = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((termMenu = term1->findChild<QMenu *>(QStringLiteral("terminalContextMenu"))) != nullptr &&
+                                     termMenu->isVisible(),
+                                 2000);
+        QVERIFY(termMenu->styleSheet().contains(QLatin1String("#FFD300")));
+        QAction *termRenameAct = nullptr;
+        for (QAction *act : termMenu->actions()) {
+            if (act->text().contains(QLatin1String("Rename Tab"))) {
+                termRenameAct = act;
+                break;
+            }
+        }
+        QVERIFY(termRenameAct != nullptr);
+        termMenu->close();
+        termRenameAct->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(renameModal->isVisible(), 2000);
+        renameInput->setText(QStringLiteral("Logs"));
+        QTest::mouseClick(renameSaveBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!renameModal->isVisible(), 2000);
+        QCOMPARE(tabs->tabText(1), QStringLiteral("Logs"));
+
+        // 6. Reordering tabs keeps custom close buttons inside tabs and dynamically targets moved tab
+        bar->moveTab(1, 0);
+        QApplication::processEvents();
+        QCOMPARE(tabs->tabText(0), QStringLiteral("Logs"));
+        auto *movedCloseBtn = qobject_cast<QAbstractButton *>(bar->tabButton(0, QTabBar::RightSide));
+        QVERIFY(movedCloseBtn != nullptr);
+        QVERIFY(bar->tabRect(0).contains(movedCloseBtn->geometry()));
+        QTest::mouseClick(movedCloseBtn, Qt::LeftButton);
+        auto *closeModal = win.findChild<QWidget *>(QStringLiteral("tabCloseConfirmModal"));
+        auto *closeTargetLbl = win.findChild<QLabel *>(QStringLiteral("tabCloseModalTarget"));
+        auto *closeCancelBtn = win.findChild<QPushButton *>(QStringLiteral("tabCloseCancelButton"));
+        QVERIFY(closeModal && closeTargetLbl && closeCancelBtn);
+        QTRY_VERIFY_WITH_TIMEOUT(closeModal->isVisible(), 2000);
+        QVERIFY(closeTargetLbl->text().contains(QLatin1String("Logs")));
+        QTest::mouseClick(closeCancelBtn, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!closeModal->isVisible(), 2000);
     }
 };
 

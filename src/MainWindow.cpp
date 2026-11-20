@@ -4,6 +4,8 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
+#include <QAbstractButton>
+#include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDir>
 #include <QEasingCurve>
@@ -16,7 +18,9 @@
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
 #include <QLinearGradient>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -41,6 +45,88 @@
 
 namespace {
 
+class SolarForgeTabCloseButton final : public QAbstractButton {
+public:
+    explicit SolarForgeTabCloseButton(QWidget *parent = nullptr)
+        : QAbstractButton(parent) {
+        setObjectName(QStringLiteral("tabCloseButton"));
+        setFixedSize(18, 18);
+        setFocusPolicy(Qt::NoFocus);
+        setCursor(Qt::PointingHandCursor);
+        setToolTip(QStringLiteral("Close Tab"));
+        setAttribute(Qt::WA_Hover, true);
+
+        m_hoverAnim = new QVariantAnimation(this);
+        m_hoverAnim->setDuration(120);
+        m_hoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_hoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_hoverProgress = v.toReal();
+            update();
+        });
+    }
+
+    [[nodiscard]] QSize sizeHint() const override { return {18, 18}; }
+
+protected:
+    void enterEvent(QEnterEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(1.0);
+        m_hoverAnim->start();
+        QAbstractButton::enterEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(0.0);
+        m_hoverAnim->start();
+        QAbstractButton::leaveEvent(event);
+    }
+
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const QRectF pill = QRectF(rect()).adjusted(1.0, 1.0, -1.0, -1.0);
+        const qreal t = isDown() ? 1.0 : m_hoverProgress;
+
+        // Always draw a subtle glass backing pill, transitioning to Solar Forge crimson on hover
+        if (t > 0.01) {
+            QLinearGradient bgGrad(pill.topLeft(), pill.bottomRight());
+            if (isDown()) {
+                bgGrad.setColorAt(0.0, QColor(0xC9, 0x2A, 0x2A, 235));
+                bgGrad.setColorAt(1.0, QColor(0x9C, 0x1E, 0x24, 240));
+            } else {
+                bgGrad.setColorAt(0.0, QColor(0xFF, 0x5A, 0x1F, static_cast<int>(18 + 204 * t)));
+                bgGrad.setColorAt(1.0, QColor(0xD6, 0x28, 0x28, static_cast<int>(16 + 210 * t)));
+            }
+            p.setBrush(bgGrad);
+            p.setPen(QPen(QColor(255, 168, 96, static_cast<int>(28 + 142 * t)), 0.9));
+        } else {
+            p.setBrush(QColor(255, 255, 255, 16));
+            p.setPen(QPen(QColor(255, 255, 255, 30), 0.8));
+        }
+        p.drawRoundedRect(pill, 5.0, 5.0);
+
+        // Crisp always-visible antialiased vector "×"
+        const QPointF c = pill.center();
+        constexpr qreal half = 3.5;
+        const QColor xCol(
+            static_cast<int>(0xC8 + (0xFF - 0xC8) * t),
+            static_cast<int>(0xCB + (0xFF - 0xCB) * t),
+            static_cast<int>(0xDC + (0xFF - 0xDC) * t),
+            static_cast<int>(225 + 30 * t));
+        p.setPen(QPen(xCol, 1.55 + 0.25 * t, Qt::SolidLine, Qt::RoundCap));
+        p.drawLine(QPointF(c.x() - half, c.y() - half), QPointF(c.x() + half, c.y() + half));
+        p.drawLine(QPointF(c.x() + half, c.y() - half), QPointF(c.x() - half, c.y() + half));
+    }
+
+private:
+    QVariantAnimation *m_hoverAnim = nullptr;
+    qreal m_hoverProgress = 0.0;
+};
+
 class AdaptiveTabBar final : public QTabBar {
 public:
     static constexpr int kPreferredTabWidth = 200;
@@ -49,36 +135,223 @@ public:
     explicit AdaptiveTabBar(QWidget *parent = nullptr)
         : QTabBar(parent) {
         setElideMode(Qt::ElideMiddle);
+        setMouseTracking(true);
+
+        m_indicatorAnim = new QVariantAnimation(this);
+        m_indicatorAnim->setDuration(190);
+        m_indicatorAnim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_indicatorAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            const qreal t = v.toReal();
+            m_indicatorLeft = m_animStartLeft + (m_animEndLeft - m_animStartLeft) * t;
+            m_indicatorWidth = m_animStartWidth + (m_animEndWidth - m_animStartWidth) * t;
+            update();
+        });
+
+        connect(this, &QTabBar::currentChanged, this, [this](int idx) {
+            animateIndicatorToTab(idx);
+        });
+        connect(this, &QTabBar::tabMoved, this, [this](int, int) {
+            alignCloseButtonsInsideTabs();
+            snapIndicatorToCurrent();
+        });
+    }
+
+    void setOnTabContextMenu(std::function<void(int, const QPoint &)> cb) {
+        m_onContextMenu = std::move(cb);
+    }
+
+    void setOnTabDoubleClicked(std::function<void(int)> cb) {
+        m_onDoubleClicked = std::move(cb);
     }
 
     void refreshTabGeometry() {
         QEvent ev(QEvent::FontChange);
         QCoreApplication::sendEvent(this, &ev);
         updateGeometry();
+        alignCloseButtonsInsideTabs();
+        snapIndicatorToCurrent();
     }
 
 protected:
     [[nodiscard]] QSize tabSizeHint(int index) const override {
         const QSize base = QTabBar::tabSizeHint(index);
-        return {targetTabWidth(), base.height()};
+        return {targetTabWidth(), std::max(32, base.height())};
     }
 
     [[nodiscard]] QSize minimumTabSizeHint(int index) const override {
         const QSize base = QTabBar::minimumTabSizeHint(index);
-        return {std::min(kMinTabWidth, targetTabWidth()), base.height()};
+        return {std::min(kMinTabWidth, targetTabWidth()), std::max(32, base.height())};
     }
 
     void tabInserted(int index) override {
         QTabBar::tabInserted(index);
+        if (tabsClosable()) {
+            installCloseButton(index);
+        }
         updateGeometry();
+        snapIndicatorToCurrent();
     }
 
     void tabRemoved(int index) override {
         QTabBar::tabRemoved(index);
         updateGeometry();
+        snapIndicatorToCurrent();
+    }
+
+    void tabLayoutChange() override {
+        QTabBar::tabLayoutChange();
+        alignCloseButtonsInsideTabs();
+        if (m_indicatorAnim->state() != QAbstractAnimation::Running) {
+            snapIndicatorToCurrent();
+        }
+    }
+
+    void resizeEvent(QResizeEvent *event) override {
+        QTabBar::resizeEvent(event);
+        alignCloseButtonsInsideTabs();
+        snapIndicatorToCurrent();
+    }
+
+    void contextMenuEvent(QContextMenuEvent *event) override {
+        const int idx = tabAt(event->pos());
+        if (idx >= 0 && m_onContextMenu) {
+            m_onContextMenu(idx, event->globalPos());
+            event->accept();
+            return;
+        }
+        QTabBar::contextMenuEvent(event);
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton) {
+            const int idx = tabAt(event->position().toPoint());
+            if (idx >= 0 && m_onDoubleClicked) {
+                m_onDoubleClicked(idx);
+                event->accept();
+                return;
+            }
+        }
+        QTabBar::mouseDoubleClickEvent(event);
+    }
+
+    void paintEvent(QPaintEvent *event) override {
+        QTabBar::paintEvent(event);
+
+        if (currentIndex() < 0 || m_indicatorWidth <= 4.0) {
+            return;
+        }
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const qreal inset = std::min(10.0, m_indicatorWidth * 0.12);
+        const qreal x = m_indicatorLeft + inset;
+        const qreal w = std::max(8.0, m_indicatorWidth - 2.0 * inset);
+
+        // Warm Solar Forge upward ambient underglow inside the active tab
+        const QRectF glowRect(m_indicatorLeft + 2.0, std::max(0.0, static_cast<qreal>(height()) - 14.0),
+                              std::max(0.0, m_indicatorWidth - 4.0), 12.0);
+        if (glowRect.width() > 2.0) {
+            QLinearGradient glowGrad(glowRect.bottomLeft(), glowRect.topLeft());
+            glowGrad.setColorAt(0.0, QColor(255, 211, 0, 42));
+            glowGrad.setColorAt(0.55, QColor(255, 152, 0, 14));
+            glowGrad.setColorAt(1.0, QColor(0, 0, 0, 0));
+            p.fillRect(glowRect, glowGrad);
+        }
+
+        // Sliding glowing Solar Forge active indicator bar
+        const QRectF barRect(x, static_cast<qreal>(height()) - 2.8, w, 2.8);
+        QLinearGradient barGrad(barRect.topLeft(), barRect.topRight());
+        barGrad.setColorAt(0.0, QColor(GhosttyUnionTheme::kGoldHex));
+        barGrad.setColorAt(0.65, QColor(GhosttyUnionTheme::kAmberHex));
+        barGrad.setColorAt(1.0, QColor(GhosttyUnionTheme::kRedOrangeHex));
+        p.setPen(Qt::NoPen);
+        p.setBrush(barGrad);
+        p.drawRoundedRect(barRect, 1.4, 1.4);
     }
 
 private:
+    void installCloseButton(int index) {
+        if (index < 0 || index >= count()) {
+            return;
+        }
+        if (dynamic_cast<SolarForgeTabCloseButton *>(tabButton(index, QTabBar::RightSide))) {
+            return;
+        }
+        if (qobject_cast<QAbstractButton *>(tabButton(index, QTabBar::LeftSide))) {
+            setTabButton(index, QTabBar::LeftSide, nullptr);
+        }
+        auto *btn = new SolarForgeTabCloseButton(this);
+        connect(btn, &QAbstractButton::clicked, this, [this, btn]() {
+            for (int i = 0; i < count(); ++i) {
+                if (tabButton(i, QTabBar::RightSide) == btn || tabButton(i, QTabBar::LeftSide) == btn) {
+                    Q_EMIT tabCloseRequested(i);
+                    return;
+                }
+            }
+        });
+        setTabButton(index, QTabBar::RightSide, btn);
+        alignCloseButtonsInsideTabs();
+    }
+
+    void alignCloseButtonsInsideTabs() {
+        for (int i = 0; i < count(); ++i) {
+            auto *btn = dynamic_cast<SolarForgeTabCloseButton *>(tabButton(i, QTabBar::RightSide));
+            if (!btn) {
+                continue;
+            }
+            const QRect r = tabRect(i);
+            if (!r.isValid() || r.width() < btn->width() + 8) {
+                continue;
+            }
+            const int visualRight = r.right() - 3;
+            const int targetX = std::max(r.left() + 4, visualRight - 6 - btn->width() + 1);
+            const int visualTop = r.top() + 3;
+            const int visualH = std::max(btn->height(), r.height() - 5);
+            const int targetY = visualTop + (visualH - btn->height()) / 2;
+            btn->move(targetX, targetY);
+            btn->raise();
+        }
+    }
+
+    void snapIndicatorToCurrent() {
+        const int idx = currentIndex();
+        if (idx < 0 || idx >= count()) {
+            m_indicatorWidth = 0.0;
+            return;
+        }
+        const QRect r = tabRect(idx);
+        if (r.isValid()) {
+            m_indicatorLeft = static_cast<qreal>(r.left());
+            m_indicatorWidth = static_cast<qreal>(r.width());
+            m_hasIndicator = true;
+            update();
+        }
+    }
+
+    void animateIndicatorToTab(int idx) {
+        if (idx < 0 || idx >= count()) {
+            m_indicatorWidth = 0.0;
+            update();
+            return;
+        }
+        const QRect r = tabRect(idx);
+        if (!r.isValid()) {
+            return;
+        }
+        if (!m_hasIndicator || !isVisible()) {
+            snapIndicatorToCurrent();
+            return;
+        }
+        m_animStartLeft = m_indicatorLeft;
+        m_animStartWidth = m_indicatorWidth;
+        m_animEndLeft = static_cast<qreal>(r.left());
+        m_animEndWidth = static_cast<qreal>(r.width());
+        m_indicatorAnim->stop();
+        m_indicatorAnim->setStartValue(0.0);
+        m_indicatorAnim->setEndValue(1.0);
+        m_indicatorAnim->start();
+    }
+
     [[nodiscard]] int availableContainerWidth() const {
         const auto *tw = qobject_cast<const QTabWidget *>(parentWidget());
         if (!tw) {
@@ -103,6 +376,17 @@ private:
         const int floorW = std::min(kMinTabWidth, avail);
         return std::clamp(avail / n, floorW, kPreferredTabWidth);
     }
+
+    QVariantAnimation *m_indicatorAnim = nullptr;
+    bool m_hasIndicator = false;
+    qreal m_indicatorLeft = 0.0;
+    qreal m_indicatorWidth = 0.0;
+    qreal m_animStartLeft = 0.0;
+    qreal m_animStartWidth = 0.0;
+    qreal m_animEndLeft = 0.0;
+    qreal m_animEndWidth = 0.0;
+    std::function<void(int, const QPoint &)> m_onContextMenu;
+    std::function<void(int)> m_onDoubleClicked;
 };
 
 class TerminalTabWidget final : public QTabWidget {
@@ -112,6 +396,8 @@ public:
         , m_adaptiveTabBar(new AdaptiveTabBar(this)) {
         setTabBar(m_adaptiveTabBar);
     }
+
+    [[nodiscard]] AdaptiveTabBar *adaptiveTabBar() const { return m_adaptiveTabBar; }
 
 protected:
     void resizeEvent(QResizeEvent *event) override {
@@ -785,12 +1071,407 @@ private:
     std::function<void()> m_onCancel;
 };
 
+namespace {
+
+class ModalRenameBadge final : public QWidget {
+public:
+    explicit ModalRenameBadge(QWidget *parent = nullptr)
+        : QWidget(parent) {
+        setFixedSize(56, 56);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+
+protected:
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const QPointF center(width() * 0.5, height() * 0.5);
+        const QColor gold(GhosttyUnionTheme::kGoldHex);
+        const QColor amber(GhosttyUnionTheme::kAmberHex);
+
+        QRadialGradient halo(center, 27.0);
+        halo.setColorAt(0.0, QColor(255, 211, 0, 72));
+        halo.setColorAt(0.68, QColor(255, 152, 0, 22));
+        halo.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.setPen(Qt::NoPen);
+        p.setBrush(halo);
+        p.drawEllipse(center, 27.0, 27.0);
+
+        const QRectF medallion(center.x() - 21.0, center.y() - 21.0, 42.0, 42.0);
+        QLinearGradient fillGrad(medallion.topLeft(), medallion.bottomRight());
+        fillGrad.setColorAt(0.0, QColor(0x3B, 0x32, 0x22, 238));
+        fillGrad.setColorAt(1.0, QColor(0x21, 0x1F, 0x27, 245));
+
+        QLinearGradient ringGrad(medallion.topLeft(), medallion.bottomRight());
+        ringGrad.setColorAt(0.0, gold);
+        ringGrad.setColorAt(1.0, amber);
+
+        p.setBrush(fillGrad);
+        p.setPen(QPen(ringGrad, 1.4));
+        p.drawEllipse(medallion);
+
+        // Crisp vector pencil glyph inside medallion
+        QPainterPath penBody;
+        penBody.moveTo(center.x() - 7.5, center.y() + 7.5);
+        penBody.lineTo(center.x() - 3.2, center.y() + 6.4);
+        penBody.lineTo(center.x() + 7.2, center.y() - 4.0);
+        penBody.lineTo(center.x() + 4.0, center.y() - 7.2);
+        penBody.lineTo(center.x() - 6.4, center.y() + 3.2);
+        penBody.closeSubpath();
+
+        p.setPen(QPen(gold, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(QColor(255, 211, 0, 38));
+        p.drawPath(penBody);
+        p.drawLine(QPointF(center.x() + 1.8, center.y() - 5.0),
+                   QPointF(center.x() + 5.0, center.y() - 1.8));
+    }
+};
+
+} // namespace
+
+class MainWindow::TabRenameModalOverlay final : public QWidget {
+public:
+    explicit TabRenameModalOverlay(QWidget *parent)
+        : QWidget(parent) {
+        setObjectName(QStringLiteral("tabRenameModal"));
+        setAttribute(Qt::WA_NoSystemBackground);
+        setFocusPolicy(Qt::StrongFocus);
+        hide();
+
+        auto *outerLayout = new QVBoxLayout(this);
+        outerLayout->setContentsMargins(24, 24, 24, 24);
+        outerLayout->addStretch(1);
+
+        auto *centerRow = new QHBoxLayout();
+        centerRow->addStretch(1);
+
+        m_card = new ModalCardWidget(this);
+        m_card->setObjectName(QStringLiteral("tabRenameCard"));
+        m_card->setStyleSheet(QStringLiteral(
+            "QLabel#tabRenameTitle {"
+            "  color: #F6F5FA;"
+            "  font-size: 16px;"
+            "  font-weight: 700;"
+            "  background: transparent;"
+            "}"
+            "QLabel#tabRenameHint {"
+            "  color: #A9ACC0;"
+            "  font-size: 12px;"
+            "  background: transparent;"
+            "}"
+            "QLineEdit#tabRenameInput {"
+            "  background-color: rgba(18, 17, 23, 235);"
+            "  color: #F4F3FA;"
+            "  border: 1px solid rgba(255, 255, 255, 36);"
+            "  border-radius: 10px;"
+            "  padding: 9px 12px;"
+            "  font-size: 13.5px;"
+            "  selection-background-color: rgba(255, 211, 0, 120);"
+            "  selection-color: #FFFFFF;"
+            "}"
+            "QLineEdit#tabRenameInput:focus {"
+            "  border: 2px solid %1;"
+            "}"
+            "QLabel#tabRenameKeyHint {"
+            "  color: #787B90;"
+            "  font-size: 11px;"
+            "  background: transparent;"
+            "}"
+            "QPushButton#tabRenameCancelButton {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A3945, stop:1 #2F2E38);"
+            "  color: #F0EFF6;"
+            "  border: 1px solid rgba(255, 255, 255, 32);"
+            "  border-radius: 10px;"
+            "  padding: 8px 16px;"
+            "  font-size: 13px;"
+            "  font-weight: 600;"
+            "  min-height: 22px;"
+            "}"
+            "QPushButton#tabRenameCancelButton:hover {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #464554, stop:1 #383743);"
+            "}"
+            "QPushButton#tabRenameCancelButton:focus {"
+            "  border: 2px solid %1;"
+            "}"
+            "QPushButton#tabRenameResetButton {"
+            "  background: rgba(137, 221, 247, 24);"
+            "  color: %3;"
+            "  border: 1px solid rgba(137, 221, 247, 85);"
+            "  border-radius: 10px;"
+            "  padding: 8px 14px;"
+            "  font-size: 12.5px;"
+            "  font-weight: 600;"
+            "  min-height: 22px;"
+            "}"
+            "QPushButton#tabRenameResetButton:hover {"
+            "  background: rgba(137, 221, 247, 42);"
+            "}"
+            "QPushButton#tabRenameResetButton:focus {"
+            "  border: 2px solid %1;"
+            "}"
+            "QPushButton#tabRenameSaveButton {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 %1, stop:1 %2);"
+            "  color: #19181D;"
+            "  border: 1px solid rgba(255, 232, 110, 170);"
+            "  border-radius: 10px;"
+            "  padding: 8px 18px;"
+            "  font-size: 13px;"
+            "  font-weight: 700;"
+            "  min-height: 22px;"
+            "}"
+            "QPushButton#tabRenameSaveButton:hover {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #FFE047, stop:1 #FFA929);"
+            "}"
+            "QPushButton#tabRenameSaveButton:focus {"
+            "  border: 2px solid #FFFFFF;"
+            "}"
+        )
+            .arg(QString::fromLatin1(GhosttyUnionTheme::kGoldHex),
+                 QString::fromLatin1(GhosttyUnionTheme::kAmberHex),
+                 QString::fromLatin1(GhosttyUnionTheme::kCyanHex)));
+
+        auto *shadow = new QGraphicsDropShadowEffect(m_card);
+        shadow->setBlurRadius(46.0);
+        shadow->setOffset(0.0, 14.0);
+        shadow->setColor(QColor(0, 0, 0, 195));
+        m_card->setGraphicsEffect(shadow);
+
+        auto *cardLayout = new QVBoxLayout(m_card);
+        cardLayout->setContentsMargins(24, 24, 24, 18);
+        cardLayout->setSpacing(10);
+
+        auto *badgeRow = new QHBoxLayout();
+        badgeRow->addStretch(1);
+        badgeRow->addWidget(new ModalRenameBadge(m_card));
+        badgeRow->addStretch(1);
+        cardLayout->addLayout(badgeRow);
+
+        auto *titleLbl = new QLabel(QStringLiteral("Rename Tab"), m_card);
+        titleLbl->setObjectName(QStringLiteral("tabRenameTitle"));
+        titleLbl->setAlignment(Qt::AlignHCenter);
+        cardLayout->addWidget(titleLbl);
+
+        auto *hintLbl = new QLabel(QStringLiteral("Set a custom label, or leave blank to follow the shell title."), m_card);
+        hintLbl->setObjectName(QStringLiteral("tabRenameHint"));
+        hintLbl->setAlignment(Qt::AlignHCenter);
+        hintLbl->setWordWrap(true);
+        cardLayout->addWidget(hintLbl);
+
+        m_input = new QLineEdit(m_card);
+        m_input->setObjectName(QStringLiteral("tabRenameInput"));
+        m_input->setPlaceholderText(QStringLiteral("Automatic shell title…"));
+        m_input->setClearButtonEnabled(true);
+        m_input->setMaxLength(120);
+        connect(m_input, &QLineEdit::returnPressed, this, [this]() { triggerSave(m_input->text()); });
+        cardLayout->addWidget(m_input);
+
+        cardLayout->addSpacing(6);
+
+        auto *btnRow = new QHBoxLayout();
+        btnRow->setSpacing(10);
+
+        m_cancelBtn = new QPushButton(QStringLiteral("Cancel"), m_card);
+        m_cancelBtn->setObjectName(QStringLiteral("tabRenameCancelButton"));
+        m_cancelBtn->setAutoDefault(false);
+        m_cancelBtn->setDefault(false);
+        m_cancelBtn->setCursor(Qt::PointingHandCursor);
+
+        m_resetBtn = new QPushButton(QStringLiteral("Reset"), m_card);
+        m_resetBtn->setObjectName(QStringLiteral("tabRenameResetButton"));
+        m_resetBtn->setAutoDefault(false);
+        m_resetBtn->setDefault(false);
+        m_resetBtn->setCursor(Qt::PointingHandCursor);
+
+        m_saveBtn = new QPushButton(QStringLiteral("Save Name"), m_card);
+        m_saveBtn->setObjectName(QStringLiteral("tabRenameSaveButton"));
+        m_saveBtn->setAutoDefault(false);
+        m_saveBtn->setDefault(false);
+        m_saveBtn->setCursor(Qt::PointingHandCursor);
+
+        connect(m_cancelBtn, &QPushButton::clicked, this, [this]() { triggerCancel(); });
+        connect(m_resetBtn, &QPushButton::clicked, this, [this]() { triggerSave(QString()); });
+        connect(m_saveBtn, &QPushButton::clicked, this, [this]() { triggerSave(m_input->text()); });
+
+        btnRow->addWidget(m_cancelBtn, 1);
+        btnRow->addWidget(m_resetBtn);
+        btnRow->addWidget(m_saveBtn, 1);
+        cardLayout->addLayout(btnRow);
+
+        cardLayout->addSpacing(2);
+        auto *keyHint = new QLabel(QStringLiteral("Enter  Save   ·   Esc  Cancel"), m_card);
+        keyHint->setObjectName(QStringLiteral("tabRenameKeyHint"));
+        keyHint->setAlignment(Qt::AlignHCenter);
+        cardLayout->addWidget(keyHint);
+
+        centerRow->addWidget(m_card);
+        centerRow->addStretch(1);
+        outerLayout->addLayout(centerRow);
+        outerLayout->addStretch(1);
+
+        m_revealAnim = new QVariantAnimation(this);
+        m_revealAnim->setDuration(140);
+        m_revealAnim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_revealAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_revealProgress = v.toReal();
+            if (m_card) {
+                m_card->setRevealProgress(m_revealProgress);
+            }
+            update();
+        });
+    }
+
+    void present(const QString &currentTitle,
+                 bool hasCustomTitle,
+                 std::function<void(const QString &)> onSave,
+                 std::function<void()> onCancel) {
+        m_onSave = std::move(onSave);
+        m_onCancel = std::move(onCancel);
+
+        m_input->setText(currentTitle);
+        m_resetBtn->setVisible(hasCustomTitle);
+
+        m_frostedBackdrop = {};
+        if (QWidget *pw = parentWidget()) {
+            setGeometry(pw->rect());
+            m_frostedBackdrop = createFrostedBackdrop(pw->grab());
+        }
+
+        m_revealProgress = 0.0;
+        if (m_card) {
+            m_card->setRevealProgress(0.0);
+        }
+        raise();
+        show();
+        m_input->setFocus(Qt::PopupFocusReason);
+        m_input->selectAll();
+
+        m_revealAnim->stop();
+        m_revealAnim->setStartValue(0.0);
+        m_revealAnim->setEndValue(1.0);
+        m_revealAnim->start();
+        update();
+    }
+
+    void dismiss() {
+        m_revealAnim->stop();
+        m_frostedBackdrop = {};
+        m_onSave = nullptr;
+        m_onCancel = nullptr;
+        hide();
+    }
+
+protected:
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        const qreal t = std::clamp(m_revealProgress, 0.25, 1.0);
+        if (!m_frostedBackdrop.isNull()) {
+            p.save();
+            p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            p.setOpacity(0.92 * t);
+            p.drawPixmap(rect(), m_frostedBackdrop);
+            p.restore();
+        }
+        const QPointF center(width() * 0.5, height() * 0.5);
+        const qreal rad = std::max(width(), height()) * 0.72;
+        QRadialGradient scrim(center, std::max(1.0, rad));
+        scrim.setColorAt(0.0, QColor(0x11, 0x10, 0x16, static_cast<int>(150.0 * t)));
+        scrim.setColorAt(1.0, QColor(0x09, 0x08, 0x0C, static_cast<int>(218.0 * t)));
+        p.fillRect(rect(), scrim);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override {
+        if (m_card && !m_card->geometry().contains(event->position().toPoint())) {
+            triggerCancel();
+        }
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override { event->accept(); }
+    void mouseMoveEvent(QMouseEvent *event) override { event->accept(); }
+    void wheelEvent(QWheelEvent *event) override { event->accept(); }
+
+    bool focusNextPrevChild(bool next) override {
+        QList<QWidget *> ring{m_input, m_cancelBtn};
+        if (m_resetBtn && m_resetBtn->isVisible()) {
+            ring.append(m_resetBtn);
+        }
+        ring.append(m_saveBtn);
+        int cur = -1;
+        for (int i = 0; i < ring.size(); ++i) {
+            if (ring[i] && ring[i]->hasFocus()) {
+                cur = i;
+                break;
+            }
+        }
+        const int step = next ? 1 : -1;
+        const int target = (cur < 0) ? 0 : (cur + step + ring.size()) % ring.size();
+        if (ring[target]) {
+            ring[target]->setFocus(Qt::TabFocusReason);
+            return true;
+        }
+        return false;
+    }
+
+    void keyPressEvent(QKeyEvent *event) override {
+        if (event->key() == Qt::Key_Escape) {
+            triggerCancel();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            if (m_cancelBtn && m_cancelBtn->hasFocus()) {
+                triggerCancel();
+            } else if (m_resetBtn && m_resetBtn->isVisible() && m_resetBtn->hasFocus()) {
+                triggerSave(QString());
+            } else {
+                triggerSave(m_input->text());
+            }
+            event->accept();
+            return;
+        }
+        event->accept();
+    }
+
+private:
+    void triggerSave(const QString &name) {
+        auto cb = std::move(m_onSave);
+        dismiss();
+        if (cb) {
+            cb(name);
+        }
+    }
+
+    void triggerCancel() {
+        auto cb = std::move(m_onCancel);
+        dismiss();
+        if (cb) {
+            cb();
+        }
+    }
+
+    ModalCardWidget *m_card = nullptr;
+    QLineEdit *m_input = nullptr;
+    QPushButton *m_cancelBtn = nullptr;
+    QPushButton *m_resetBtn = nullptr;
+    QPushButton *m_saveBtn = nullptr;
+    QVariantAnimation *m_revealAnim = nullptr;
+    QPixmap m_frostedBackdrop;
+    qreal m_revealProgress = 1.0;
+    std::function<void(const QString &)> m_onSave;
+    std::function<void()> m_onCancel;
+};
+
 MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("ghostty-union"));
     resize(1220, 780);
+    setStyleSheet(QStringLiteral("QMainWindow { background-color: %1; }")
+                      .arg(QString::fromLatin1(GhosttyUnionTheme::kChromeDeepHex)));
 
     auto *central = new QWidget(this);
+    central->setStyleSheet(QStringLiteral("background-color: %1;")
+                               .arg(QString::fromLatin1(GhosttyUnionTheme::kChromeDeepHex)));
     auto *vbox = new QVBoxLayout(central);
     vbox->setContentsMargins(0, 0, 0, 0);
     vbox->setSpacing(0);
@@ -799,7 +1480,8 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     m_statsBar = new StatsBarWidget(central);
     vbox->addWidget(m_statsBar);
 
-    m_tabs = new TerminalTabWidget(central);
+    auto *tabWidget = new TerminalTabWidget(central);
+    m_tabs = tabWidget;
     m_tabs->setDocumentMode(true);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
@@ -809,25 +1491,98 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     m_tabs->tabBar()->setAutoHide(false); // Always show tab bar
     m_tabs->tabBar()->setUsesScrollButtons(true);
 
-    // Subtle #FFD300 active tab underline accent over Union styling
+    if (AdaptiveTabBar *bar = tabWidget->adaptiveTabBar()) {
+        bar->setOnTabContextMenu([this](int idx, const QPoint &globalPos) {
+            showTabContextMenu(idx, globalPos);
+        });
+        bar->setOnTabDoubleClicked([this](int idx) {
+            requestRenameTabAt(idx);
+        });
+    }
+
+    // Solar Forge non-text tab strip chrome (active sliding glow bar is custom-painted by AdaptiveTabBar)
     m_tabs->setStyleSheet(QStringLiteral(
-        "QTabBar::tab:selected { border-bottom: 2px solid %1; }"
-        "QTabBar::tab { padding: 4px 12px; }"
-    ).arg(QString::fromLatin1(GhosttyUnionTheme::kGoldHex)));
+        "QTabWidget::pane {"
+        "  border: none;"
+        "  border-top: 1px solid %1;"
+        "  background: %2;"
+        "}"
+        "QTabWidget::tab-bar {"
+        "  left: 4px;"
+        "}"
+        "QTabBar {"
+        "  background: %3;"
+        "  qproperty-drawBase: 0;"
+        "}"
+        "QTabBar::tab {"
+        "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1D1C23, stop:1 #18171D);"
+        "  color: %4;"
+        "  border: 1px solid rgba(255, 255, 255, 14);"
+        "  border-bottom: none;"
+        "  border-top-left-radius: 8px;"
+        "  border-top-right-radius: 8px;"
+        "  padding: 5px 10px 6px 12px;"
+        "  margin-top: 3px;"
+        "  margin-right: 3px;"
+        "}"
+        "QTabBar::tab:hover:!selected {"
+        "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #26242E, stop:1 #1E1D25);"
+        "  color: #DFE1ED;"
+        "  border: 1px solid rgba(255, 211, 0, 52);"
+        "  border-bottom: none;"
+        "}"
+        "QTabBar::tab:selected {"
+        "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2C2A35, stop:1 #222126);"
+        "  color: %5;"
+        "  font-weight: 600;"
+        "  border: 1px solid rgba(255, 211, 0, 72);"
+        "  border-bottom: none;"
+        "}"
+        "QToolButton#newTabButton {"
+        "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #272530, stop:1 #1C1B22);"
+        "  color: %6;"
+        "  border: 1px solid #3F3C37;"
+        "  border-radius: 7px;"
+        "  font-size: 15px;"
+        "  font-weight: 700;"
+        "  margin: 3px 6px 3px 4px;"
+        "  padding: 0px 8px;"
+        "}"
+        "QToolButton#newTabButton:hover {"
+        "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #35323F, stop:1 #26242E);"
+        "  border: 1px solid %6;"
+        "  color: #FFFFFF;"
+        "}"
+        "QToolButton#newTabButton:pressed {"
+        "  background: #1C1B22;"
+        "}"
+    )
+        .arg(QString::fromLatin1(GhosttyUnionTheme::kDividerHex),
+             QString::fromLatin1(GhosttyUnionTheme::kChromeDeepHex),
+             QString::fromLatin1(GhosttyUnionTheme::kChromeDeepHex),
+             QString::fromLatin1(GhosttyUnionTheme::kDimTextHex),
+             QString::fromLatin1(GhosttyUnionTheme::kChromeTextHex),
+             QString::fromLatin1(GhosttyUnionTheme::kGoldHex)));
 
     auto *newTabBtn = new QToolButton(m_tabs);
+    newTabBtn->setObjectName(QStringLiteral("newTabButton"));
     newTabBtn->setText(QStringLiteral("+"));
     newTabBtn->setToolTip(QStringLiteral("New Tab (Ctrl+Shift+T)"));
-    newTabBtn->setAutoRaise(true);
+    newTabBtn->setAutoRaise(false);
+    newTabBtn->setCursor(Qt::PointingHandCursor);
     newTabBtn->setFocusPolicy(Qt::NoFocus);
-    connect(newTabBtn, &QToolButton::clicked, this, [this]() { addNewTab(); });
+    connect(newTabBtn, &QToolButton::clicked, this, [this]() {
+        if (!isAnyModalVisible()) {
+            addNewTab();
+        }
+    });
     m_tabs->setCornerWidget(newTabBtn, Qt::TopRightCorner);
 
     connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::requestCloseTabAt);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
         if (auto *p = currentPane()) {
             recordTabVisit(p);
-            if (!isTabCloseModalVisible()) {
+            if (!isAnyModalVisible()) {
                 p->focusActive();
             }
         }
@@ -840,6 +1595,9 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     m_closeModal = new TabCloseModalOverlay(this);
     m_closeModal->setGeometry(rect());
 
+    m_renameModal = new TabRenameModalOverlay(this);
+    m_renameModal->setGeometry(rect());
+
     wireShortcuts();
     addNewTab(initialCwd.isEmpty() ? QDir::currentPath() : initialCwd);
 }
@@ -850,6 +1608,14 @@ TerminalTabPane *MainWindow::currentPane() const {
 
 bool MainWindow::isTabCloseModalVisible() const {
     return m_closeModal != nullptr && m_closeModal->isVisible();
+}
+
+bool MainWindow::isTabRenameModalVisible() const {
+    return m_renameModal != nullptr && m_renameModal->isVisible();
+}
+
+bool MainWindow::isAnyModalVisible() const {
+    return isTabCloseModalVisible() || isTabRenameModalVisible();
 }
 
 void MainWindow::recordTabVisit(TerminalTabPane *pane) {
@@ -880,6 +1646,11 @@ void MainWindow::wirePaneSignals(TerminalTabPane *pane) {
         }
     });
     connect(pane, &TerminalTabPane::detachToNewTabRequested, this, &MainWindow::adoptTerminalInNewTab);
+    connect(pane, &TerminalTabPane::renameTabRequested, this, [this](const TerminalTabPane *target) {
+        if (const int tabIdx = m_tabs->indexOf(target); tabIdx >= 0) {
+            requestRenameTabAt(tabIdx);
+        }
+    });
 }
 
 void MainWindow::addNewTab(const QString &cwd) {
@@ -919,8 +1690,121 @@ void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
     updateWindowTitle();
 }
 
+void MainWindow::showTabContextMenu(int index, const QPoint &globalPos) {
+    if (isAnyModalVisible() || index < 0 || index >= m_tabs->count()) {
+        return;
+    }
+    const QPointer<TerminalTabPane> targetPane(qobject_cast<TerminalTabPane *>(m_tabs->widget(index)));
+    if (!targetPane) {
+        return;
+    }
+
+    auto *menu = new QMenu(this);
+    menu->setObjectName(QStringLiteral("tabBarContextMenu"));
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    GhosttyUnionTheme::styleSolarForgeMenu(menu);
+
+    const QColor goldCol(GhosttyUnionTheme::kGoldHex);
+    const QColor cyanCol(GhosttyUnionTheme::kCyanHex);
+    const QColor amberCol(GhosttyUnionTheme::kAmberHex);
+    const QColor redCol(GhosttyUnionTheme::kRedOrangeHex);
+
+    QAction *renameAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Rename, goldCol),
+        QStringLiteral("Rename Tab…\tCtrl+Shift+A"));
+    connect(renameAct, &QAction::triggered, this, [this, targetPane]() {
+        if (targetPane) {
+            if (const int idx = m_tabs->indexOf(targetPane.data()); idx >= 0) {
+                requestRenameTabAt(idx);
+            }
+        }
+    });
+
+    QAction *resetNameAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::ResetName, cyanCol),
+        QStringLiteral("Reset Tab Name"));
+    resetNameAct->setEnabled(targetPane->hasCustomTitle());
+    connect(resetNameAct, &QAction::triggered, this, [targetPane]() {
+        if (targetPane) {
+            targetPane->setCustomTitle(QString());
+        }
+    });
+
+    menu->addSeparator();
+
+    QAction *newTabAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::NewTab, amberCol),
+        QStringLiteral("New Tab\tCtrl+Shift+T"));
+    connect(newTabAct, &QAction::triggered, this, [this]() { addNewTab(); });
+
+    QAction *dupTabAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Duplicate, amberCol),
+        QStringLiteral("Duplicate Tab"));
+    connect(dupTabAct, &QAction::triggered, this, [this, targetPane]() {
+        if (targetPane) {
+            addNewTab(targetPane->currentWorkingDirectory());
+        }
+    });
+
+    menu->addSeparator();
+
+    QAction *closeAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::CloseTab, redCol),
+        QStringLiteral("Close Tab\tCtrl+Shift+W"));
+    connect(closeAct, &QAction::triggered, this, [this, targetPane]() {
+        if (targetPane) {
+            if (const int idx = m_tabs->indexOf(targetPane.data()); idx >= 0) {
+                requestCloseTabAt(idx);
+            }
+        }
+    });
+
+    GhosttyUnionTheme::popupSolarForgeMenuAnimated(menu, globalPos);
+}
+
+void MainWindow::requestRenameTabAt(int index) {
+    if (isAnyModalVisible() || index < 0 || index >= m_tabs->count()) {
+        return;
+    }
+    auto *targetPane = qobject_cast<TerminalTabPane *>(m_tabs->widget(index));
+    if (!targetPane || !m_renameModal) {
+        return;
+    }
+
+    m_pendingRenamePane = targetPane;
+    const QString initialText = targetPane->hasCustomTitle() ? targetPane->customTitle() : m_tabs->tabText(index);
+    m_renameModal->present(
+        initialText,
+        targetPane->hasCustomTitle(),
+        [this](const QString &newName) { applyPendingTabRename(newName); },
+        [this]() { dismissTabRenameModal(/*restoreFocus=*/true); });
+}
+
+void MainWindow::dismissTabRenameModal(bool restoreFocus) {
+    m_pendingRenamePane = nullptr;
+    if (m_renameModal && m_renameModal->isVisible()) {
+        m_renameModal->dismiss();
+    }
+    if (restoreFocus) {
+        if (auto *active = currentPane()) {
+            active->focusActive();
+        }
+    }
+}
+
+void MainWindow::applyPendingTabRename(const QString &newName) {
+    const QPointer<TerminalTabPane> targetPane = m_pendingRenamePane;
+    m_pendingRenamePane = nullptr;
+    if (targetPane) {
+        targetPane->setCustomTitle(newName);
+    }
+    if (auto *active = currentPane()) {
+        active->focusActive();
+    }
+}
+
 void MainWindow::requestCloseTabAt(int index) {
-    if (isTabCloseModalVisible() || index < 0 || index >= m_tabs->count()) {
+    if (isAnyModalVisible() || index < 0 || index >= m_tabs->count()) {
         return;
     }
     auto *targetPane = qobject_cast<TerminalTabPane *>(m_tabs->widget(index));
@@ -980,6 +1864,9 @@ void MainWindow::closeTabAt(int index) {
     if (m_pendingClosePane && m_pendingClosePane.data() == closingPane) {
         dismissTabCloseModal(/*restoreFocus=*/false);
     }
+    if (m_pendingRenamePane && m_pendingRenamePane.data() == closingPane) {
+        dismissTabRenameModal(/*restoreFocus=*/false);
+    }
 
     const auto removed = std::ranges::remove_if(
         m_tabHistory,
@@ -1020,11 +1907,11 @@ void MainWindow::closeTabAt(int index) {
     }
     if (auto *active = currentPane()) {
         recordTabVisit(active);
-        if (!isTabCloseModalVisible()) {
+        if (!isAnyModalVisible()) {
             active->focusActive();
             const QPointer<TerminalTabPane> guard(active);
             QTimer::singleShot(0, this, [this, guard]() {
-                if (!isTabCloseModalVisible() && guard && guard->isVisible()) {
+                if (!isAnyModalVisible() && guard && guard->isVisible()) {
                     guard->focusActive();
                 }
             });
@@ -1046,7 +1933,7 @@ void MainWindow::wireShortcuts() {
         auto *sc = new QShortcut(seq, this);
         sc->setContext(Qt::WindowShortcut);
         connect(sc, &QShortcut::activated, this, [this, fn]() {
-            if (isTabCloseModalVisible()) {
+            if (isAnyModalVisible()) {
                 return;
             }
             fn();
@@ -1061,6 +1948,9 @@ void MainWindow::wireShortcuts() {
     });
 
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T), [this]() { addNewTab(); });
+    addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_A), [this]() {
+        requestRenameTabAt(m_tabs->currentIndex());
+    });
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_W), [this]() {
         if (auto *p = currentPane()) {
             if (!p->closeActive()) {
@@ -1207,5 +2097,8 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
     QMainWindow::resizeEvent(event);
     if (m_closeModal) {
         m_closeModal->setGeometry(rect());
+    }
+    if (m_renameModal) {
+        m_renameModal->setGeometry(rect());
     }
 }

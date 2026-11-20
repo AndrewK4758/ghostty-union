@@ -39,6 +39,9 @@ public:
     [[nodiscard]] TerminalWidget *activeTerminal() const { return m_active; }
     [[nodiscard]] int terminalCount() const;
     [[nodiscard]] QString title() const;
+    [[nodiscard]] QString customTitle() const { return m_customTitle; }
+    [[nodiscard]] bool hasCustomTitle() const { return !m_customTitle.isEmpty(); }
+    void setCustomTitle(const QString &name);
     [[nodiscard]] QString currentWorkingDirectory() const;
 
     void splitActive(Qt::Orientation orientation);
@@ -60,6 +63,7 @@ Q_SIGNALS:
     void titleChanged(const QString &title);
     void emptied(TerminalTabPane *self);
     void detachToNewTabRequested(TerminalWidget *term);
+    void renameTabRequested(TerminalTabPane *self);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -96,5 +100,6 @@ private:
     QList<QPointer<TerminalWidget>> m_focusHistory;
     bool m_suppressFocusTracking = false;
     bool m_zoomed = false;
+    QString m_customTitle;
     DropOverlayWidget *m_dropOverlay = nullptr;
 };
