@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "StatsBarWidget.h"
 #include "TerminalTabPane.h"
+#include "TerminalWidget.h"
 #include "Theme.h"
 
 #include <QAction>
@@ -10,10 +11,14 @@
 #include <QKeySequence>
 #include <QShortcut>
 #include <QShowEvent>
+#include <QSignalBlocker>
 #include <QTabBar>
 #include <QTabWidget>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+
+#include <algorithm>
 
 MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     : QMainWindow(parent) {
@@ -33,6 +38,8 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     m_tabs->setDocumentMode(true);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
+    m_tabs->setFocusPolicy(Qt::NoFocus);
+    m_tabs->tabBar()->setFocusPolicy(Qt::NoFocus);
     m_tabs->tabBar()->setExpanding(false);
     m_tabs->tabBar()->setAutoHide(false); // Always show tab bar
     m_tabs->tabBar()->setUsesScrollButtons(true);
@@ -54,6 +61,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::closeTabAt);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
         if (auto *p = currentPane()) {
+            recordTabVisit(p);
             p->focusActive();
         }
         updateWindowTitle();
@@ -70,19 +78,18 @@ TerminalTabPane *MainWindow::currentPane() const {
     return qobject_cast<TerminalTabPane *>(m_tabs->currentWidget());
 }
 
-void MainWindow::addNewTab(const QString &cwd) {
-    QString dir = cwd;
-    if (dir.isEmpty()) {
-        if (const auto *p = currentPane()) {
-            dir = p->currentWorkingDirectory();
-        }
+void MainWindow::recordTabVisit(TerminalTabPane *pane) {
+    if (!pane) {
+        return;
     }
-    if (dir.isEmpty()) {
-        dir = QDir::homePath();
-    }
+    m_tabHistory.erase(
+        std::remove_if(m_tabHistory.begin(), m_tabHistory.end(),
+                       [pane](const QPointer<TerminalTabPane> &p) { return p.isNull() || p.data() == pane; }),
+        m_tabHistory.end());
+    m_tabHistory.prepend(QPointer<TerminalTabPane>(pane));
+}
 
-    auto *pane = new TerminalTabPane(dir, m_tabs);
-    const int idx = m_tabs->addTab(pane, pane->title());
+void MainWindow::wirePaneSignals(TerminalTabPane *pane) {
     connect(pane, &TerminalTabPane::titleChanged, this, [this, pane](const QString &t) {
         const int tabIdx = m_tabs->indexOf(pane);
         if (tabIdx >= 0) {
@@ -97,8 +104,40 @@ void MainWindow::addNewTab(const QString &cwd) {
             closeTabAt(tabIdx);
         }
     });
+    connect(pane, &TerminalTabPane::detachToNewTabRequested, this, &MainWindow::adoptTerminalInNewTab);
+}
+
+void MainWindow::addNewTab(const QString &cwd) {
+    QString dir = cwd;
+    if (dir.isEmpty()) {
+        if (const auto *p = currentPane()) {
+            dir = p->currentWorkingDirectory();
+        }
+    }
+    if (dir.isEmpty()) {
+        dir = QDir::homePath();
+    }
+
+    auto *pane = new TerminalTabPane(dir, m_tabs);
+    wirePaneSignals(pane);
+    const int idx = m_tabs->addTab(pane, pane->title());
 
     m_tabs->setCurrentIndex(idx);
+    recordTabVisit(pane);
+    pane->focusActive();
+    updateWindowTitle();
+}
+
+void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
+    if (!term) {
+        return;
+    }
+    auto *pane = new TerminalTabPane(term, m_tabs);
+    wirePaneSignals(pane);
+    const int idx = m_tabs->addTab(pane, pane->title());
+
+    m_tabs->setCurrentIndex(idx);
+    recordTabVisit(pane);
     pane->focusActive();
     updateWindowTitle();
 }
@@ -107,14 +146,54 @@ void MainWindow::closeTabAt(int index) {
     if (index < 0 || index >= m_tabs->count()) {
         return;
     }
+    const bool wasCurrent = (index == m_tabs->currentIndex());
     QWidget *w = m_tabs->widget(index);
-    m_tabs->removeTab(index);
+    auto *closingPane = qobject_cast<TerminalTabPane *>(w);
+
+    m_tabHistory.erase(
+        std::remove_if(m_tabHistory.begin(), m_tabHistory.end(),
+                       [closingPane](const QPointer<TerminalTabPane> &p) {
+                           return p.isNull() || p.data() == closingPane;
+                       }),
+        m_tabHistory.end());
+
+    TerminalTabPane *nextMru = nullptr;
+    if (wasCurrent) {
+        for (const QPointer<TerminalTabPane> &cand : m_tabHistory) {
+            if (cand && cand.data() != closingPane && m_tabs->indexOf(cand.data()) >= 0) {
+                nextMru = cand.data();
+                break;
+            }
+        }
+    }
+
+    {
+        const QSignalBlocker blocker(m_tabs);
+        m_tabs->removeTab(index);
+    }
     if (w) {
         w->deleteLater();
     }
     if (m_tabs->count() == 0) {
         close();
+        return;
     }
+
+    if (wasCurrent && nextMru && m_tabs->indexOf(nextMru) >= 0) {
+        const QSignalBlocker blocker(m_tabs);
+        m_tabs->setCurrentWidget(nextMru);
+    }
+    if (auto *active = currentPane()) {
+        recordTabVisit(active);
+        active->focusActive();
+        const QPointer<TerminalTabPane> guard(active);
+        QTimer::singleShot(0, this, [guard]() {
+            if (guard && guard->isVisible()) {
+                guard->focusActive();
+            }
+        });
+    }
+    updateWindowTitle();
 }
 
 void MainWindow::updateWindowTitle() {
@@ -195,12 +274,30 @@ void MainWindow::wireShortcuts() {
         if (auto *p = currentPane()) p->resizeSplit(0, 1);
     });
 
-    // Split zoom (`Ctrl+Shift+Enter` / `Return`)
+    // Split zoom (`Ctrl+Shift+Enter` / `Return`) & split rearrangement (`Ctrl+Alt+Shift+Arrows/E`, `Ctrl+Shift+R`)
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Return), [this]() {
         if (auto *p = currentPane()) p->toggleZoom();
     });
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Enter), [this]() {
         if (auto *p = currentPane()) p->toggleZoom();
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_Left), [this]() {
+        if (auto *p = currentPane()) p->moveSplit(-1, 0);
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_Right), [this]() {
+        if (auto *p = currentPane()) p->moveSplit(1, 0);
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_Up), [this]() {
+        if (auto *p = currentPane()) p->moveSplit(0, -1);
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_Down), [this]() {
+        if (auto *p = currentPane()) p->moveSplit(0, 1);
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R), [this]() {
+        if (auto *p = currentPane()) p->rotateSplitOrientation();
+    });
+    addBind(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_E), [this]() {
+        if (auto *p = currentPane()) p->equalizeSplits();
     });
 
     // Tab switching (`Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PageUp/PageDown`, `Alt+1..9`)

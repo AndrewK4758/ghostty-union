@@ -1,6 +1,10 @@
 #pragma once
 
+#include <QList>
 #include <QMainWindow>
+#include <QPointer>
+
+#include "TerminalWidget.h"
 
 class QTabWidget;
 class StatsBarWidget;
@@ -25,10 +29,14 @@ protected:
 private:
     TerminalTabPane *currentPane() const;
     void addNewTab(const QString &cwd = {});
+    void adoptTerminalInNewTab(TerminalWidget *term);
+    void wirePaneSignals(TerminalTabPane *pane);
+    void recordTabVisit(TerminalTabPane *pane);
     void closeTabAt(int index);
     void wireShortcuts();
     void updateWindowTitle();
 
     StatsBarWidget *m_statsBar = nullptr;
     QTabWidget *m_tabs = nullptr;
+    QList<QPointer<TerminalTabPane>> m_tabHistory;
 };

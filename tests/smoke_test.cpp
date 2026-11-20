@@ -15,6 +15,7 @@
 #include <QKeyEvent>
 #include <QLayout>
 #include <QMouseEvent>
+#include <QPointer>
 #include <QPushButton>
 #include <QSysInfo>
 #include <QTabBar>
@@ -1088,6 +1089,232 @@ private Q_SLOTS:
             liveTerm->plainTextSnapshot().contains(QLatin1String("__ZSH_CD_DONE__")),
             5000);
         QTRY_COMPARE_WITH_TIMEOUT(liveTerm->currentWorkingDirectory(), canonicalTarget, 5000);
+    }
+
+    void testCtrlDFocusShiftAcrossNestedSplitsAndTabs() {
+        MainWindow win;
+        win.resize(1000, 640);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QCOMPARE(tabs->focusPolicy(), Qt::NoFocus);
+        QCOMPARE(tabs->tabBar()->focusPolicy(), Qt::NoFocus);
+
+        auto waitShellReady = [](TerminalWidget *t, const QString &id) {
+            const QString expected = QStringLiteral("__RDY_%1__").arg(id);
+            QTest::keyClicks(t, QStringLiteral("printf '%s%s\\n' __RDY_ %1__").arg(id));
+            QTest::keyClick(t, Qt::Key_Return);
+            QTRY_VERIFY_WITH_TIMEOUT(t->plainTextSnapshot().contains(expected), 5000);
+            QTest::qWait(80);
+        };
+
+        auto *pane = qobject_cast<TerminalTabPane *>(tabs->currentWidget());
+        QVERIFY(pane != nullptr);
+        TerminalWidget *tA = pane->activeTerminal();
+        QVERIFY(tA != nullptr);
+        waitShellReady(tA, QStringLiteral("A"));
+
+        pane->splitActive(Qt::Horizontal);
+        TerminalWidget *tB = pane->activeTerminal();
+        QVERIFY(tB != nullptr && tB != tA);
+        waitShellReady(tB, QStringLiteral("B"));
+
+        pane->splitActive(Qt::Vertical);
+        TerminalWidget *tC = pane->activeTerminal();
+        QVERIFY(tC != nullptr && tC != tB && tC != tA);
+        QTRY_VERIFY_WITH_TIMEOUT(tC->hasFocus(), 2000);
+        waitShellReady(tC, QStringLiteral("C"));
+
+        // Ctrl+D on C (layout A | (B / C)) must collapse nested splitter and return focus to MRU B
+        const QPointer<TerminalWidget> guardA(tA);
+        const QPointer<TerminalWidget> guardB(tB);
+        QTest::keyClick(tC, Qt::Key_D, Qt::ControlModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(pane->findChildren<TerminalWidget *>().size(), 2, 5000);
+        QVERIFY(guardB);
+        QCOMPARE(pane->activeTerminal(), guardB.data());
+        QTRY_VERIFY_WITH_TIMEOUT(guardB && guardB->hasFocus(), 2000);
+        QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(guardB.data()));
+
+        // Typing into QApplication::focusWidget() reaches B directly
+        QTest::keyClicks(QApplication::focusWidget(), QStringLiteral("echo __AFTER_CTRL_D_B__"));
+        QTest::keyClick(QApplication::focusWidget(), Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(guardB && guardB->plainTextSnapshot().contains(QLatin1String("__AFTER_CTRL_D_B__")), 5000);
+        QVERIFY(guardB);
+
+        // MRU focus order: split -> click A -> click C2 -> Ctrl+D on C2 must return focus to A
+        pane->splitActive(Qt::Vertical);
+        TerminalWidget *tC2 = pane->activeTerminal();
+        QVERIFY(tC2 != nullptr && tC2 != tB && tC2 != tA);
+        waitShellReady(tC2, QStringLiteral("C2"));
+
+        QVERIFY(guardA);
+        QTest::mouseClick(guardA, Qt::LeftButton, Qt::NoModifier, QPoint(24, 24));
+        QTRY_VERIFY_WITH_TIMEOUT(guardA && guardA->hasFocus(), 2000);
+        QTest::mouseClick(tC2, Qt::LeftButton, Qt::NoModifier, QPoint(24, 24));
+        QTRY_VERIFY_WITH_TIMEOUT(tC2->hasFocus(), 2000);
+
+        QTest::keyClick(tC2, Qt::Key_D, Qt::ControlModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(pane->findChildren<TerminalWidget *>().size(), 2, 5000);
+        QVERIFY(guardA);
+        QCOMPARE(pane->activeTerminal(), guardA.data());
+        QTRY_VERIFY_WITH_TIMEOUT(guardA && guardA->hasFocus(), 2000);
+        QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(guardA.data()));
+
+        // MRU tab focus restoration: open 3 tabs, visit Tab 0 -> Tab 2, Ctrl+D Tab 2 -> restores Tab 0
+        QTest::keyClick(QApplication::focusWidget(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+        QTest::keyClick(QApplication::focusWidget(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 3, 3000);
+
+        tabs->setCurrentIndex(0);
+        QApplication::processEvents();
+        tabs->setCurrentIndex(2);
+        QApplication::processEvents();
+
+        auto *pane2 = qobject_cast<TerminalTabPane *>(tabs->currentWidget());
+        QVERIFY(pane2 != nullptr);
+        TerminalWidget *tab2Term = pane2->activeTerminal();
+        QVERIFY(tab2Term != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(tab2Term->hasFocus(), 2000);
+        waitShellReady(tab2Term, QStringLiteral("TAB2"));
+
+        QTest::keyClick(tab2Term, Qt::Key_D, Qt::ControlModifier);
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 5000);
+        QCOMPARE(tabs->currentIndex(), 0);
+        QCOMPARE(tabs->currentWidget(), static_cast<QWidget *>(pane));
+        QTRY_VERIFY_WITH_TIMEOUT(tA->hasFocus(), 2000);
+        QCOMPARE(QApplication::focusWidget(), static_cast<QWidget *>(tA));
+    }
+
+    void testSplitRearrangementDragSwapDockAndDetach() {
+        MainWindow win;
+        win.resize(1000, 640);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        auto *pane = qobject_cast<TerminalTabPane *>(tabs->currentWidget());
+        QVERIFY(pane != nullptr);
+
+        TerminalWidget *tA = pane->activeTerminal();
+        QVERIFY(tA != nullptr);
+        QVERIFY(!tA->isSplitRearrangeable());
+
+        pane->splitActive(Qt::Horizontal);
+        TerminalWidget *tB = pane->activeTerminal();
+        QVERIFY(tB != nullptr && tB != tA);
+        QVERIFY(tA->isSplitRearrangeable());
+        QVERIFY(tB->isSplitRearrangeable());
+        QApplication::processEvents();
+        QVERIFY(tA->mapTo(pane, QPoint(0, 0)).x() < tB->mapTo(pane, QPoint(0, 0)).x());
+
+        auto dragBetweenWidgets = [](TerminalWidget *src,
+                                     const QPoint &srcLocalStart,
+                                     TerminalWidget *dst,
+                                     const QPoint &dstLocalEnd,
+                                     Qt::KeyboardModifiers mods) {
+            const QPoint gStart = src->mapToGlobal(srcLocalStart);
+            const QPoint gEnd = dst->mapToGlobal(dstLocalEnd);
+            const QPoint dstInSrc = src->mapFromGlobal(gEnd);
+            QMouseEvent press(QEvent::MouseButtonPress, QPointF(srcLocalStart), QPointF(gStart),
+                              Qt::LeftButton, Qt::LeftButton, mods);
+            QCoreApplication::sendEvent(src, &press);
+            QMouseEvent step(QEvent::MouseMove, QPointF(srcLocalStart + QPoint(10, 10)),
+                             QPointF(gStart + QPoint(10, 10)),
+                             Qt::NoButton, Qt::LeftButton, mods);
+            QCoreApplication::sendEvent(src, &step);
+            QMouseEvent move(QEvent::MouseMove, QPointF(dstInSrc), QPointF(gEnd),
+                             Qt::NoButton, Qt::LeftButton, mods);
+            QCoreApplication::sendEvent(src, &move);
+            QMouseEvent release(QEvent::MouseButtonRelease, QPointF(dstInSrc), QPointF(gEnd),
+                                Qt::LeftButton, Qt::NoButton, mods);
+            QCoreApplication::sendEvent(src, &release);
+            QApplication::processEvents();
+        };
+
+        // 1. Hover-grip drag CenterSwap: drag tB onto center of tA -> tB moves left, tA moves right
+        const QPoint gripB = tB->splitGripRect().center().toPoint();
+        QCOMPARE(pane->previewDropZoneForTesting(tB, tA->mapToGlobal(tA->rect().center())),
+                 TerminalTabPane::DropZone::CenterSwap);
+        dragBetweenWidgets(tB, gripB, tA, tA->rect().center(), Qt::NoModifier);
+        QVERIFY(tB->mapTo(pane, QPoint(0, 0)).x() < tA->mapTo(pane, QPoint(0, 0)).x());
+        QCOMPARE(pane->activeTerminal(), tB);
+        QTRY_VERIFY_WITH_TIMEOUT(tB->hasFocus(), 2000);
+
+        // 2. Ctrl+Alt+LeftDrag Bottom edge re-dock: drag tB onto bottom band of tA -> tA above, tB below
+        const QPoint botA(tA->width() / 2, tA->height() - 30);
+        QCOMPARE(pane->previewDropZoneForTesting(tB, tA->mapToGlobal(botA)),
+                 TerminalTabPane::DropZone::Bottom);
+        dragBetweenWidgets(tB, tB->rect().center(), tA, botA, Qt::ControlModifier | Qt::AltModifier);
+        QVERIFY(tB->mapTo(pane, QPoint(0, 0)).y() > tA->mapTo(pane, QPoint(0, 0)).y());
+        QTRY_VERIFY_WITH_TIMEOUT(tB->hasFocus(), 2000);
+
+        // 3. 3-pane RootRight full-height dock + keyboard moveSplit / rotate / equalize
+        pane->splitActive(Qt::Horizontal);
+        TerminalWidget *tC = pane->activeTerminal();
+        QVERIFY(tC != nullptr && tC != tB && tC != tA);
+        QApplication::processEvents();
+
+        const QPoint rootRightGlobal = pane->mapToGlobal(QPoint(pane->width() - 6, pane->height() / 2));
+        QCOMPARE(pane->previewDropZoneForTesting(tC, rootRightGlobal),
+                 TerminalTabPane::DropZone::RootRight);
+        QVERIFY(pane->dockTerminal(tC, nullptr, TerminalTabPane::DropZone::RootRight));
+        QApplication::processEvents();
+        QVERIFY(tC->mapTo(pane, QPoint(0, 0)).x() > tA->mapTo(pane, QPoint(0, 0)).x());
+        QVERIFY(tC->height() >= pane->height() - 10);
+
+        const int xBeforeMove = tC->mapTo(pane, QPoint(0, 0)).x();
+        QVERIFY(pane->moveSplit(-1, 0));
+        QApplication::processEvents();
+        QVERIFY(tC->mapTo(pane, QPoint(0, 0)).x() < xBeforeMove);
+
+        pane->rotateSplitOrientation();
+        pane->equalizeSplits();
+        QApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(tC->hasFocus(), 2000);
+
+        // 4. Dragging split onto tab bar detaches live terminal into a new tab without losing PTY
+        QTest::keyClicks(tC, QStringLiteral("echo __BEFORE_DETACH__"));
+        QTest::keyClick(tC, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(tC->plainTextSnapshot().contains(QLatin1String("__BEFORE_DETACH__")), 5000);
+
+        const QPoint tabBarGlobal = pane->mapToGlobal(QPoint(pane->width() / 2, -16));
+        QCOMPARE(pane->previewDropZoneForTesting(tC, tabBarGlobal),
+                 TerminalTabPane::DropZone::DetachTab);
+        const QPoint dstInC = tC->mapFromGlobal(tabBarGlobal);
+        const QPoint gripC = tC->splitGripRect().center().toPoint();
+        QMouseEvent pressC(QEvent::MouseButtonPress, QPointF(gripC), QPointF(tC->mapToGlobal(gripC)),
+                           Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(tC, &pressC);
+        QMouseEvent stepC(QEvent::MouseMove, QPointF(gripC + QPoint(8, 8)),
+                          QPointF(tC->mapToGlobal(gripC + QPoint(8, 8))),
+                          Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(tC, &stepC);
+        QMouseEvent moveC(QEvent::MouseMove, QPointF(dstInC), QPointF(tabBarGlobal),
+                          Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(tC, &moveC);
+        QMouseEvent relC(QEvent::MouseButtonRelease, QPointF(dstInC), QPointF(tabBarGlobal),
+                         Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(tC, &relC);
+
+        QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), 2, 3000);
+        auto *newPane = qobject_cast<TerminalTabPane *>(tabs->currentWidget());
+        QVERIFY(newPane != nullptr && newPane != pane);
+        QCOMPARE(newPane->activeTerminal(), tC);
+        QVERIFY(!tC->isSplitRearrangeable());
+        QTRY_VERIFY_WITH_TIMEOUT(tC->hasFocus(), 2000);
+        QVERIFY(tC->plainTextSnapshot().contains(QLatin1String("__BEFORE_DETACH__")));
+        QCOMPARE(pane->findChildren<TerminalWidget *>().size(), 2);
+
+        // Verify live PTY still responds in detached tab
+        QTest::keyClicks(tC, QStringLiteral("echo __AFTER_DETACH__"));
+        QTest::keyClick(tC, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(tC->plainTextSnapshot().contains(QLatin1String("__AFTER_DETACH__")), 5000);
     }
 };
 

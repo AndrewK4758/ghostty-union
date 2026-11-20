@@ -63,6 +63,9 @@ public:
     GhosttyUnionLink::ResolvedLink hoveredLink() const { return m_hoveredLink; }
     void setUnfocusedSplitDimmed(bool dimmed);
     bool isUnfocusedSplitDimmed() const { return m_unfocusedSplitDimmed; }
+    void setSplitRearrangeable(bool rearrangeable);
+    bool isSplitRearrangeable() const { return m_splitRearrangeable; }
+    QRectF splitGripRect() const;
     void setLinkOpenHandlerForTesting(LinkOpenHandler handler);
     void setPtyOutputSpyForTesting(std::function<void(const QByteArray &)> spy);
 
@@ -72,6 +75,13 @@ Q_SIGNALS:
     void focused(TerminalWidget *self);
     void exited(TerminalWidget *self, int exitCode);
     void splitRequested(Qt::Orientation orientation);
+    void splitDragMoved(TerminalWidget *self, const QPoint &globalPos);
+    void splitDragReleased(TerminalWidget *self, const QPoint &globalPos);
+    void splitDragCancelled(TerminalWidget *self);
+    void moveSplitRequested(int dx, int dy);
+    void rotateSplitRequested();
+    void equalizeSplitsRequested();
+    void moveToNewTabRequested();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -128,6 +138,8 @@ private:
     bool strictCellAt(const QPointF &pos, uint16_t &colOut, uint16_t &rowOut) const;
     bool hasScrollbar() const;
     bool isInScrollbarZone(const QPointF &pos) const;
+    bool isInSplitGripZone(const QPointF &pos) const;
+    bool isNearSplitGripZone(const QPointF &pos) const;
     bool computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const;
     void scrollViewportToThumbTop(qreal desiredThumbTop);
     void updateScrollbarHoverState(const QPointF &pos);
@@ -186,6 +198,12 @@ private:
     qreal m_metricsDpr = 0.0;
     uint16_t m_cols = 80;
     uint16_t m_rows = 24;
+    uint16_t m_appliedVtCols = 80;
+    uint16_t m_appliedVtRows = 24;
+    uint16_t m_appliedPtyCols = 0;
+    uint16_t m_appliedPtyRows = 0;
+    int m_appliedCellWidth = 0;
+    int m_appliedCellHeight = 0;
     static constexpr int kPadX = 6;
     static constexpr int kPadY = 4;
     static constexpr int kPadRight = 12;
@@ -195,6 +213,7 @@ private:
     bool m_renderHeld = false;
     QTimer m_renderHoldTimer;
     QTimer m_blinkTimer;
+    QTimer m_resizeCoalesceTimer;
     bool m_blinkVisible = true;
     QElapsedTimer m_clock;
 
@@ -218,6 +237,12 @@ private:
     QPointF m_pressPos;
     bool m_linkClickPending = false;
     bool m_unfocusedSplitDimmed = false;
+    bool m_splitRearrangeable = false;
+    bool m_splitGripHovered = false;
+    bool m_splitGripNear = false;
+    bool m_splitDragArmed = false;
+    bool m_splitDragging = false;
+    QPointF m_splitDragStartPos;
     LinkOpenHandler m_linkOpenHandler;
     std::function<void(const QByteArray &)> m_ptyOutputSpy;
 };

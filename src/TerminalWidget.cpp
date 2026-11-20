@@ -758,6 +758,10 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
     connect(&m_blinkTimer, &QTimer::timeout, this, &TerminalWidget::onCursorBlink);
     m_blinkTimer.start();
 
+    m_resizeCoalesceTimer.setSingleShot(true);
+    m_resizeCoalesceTimer.setInterval(20);
+    connect(&m_resizeCoalesceTimer, &QTimer::timeout, this, &TerminalWidget::resizeTerminalToWidget);
+
     updateFontMetrics();
     if (!initGhostty()) {
         return;
@@ -826,6 +830,10 @@ bool TerminalWidget::initGhostty() {
     if (ghostty_terminal_new(nullptr, &m_terminal, m_cols, m_rows) != GHOSTTY_SUCCESS) {
         return false;
     }
+    m_appliedVtCols = m_cols;
+    m_appliedVtRows = m_rows;
+    m_appliedCellWidth = m_cellWidth;
+    m_appliedCellHeight = m_cellHeight;
     if (ghostty_render_state_new(nullptr, &m_renderState) != GHOSTTY_SUCCESS ||
         ghostty_render_state_row_iterator_new(nullptr, &m_rowIter) != GHOSTTY_SUCCESS ||
         ghostty_render_state_row_cells_new(nullptr, &m_cellsIter) != GHOSTTY_SUCCESS ||
@@ -1011,6 +1019,10 @@ bool TerminalWidget::spawnShell(const QString &workingDirectory) {
     ::close(slaveFd);
     m_childPid = pid;
     m_ptyMasterFd = masterFd;
+    m_appliedPtyCols = m_cols;
+    m_appliedPtyRows = m_rows;
+    m_appliedCellWidth = m_cellWidth;
+    m_appliedCellHeight = m_cellHeight;
     const int flags = ::fcntl(m_ptyMasterFd, F_GETFL, 0);
     ::fcntl(m_ptyMasterFd, F_SETFL, flags | O_NONBLOCK);
 
@@ -1109,6 +1121,8 @@ void TerminalWidget::showEvent(QShowEvent *event) {
     QWidget::showEvent(event);
     if (m_startShellPending && m_ptyMasterFd < 0) {
         QTimer::singleShot(0, this, &TerminalWidget::ensureShellSpawned);
+    } else if (m_ptyMasterFd >= 0) {
+        m_resizeCoalesceTimer.start();
     }
 }
 
@@ -1136,7 +1150,12 @@ void TerminalWidget::feedVtBytes(const QByteArray &bytes) {
 
 void TerminalWidget::resizeEvent(QResizeEvent *event) {
     QWidget::resizeEvent(event);
-    resizeTerminalToWidget();
+    if (m_ptyMasterFd >= 0) {
+        // Coalesce transient reparent/layout geometries so zsh ZLE doesn't receive a SIGWINCH storm.
+        m_resizeCoalesceTimer.start();
+    } else {
+        resizeTerminalToWidget();
+    }
 }
 
 void TerminalWidget::resizeTerminalToWidget() {
@@ -1147,10 +1166,19 @@ void TerminalWidget::resizeTerminalToWidget() {
     if (std::abs(dpr - m_metricsDpr) > 0.001) {
         updateFontMetrics();
     }
+    if (m_ptyMasterFd >= 0) {
+        if (!isVisible() ||
+            width() < kPadX + kPadRight + 8 * std::max(1, m_cellWidth) ||
+            height() < 2 * kPadY + 3 * std::max(1, m_cellHeight)) {
+            return;
+        }
+    }
     const int availW = std::max(m_cellWidth, width() - kPadX - kPadRight);
     const int availH = std::max(m_cellHeight, height() - 2 * kPadY);
-    const uint16_t newCols = static_cast<uint16_t>(std::clamp(availW / m_cellWidth, 2, 1000));
-    const uint16_t newRows = static_cast<uint16_t>(std::clamp(availH / m_cellHeight, 1, 1000));
+    const int minCols = (m_ptyMasterFd >= 0) ? 8 : 2;
+    const int minRows = (m_ptyMasterFd >= 0) ? 3 : 1;
+    const uint16_t newCols = static_cast<uint16_t>(std::clamp(availW / m_cellWidth, minCols, 1000));
+    const uint16_t newRows = static_cast<uint16_t>(std::clamp(availH / m_cellHeight, minRows, 1000));
 
     if (newCols != m_cols || newRows != m_rows) {
         m_cols = newCols;
@@ -1158,18 +1186,29 @@ void TerminalWidget::resizeTerminalToWidget() {
         m_rowCache.clear();
     }
 
-    ghostty_terminal_resize(m_terminal, m_cols, m_rows,
-                            static_cast<uint32_t>(m_cellWidth),
-                            static_cast<uint32_t>(m_cellHeight));
+    const bool cellMetricsChanged =
+        (m_cellWidth != m_appliedCellWidth || m_cellHeight != m_appliedCellHeight);
+    if (m_cols != m_appliedVtCols || m_rows != m_appliedVtRows || cellMetricsChanged) {
+        ghostty_terminal_resize(m_terminal, m_cols, m_rows,
+                                static_cast<uint32_t>(m_cellWidth),
+                                static_cast<uint32_t>(m_cellHeight));
+        m_appliedVtCols = m_cols;
+        m_appliedVtRows = m_rows;
+    }
 
-    if (m_ptyMasterFd >= 0) {
+    if (m_ptyMasterFd >= 0 &&
+        (m_cols != m_appliedPtyCols || m_rows != m_appliedPtyRows || cellMetricsChanged)) {
         struct winsize ws{};
         ws.ws_col = m_cols;
         ws.ws_row = m_rows;
         ws.ws_xpixel = static_cast<unsigned short>(m_cols * m_cellWidth);
         ws.ws_ypixel = static_cast<unsigned short>(m_rows * m_cellHeight);
         ::ioctl(m_ptyMasterFd, TIOCSWINSZ, &ws);
+        m_appliedPtyCols = m_cols;
+        m_appliedPtyRows = m_rows;
     }
+    m_appliedCellWidth = m_cellWidth;
+    m_appliedCellHeight = m_cellHeight;
 
     GhosttyMouseEncoderSize msize{};
     msize.size = sizeof(msize);
@@ -1682,9 +1721,40 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
             p.restore();
         }
     }
+
+    // Borderless hover drag grip pill when 2+ splits are visible
+    if (m_splitRearrangeable && (m_splitDragging || m_splitGripHovered || m_splitGripNear)) {
+        const QRectF grip = splitGripRect();
+        const bool activeGrip = m_splitDragging || m_splitGripHovered;
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(QPen(QColor(activeGrip ? GhosttyUnionTheme::kGoldHex : GhosttyUnionTheme::kDividerHex), 1.0));
+        p.setBrush(QColor(0x2A, 0x29, 0x2E, activeGrip ? 245 : 225));
+        p.drawRoundedRect(grip, 3.5, 3.5);
+
+        const QColor dotCol(activeGrip ? GhosttyUnionTheme::kGoldHex : GhosttyUnionTheme::kDimTextHex);
+        p.setPen(Qt::NoPen);
+        p.setBrush(dotCol);
+        const qreal cy = grip.center().y();
+        const qreal cx = grip.center().x();
+        for (int i = -1; i <= 1; ++i) {
+            p.drawEllipse(QPointF(cx + i * 6.0, cy), 1.1, 1.1);
+        }
+        p.restore();
+    }
 }
 
 void TerminalWidget::keyPressEvent(QKeyEvent *event) {
+    if (m_splitDragging && event->key() == Qt::Key_Escape) {
+        m_splitDragArmed = false;
+        m_splitDragging = false;
+        refreshMouseCursor();
+        update();
+        Q_EMIT splitDragCancelled(this);
+        event->accept();
+        return;
+    }
+
     // Font zoom, prompt jump & copy/paste shortcuts
     const auto baseMods = event->modifiers() & ~Qt::KeypadModifier;
     if (baseMods == (Qt::ControlModifier | Qt::ShiftModifier)) {
@@ -1872,6 +1942,30 @@ bool TerminalWidget::isInScrollbarZone(const QPointF &pos) const {
            pos.y() <= static_cast<qreal>(height());
 }
 
+QRectF TerminalWidget::splitGripRect() const {
+    return QRectF((static_cast<qreal>(width()) - 44.0) * 0.5, 3.0, 44.0, 7.0);
+}
+
+bool TerminalWidget::isInSplitGripZone(const QPointF &pos) const {
+    if (!m_splitRearrangeable || width() < 96) {
+        return false;
+    }
+    const qreal half = 28.0;
+    const qreal mid = static_cast<qreal>(width()) * 0.5;
+    return pos.x() >= (mid - half) && pos.x() <= (mid + half) &&
+           pos.y() >= 0.0 && pos.y() <= 14.0;
+}
+
+bool TerminalWidget::isNearSplitGripZone(const QPointF &pos) const {
+    if (!m_splitRearrangeable || !m_mouseInside || width() < 96) {
+        return false;
+    }
+    const qreal half = 80.0;
+    const qreal mid = static_cast<qreal>(width()) * 0.5;
+    return pos.x() >= (mid - half) && pos.x() <= (mid + half) &&
+           pos.y() >= 0.0 && pos.y() <= 32.0;
+}
+
 bool TerminalWidget::computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const {
     if (!hasScrollbar()) {
         return false;
@@ -1984,7 +2078,11 @@ void TerminalWidget::updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers
 
 void TerminalWidget::refreshMouseCursor() {
     Qt::CursorShape desired = Qt::IBeamCursor;
-    if (m_scrollbarDragging || m_scrollbarHovered) {
+    if (m_splitDragging) {
+        desired = Qt::ClosedHandCursor;
+    } else if (m_splitGripHovered) {
+        desired = Qt::OpenHandCursor;
+    } else if (m_scrollbarDragging || m_scrollbarHovered) {
         desired = Qt::ArrowCursor;
     } else if (m_hoveredLink.isValid()) {
         desired = Qt::PointingHandCursor;
@@ -2014,6 +2112,25 @@ void TerminalWidget::setUnfocusedSplitDimmed(bool dimmed) {
         m_unfocusedSplitDimmed = dimmed;
         update();
     }
+}
+
+void TerminalWidget::setSplitRearrangeable(bool rearrangeable) {
+    if (m_splitRearrangeable == rearrangeable) {
+        return;
+    }
+    m_splitRearrangeable = rearrangeable;
+    if (!m_splitRearrangeable) {
+        m_splitGripHovered = false;
+        m_splitGripNear = false;
+        m_splitDragArmed = false;
+        m_splitDragging = false;
+        refreshMouseCursor();
+    } else if (m_mouseInside) {
+        m_splitGripHovered = isInSplitGripZone(m_lastMousePos);
+        m_splitGripNear = isNearSplitGripZone(m_lastMousePos);
+        refreshMouseCursor();
+    }
+    update();
 }
 
 void TerminalWidget::setLinkOpenHandlerForTesting(LinkOpenHandler handler) {
@@ -2093,6 +2210,26 @@ void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &glob
         Q_EMIT splitRequested(Qt::Vertical);
     });
 
+    if (m_splitRearrangeable) {
+        QMenu *rearrangeMenu = menu->addMenu(QStringLiteral("Rearrange Split"));
+        QAction *mvLeft = rearrangeMenu->addAction(QStringLiteral("Move / Swap Left\tCtrl+Alt+Shift+Left"));
+        connect(mvLeft, &QAction::triggered, this, [this]() { Q_EMIT moveSplitRequested(-1, 0); });
+        QAction *mvRight = rearrangeMenu->addAction(QStringLiteral("Move / Swap Right\tCtrl+Alt+Shift+Right"));
+        connect(mvRight, &QAction::triggered, this, [this]() { Q_EMIT moveSplitRequested(1, 0); });
+        QAction *mvUp = rearrangeMenu->addAction(QStringLiteral("Move / Swap Up\tCtrl+Alt+Shift+Up"));
+        connect(mvUp, &QAction::triggered, this, [this]() { Q_EMIT moveSplitRequested(0, -1); });
+        QAction *mvDown = rearrangeMenu->addAction(QStringLiteral("Move / Swap Down\tCtrl+Alt+Shift+Down"));
+        connect(mvDown, &QAction::triggered, this, [this]() { Q_EMIT moveSplitRequested(0, 1); });
+
+        rearrangeMenu->addSeparator();
+        QAction *rotAct = rearrangeMenu->addAction(QStringLiteral("Rotate Split Orientation\tCtrl+Shift+R"));
+        connect(rotAct, &QAction::triggered, this, &TerminalWidget::rotateSplitRequested);
+        QAction *eqAct = rearrangeMenu->addAction(QStringLiteral("Equalize Splits\tCtrl+Alt+Shift+E"));
+        connect(eqAct, &QAction::triggered, this, &TerminalWidget::equalizeSplitsRequested);
+        QAction *detachAct = rearrangeMenu->addAction(QStringLiteral("Move Split to New Tab"));
+        connect(detachAct, &QAction::triggered, this, &TerminalWidget::moveToNewTabRequested);
+    }
+
     menu->addSeparator();
 
     QAction *resetAct = menu->addAction(QStringLiteral("Clear / Reset Terminal"));
@@ -2130,6 +2267,17 @@ void TerminalWidget::mousePressEvent(QMouseEvent *event) {
     }
 
     const auto nonKeypadMods = event->modifiers() & ~Qt::KeypadModifier;
+    const bool ctrlAltDrag = (nonKeypadMods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) ==
+                             (Qt::ControlModifier | Qt::AltModifier);
+    if (m_splitRearrangeable && event->button() == Qt::LeftButton &&
+        (isInSplitGripZone(event->position()) || ctrlAltDrag)) {
+        m_splitDragArmed = true;
+        m_splitDragging = false;
+        m_splitDragStartPos = event->position();
+        event->accept();
+        return;
+    }
+
     const bool ctrlOnly = (nonKeypadMods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == Qt::ControlModifier;
     if (event->button() == Qt::LeftButton && ctrlOnly && m_terminal) {
         uint16_t col = 0;
@@ -2179,6 +2327,21 @@ void TerminalWidget::mousePressEvent(QMouseEvent *event) {
 void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
     m_lastMousePos = event->position();
 
+    if (m_splitDragArmed && event->button() == Qt::LeftButton) {
+        const bool wasDragging = m_splitDragging;
+        m_splitDragArmed = false;
+        m_splitDragging = false;
+        m_splitGripHovered = isInSplitGripZone(event->position());
+        m_splitGripNear = isNearSplitGripZone(event->position());
+        refreshMouseCursor();
+        update();
+        if (wasDragging) {
+            Q_EMIT splitDragReleased(this, event->globalPosition().toPoint());
+        }
+        event->accept();
+        return;
+    }
+
     if (m_scrollbarDragging && event->button() == Qt::LeftButton) {
         m_scrollbarDragging = false;
         updateScrollbarHoverState(event->position());
@@ -2224,6 +2387,42 @@ void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
 void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
     m_lastMousePos = event->position();
     m_mouseInside = true;
+
+    if (m_splitDragArmed) {
+        if (!event->buttons().testFlag(Qt::LeftButton)) {
+            const bool wasDragging = m_splitDragging;
+            m_splitDragArmed = false;
+            m_splitDragging = false;
+            m_splitGripHovered = isInSplitGripZone(event->position());
+            m_splitGripNear = isNearSplitGripZone(event->position());
+            refreshMouseCursor();
+            update();
+            if (wasDragging) {
+                Q_EMIT splitDragCancelled(this);
+            }
+            return;
+        }
+        if (!m_splitDragging && (event->position() - m_splitDragStartPos).manhattanLength() > 5.0) {
+            m_splitDragging = true;
+            clearHoveredLink();
+            refreshMouseCursor();
+            update();
+        }
+        if (m_splitDragging) {
+            Q_EMIT splitDragMoved(this, event->globalPosition().toPoint());
+        }
+        event->accept();
+        return;
+    }
+
+    const bool gripHovered = isInSplitGripZone(event->position());
+    const bool gripNear = isNearSplitGripZone(event->position());
+    if (gripHovered != m_splitGripHovered || gripNear != m_splitGripNear) {
+        m_splitGripHovered = gripHovered;
+        m_splitGripNear = gripNear;
+        refreshMouseCursor();
+        update();
+    }
 
     if (m_scrollbarDragging) {
         if (!event->buttons().testFlag(Qt::LeftButton)) {
@@ -2284,6 +2483,11 @@ void TerminalWidget::leaveEvent(QEvent *event) {
     m_mouseInside = false;
     if (m_scrollbarHovered) {
         m_scrollbarHovered = false;
+        update();
+    }
+    if (m_splitGripHovered || m_splitGripNear) {
+        m_splitGripHovered = false;
+        m_splitGripNear = false;
         update();
     }
     clearHoveredLink();
@@ -2754,18 +2958,21 @@ void TerminalWidget::pasteText(const QString &text,
 void TerminalWidget::zoomIn() {
     m_basePointSize = std::min(28.0, m_basePointSize + 1.0);
     updateFontMetrics();
+    m_resizeCoalesceTimer.stop();
     resizeTerminalToWidget();
 }
 
 void TerminalWidget::zoomOut() {
     m_basePointSize = std::max(6.0, m_basePointSize - 1.0);
     updateFontMetrics();
+    m_resizeCoalesceTimer.stop();
     resizeTerminalToWidget();
 }
 
 void TerminalWidget::zoomReset() {
     m_basePointSize = 10.5;
     updateFontMetrics();
+    m_resizeCoalesceTimer.stop();
     resizeTerminalToWidget();
 }
 
@@ -2798,6 +3005,15 @@ void TerminalWidget::focusOutEvent(QFocusEvent *event) {
     QWidget::focusOutEvent(event);
     m_linkClickPending = false;
     m_pressedLink = {};
+    if (m_splitDragArmed) {
+        const bool wasDragging = m_splitDragging;
+        m_splitDragArmed = false;
+        m_splitDragging = false;
+        if (wasDragging) {
+            Q_EMIT splitDragCancelled(this);
+        }
+        refreshMouseCursor();
+    }
     clearHoveredLink();
     sendFocusEventToPty(GHOSTTY_FOCUS_LOST);
     update();
