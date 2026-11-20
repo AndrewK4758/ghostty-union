@@ -30,6 +30,8 @@ add_library(ghostty-union-core STATIC
     src/TerminalTabPane.h
     src/TerminalWidget.cpp
     src/TerminalWidget.h
+    src/TerminalLink.cpp
+    src/TerminalLink.h
     src/KeyMap.cpp
     src/KeyMap.h
     src/Theme.h
