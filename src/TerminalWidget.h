@@ -19,6 +19,7 @@ class QDropEvent;
 class QEvent;
 class QShowEvent;
 class QSocketNotifier;
+class QVariantAnimation;
 
 /**
  * Qt terminal surface widget powered by libghostty-vt (`0.1.0-dev`) and a Linux PTY.
@@ -59,6 +60,7 @@ public:
     [[nodiscard]] GhosttyUnionLink::ResolvedLink hoveredLink() const { return m_hoveredLink; }
     void setUnfocusedSplitDimmed(bool dimmed);
     [[nodiscard]] bool isUnfocusedSplitDimmed() const { return m_unfocusedSplitDimmed; }
+    void setActiveSplitAccent(bool active);
     void setSplitRearrangeable(bool rearrangeable);
     [[nodiscard]] bool isSplitRearrangeable() const { return m_splitRearrangeable; }
     [[nodiscard]] QRectF splitGripRect() const;
@@ -78,6 +80,7 @@ Q_SIGNALS:
     void rotateSplitRequested();
     void equalizeSplitsRequested();
     void moveToNewTabRequested();
+    void renameTabRequested();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -139,6 +142,8 @@ private:
     bool computeScrollbarGeometry(QRectF &trackRectOut, QRectF &thumbRectOut) const;
     void scrollViewportToThumbTop(qreal desiredThumbTop);
     void updateScrollbarHoverState(const QPointF &pos);
+    void animateScrollbarHover(qreal target);
+    void animateSplitGrip(qreal target);
     void updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers mods);
     void clearHoveredLink();
     void refreshMouseCursor();
@@ -222,6 +227,8 @@ private:
     bool m_scrollbarHovered = false;
     bool m_scrollbarDragging = false;
     qreal m_scrollbarDragGrabOffset = 0.0;
+    QVariantAnimation *m_scrollbarHoverAnim = nullptr;
+    qreal m_scrollbarHoverProgress = 0.0;
 
     QString m_title = QStringLiteral("zsh");
     QString m_pwd;
@@ -233,12 +240,15 @@ private:
     QPointF m_pressPos;
     bool m_linkClickPending = false;
     bool m_unfocusedSplitDimmed = false;
+    bool m_activeSplitAccent = false;
     bool m_splitRearrangeable = false;
     bool m_splitGripHovered = false;
     bool m_splitGripNear = false;
     bool m_splitDragArmed = false;
     bool m_splitDragging = false;
     QPointF m_splitDragStartPos;
+    QVariantAnimation *m_splitGripAnim = nullptr;
+    qreal m_splitGripProgress = 0.0;
     LinkOpenHandler m_linkOpenHandler;
     std::function<void(const QByteArray &)> m_ptyOutputSpy;
 };

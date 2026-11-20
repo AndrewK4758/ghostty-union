@@ -28,13 +28,20 @@ protected:
 
 private:
     class TabCloseModalOverlay;
+    class TabRenameModalOverlay;
 
     [[nodiscard]] TerminalTabPane *currentPane() const;
     [[nodiscard]] bool isTabCloseModalVisible() const;
+    [[nodiscard]] bool isTabRenameModalVisible() const;
+    [[nodiscard]] bool isAnyModalVisible() const;
     void addNewTab(const QString &cwd = {});
     void adoptTerminalInNewTab(TerminalWidget *term);
     void wirePaneSignals(TerminalTabPane *pane);
     void recordTabVisit(TerminalTabPane *pane);
+    void showTabContextMenu(int index, const QPoint &globalPos);
+    void requestRenameTabAt(int index);
+    void dismissTabRenameModal(bool restoreFocus);
+    void applyPendingTabRename(const QString &newName);
     void requestCloseTabAt(int index);
     void dismissTabCloseModal(bool restoreFocus);
     void confirmPendingTabClose();
@@ -46,5 +53,7 @@ private:
     QTabWidget *m_tabs = nullptr;
     QList<QPointer<TerminalTabPane>> m_tabHistory;
     TabCloseModalOverlay *m_closeModal = nullptr;
+    TabRenameModalOverlay *m_renameModal = nullptr;
     QPointer<TerminalTabPane> m_pendingClosePane;
+    QPointer<TerminalTabPane> m_pendingRenamePane;
 };

@@ -10,6 +10,7 @@
 #include <QDBusPendingReply>
 #include <QDateTime>
 #include <QDir>
+#include <QEasingCurve>
 #include <QFile>
 #include <QFont>
 #include <QFontMetrics>
@@ -24,10 +25,12 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QRadialGradient>
 #include <QRegularExpression>
 #include <QSizePolicy>
 #include <QTimer>
 #include <QUrl>
+#include <QVariantAnimation>
 
 #include <algorithm>
 #include <cmath>
@@ -38,13 +41,14 @@
 
 namespace {
 
-constexpr size_t kMaxSamples = 28;
-constexpr int kBarHeightPx = 40;
-constexpr int kCardHeightPx = 32;
+constexpr size_t kMaxSamples = 40;
+constexpr int kBarHeightPx = 74;
+constexpr int kCardHeightPx = 64;
 constexpr int kMinItemWidthPx = 72;
-constexpr int kGaugeBaseSparkWidthPx = 46;
-constexpr int kNetBaseSparkWidthPx = 50;
+constexpr int kMinCardPreferredWidthPx = 128;
+constexpr int kMinClockPreferredWidthPx = 126;
 constexpr int kMinSparkWidthPx = 18;
+constexpr int kNetRowSplitY = 16;
 constexpr int kPublicIpPollMs = 300000;
 constexpr int kPublicIpDebounceMs = 1500;
 constexpr int kPublicIpTimeoutMs = 4000;
@@ -266,7 +270,8 @@ private:
 };
 
 /**
- * Custom-painted rounded clock pill centering the local date and 1s clock inside a flexible width.
+ * Custom-painted Solar Forge stacked obsidian-glass cockpit chronometer
+ * with luminous hover glow and 1-second pulse bloom.
  */
 class ClockPillWidget final : public QWidget {
 public:
@@ -278,19 +283,45 @@ public:
         setFixedHeight(kCardHeightPx);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setFocusPolicy(Qt::NoFocus);
+        setMouseTracking(true);
 
         const QFontMetrics fmDate(m_dateFont);
         const QFontMetrics fmTime(m_timeFont);
-        m_preferredWidth = 10 + fmDate.horizontalAdvance(QStringLiteral("Wed Sep 30"))
-                           + 8 + fmTime.horizontalAdvance(QStringLiteral("23:59:59")) + 10;
+        const int contentW = std::max(
+            fmDate.horizontalAdvance(QStringLiteral("Wed Sep 30")) + 24,
+            fmTime.horizontalAdvance(QStringLiteral("23:59:59")) + 8);
+        m_preferredWidth = std::max(kMinClockPreferredWidthPx, 14 + contentW + 14);
+
+        m_hoverAnim = new QVariantAnimation(this);
+        m_hoverAnim->setDuration(150);
+        m_hoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_hoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_hoverProgress = v.toReal();
+            update();
+        });
+
+        m_tickAnim = new QVariantAnimation(this);
+        m_tickAnim->setDuration(360);
+        m_tickAnim->setEasingCurve(QEasingCurve::OutQuad);
+        QObject::connect(m_tickAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_tickGlow = v.toReal();
+            update();
+        });
     }
 
     void setDateTimeText(const QString &dateText, const QString &timeText) {
         if (m_dateText == dateText && m_timeText == timeText) {
             return;
         }
+        const bool hadPrevious = !m_timeText.isEmpty();
         m_dateText = dateText;
         m_timeText = timeText;
+        if (hadPrevious && isVisible()) {
+            m_tickAnim->stop();
+            m_tickAnim->setStartValue(1.0);
+            m_tickAnim->setEndValue(0.0);
+            m_tickAnim->start();
+        }
         update();
     }
 
@@ -303,50 +334,128 @@ public:
     }
 
 protected:
+    void enterEvent(QEnterEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(1.0);
+        m_hoverAnim->start();
+        QWidget::enterEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override {
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(0.0);
+        m_hoverAnim->start();
+        QWidget::leaveEvent(event);
+    }
+
     void paintEvent(QPaintEvent * /*event*/) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
 
         const QRectF cardRect = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-        p.setBrush(QColor(0, 0, 0, 65));
-        p.setPen(QPen(QColor(GhosttyUnionTheme::kDividerHex), 1.0));
-        p.drawRoundedRect(cardRect, 6.0, 6.0);
+        constexpr qreal radius = 9.0;
+        QPainterPath clip;
+        clip.addRoundedRect(cardRect, radius, radius);
 
-        const int avail = std::max(0, width() - 20);
+        p.save();
+        p.setClipPath(clip);
+
+        // Obsidian glass surface gradient
+        QLinearGradient bg(cardRect.topLeft(), cardRect.bottomLeft());
+        bg.setColorAt(0.0, QColor(0x2B, 0x29, 0x35, 232));
+        bg.setColorAt(0.55, QColor(0x21, 0x1F, 0x29, 238));
+        bg.setColorAt(1.0, QColor(0x18, 0x17, 0x1F, 244));
+        p.fillRect(cardRect, bg);
+
+        // Warm Solar Forge radial bloom behind the time readout (pulses gently on every second tick)
+        QRadialGradient timeGlow(QPointF(cardRect.center().x(), cardRect.top() + 22.0),
+                                 std::max(cardRect.width() * 0.55, 42.0));
+        timeGlow.setColorAt(0.0, QColor(255, 211, 0, static_cast<int>(18 + 26 * m_tickGlow + 24 * m_hoverProgress)));
+        timeGlow.setColorAt(0.65, QColor(255, 152, 0, static_cast<int>(6 + 10 * m_tickGlow + 10 * m_hoverProgress)));
+        timeGlow.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.fillRect(cardRect, timeGlow);
+
+        // Right-side Solar Forge gold -> amber -> red-orange vertical accent bar
+        QLinearGradient barGrad(QPointF(0.0, cardRect.top() + 7.0), QPointF(0.0, cardRect.bottom() - 7.0));
+        barGrad.setColorAt(0.0, QColor(GhosttyUnionTheme::kGoldHex));
+        barGrad.setColorAt(0.55, QColor(GhosttyUnionTheme::kAmberHex));
+        barGrad.setColorAt(1.0, QColor(GhosttyUnionTheme::kRedOrangeHex));
+        p.setPen(Qt::NoPen);
+        p.setBrush(barGrad);
+        p.drawRoundedRect(QRectF(cardRect.right() - 4.8, cardRect.top() + 7.0, 3.0, cardRect.height() - 14.0), 1.5, 1.5);
+
+        // Top glass specular rim
+        p.fillRect(QRectF(cardRect.left() + 8.0, cardRect.top() + 0.5, cardRect.width() - 16.0, 1.0),
+                   QColor(255, 255, 255, static_cast<int>(26 + 30 * m_hoverProgress)));
+        p.restore();
+
+        QColor borderCol = QColor(GhosttyUnionTheme::kChromeBorderHex);
+        if (m_hoverProgress > 0.01) {
+            borderCol = QColor(
+                static_cast<int>(borderCol.red() + (255 - borderCol.red()) * m_hoverProgress * 0.65),
+                static_cast<int>(borderCol.green() + (211 - borderCol.green()) * m_hoverProgress * 0.65),
+                static_cast<int>(borderCol.blue() + (0 - borderCol.blue()) * m_hoverProgress * 0.65),
+                static_cast<int>(185 + 65 * m_hoverProgress));
+        }
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(borderCol, 1.0));
+        p.drawPath(clip);
+
+        const int avail = std::max(0, width() - 18);
         if (avail <= 0) {
             return;
         }
 
         const QFontMetrics fmDate(m_dateFont);
         const QFontMetrics fmTime(m_timeFont);
-        const int dateW = fmDate.horizontalAdvance(m_dateText);
-        const int timeW = fmTime.horizontalAdvance(m_timeText);
 
-        if (avail >= dateW + 8 + timeW) {
-            const int startX = 10 + (avail - (dateW + 8 + timeW)) / 2;
-            p.setFont(m_dateFont);
-            p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
-            p.drawText(QRect(startX, 0, dateW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_dateText);
+        // Stacked bold gold time on top
+        p.setFont(m_timeFont);
+        p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
+        const QString drawnTime = fmTime.elidedText(m_timeText, Qt::ElideRight, avail);
+        p.drawText(QRect(7, 7, avail, 28), Qt::AlignCenter, drawnTime);
 
-            p.setFont(m_timeFont);
-            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            p.drawText(QRect(startX + dateW + 8, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
-        } else if (avail > timeW + 20) {
-            const QString elidedDate = fmDate.elidedText(m_dateText, Qt::ElideRight, avail - timeW - 8);
-            const int edW = fmDate.horizontalAdvance(elidedDate);
-            const int startX = 10 + (avail - (edW + 8 + timeW)) / 2;
-            p.setFont(m_dateFont);
-            p.setPen(QColor(GhosttyUnionTheme::kDimTextHex));
-            p.drawText(QRect(startX, 0, edW, height()), Qt::AlignVCenter | Qt::AlignLeft, elidedDate);
+        // Subtle luminous Solar Forge divider between time and date
+        const qreal divW = std::min(static_cast<qreal>(avail) - 10.0, 74.0);
+        if (divW > 12.0) {
+            const qreal divX = 7.0 + (static_cast<qreal>(avail) - divW) * 0.5;
+            QLinearGradient divGrad(QPointF(divX, 37.0), QPointF(divX + divW, 37.0));
+            divGrad.setColorAt(0.0, QColor(255, 211, 0, 0));
+            divGrad.setColorAt(0.5, QColor(255, 211, 0, static_cast<int>(56 + 44 * m_tickGlow)));
+            divGrad.setColorAt(1.0, QColor(255, 211, 0, 0));
+            p.fillRect(QRectF(divX, 37.0, divW, 1.0), divGrad);
+        }
 
-            p.setFont(m_timeFont);
-            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            p.drawText(QRect(startX + edW + 8, 0, timeW, height()), Qt::AlignVCenter | Qt::AlignLeft, m_timeText);
-        } else {
-            p.setFont(m_timeFont);
-            p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            const QString elidedTime = fmTime.elidedText(m_timeText, Qt::ElideRight, avail);
-            p.drawText(QRect(10, 0, avail, height()), Qt::AlignCenter, elidedTime);
+        // Date on bottom flanked by subtle pulsing amber micro-dots
+        p.setFont(m_dateFont);
+        const QString drawnDate = fmDate.elidedText(m_dateText, Qt::ElideRight, avail);
+        const int dateW = fmDate.horizontalAdvance(drawnDate);
+        const QRect dateRect(7, 40, avail, 18);
+        p.setPen(QColor(0xB4, 0xB8, 0xCA));
+        p.drawText(dateRect, Qt::AlignCenter, drawnDate);
+
+        if (avail >= dateW + 18) {
+            const qreal centerX = 7.0 + static_cast<qreal>(avail) * 0.5;
+            const qreal halfDate = static_cast<qreal>(dateW) * 0.5 + 7.5;
+            const qreal cy = 49.0;
+            auto drawPulseDot = [&](qreal cx) {
+                if (m_tickGlow > 0.02) {
+                    QColor halo(GhosttyUnionTheme::kGoldHex);
+                    halo.setAlpha(static_cast<int>(78.0 * m_tickGlow));
+                    p.setPen(Qt::NoPen);
+                    p.setBrush(halo);
+                    p.drawEllipse(QPointF(cx, cy), 2.8 + 1.8 * m_tickGlow, 2.8 + 1.8 * m_tickGlow);
+                }
+                QColor dotCol(GhosttyUnionTheme::kAmberHex);
+                dotCol.setAlpha(static_cast<int>(150 + 100 * m_tickGlow));
+                p.setPen(Qt::NoPen);
+                p.setBrush(dotCol);
+                p.drawEllipse(QPointF(cx, cy), 1.5, 1.5);
+            };
+            drawPulseDot(centerX - halfDate);
+            drawPulseDot(centerX + halfDate);
         }
     }
 
@@ -355,11 +464,17 @@ private:
     QFont m_timeFont;
     QString m_dateText;
     QString m_timeText;
-    int m_preferredWidth = kMinItemWidthPx;
+    int m_preferredWidth = kMinClockPreferredWidthPx;
+    QVariantAnimation *m_hoverAnim = nullptr;
+    QVariantAnimation *m_tickAnim = nullptr;
+    qreal m_hoverProgress = 0.0;
+    qreal m_tickGlow = 0.0;
 };
 
 /**
- * Custom-painted rounded telemetry card supporting GaugeSpark, NetDualSpark, and VpnStatus modes.
+ * Custom-painted Solar Forge obsidian-glass cockpit telemetry card (`64px`) with
+ * full-width recessed oscilloscope sparklines, triple-pass neon bloom curves,
+ * animated progress gauges, copy shimmer, and live VPN beacon.
  */
 class StatsCardWidget final : public QWidget {
 public:
@@ -376,17 +491,58 @@ public:
         , m_tag(std::move(tag))
         , m_valueFont(valueFont)
         , m_compactFont(valueFont)
+        , m_microFont(valueFont)
         , m_tagFont(std::move(tagFont)) {
         m_compactFont.setPointSizeF(7.8);
+        m_microFont.setPointSizeF(6.7);
         setFixedHeight(kCardHeightPx);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setMouseTracking(true);
         setFocusPolicy(Qt::NoFocus);
 
+        m_hoverAnim = new QVariantAnimation(this);
+        m_hoverAnim->setDuration(150);
+        m_hoverAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_hoverAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_hoverProgress = v.toReal();
+            update();
+        });
+
+        m_gaugeAnim = new QVariantAnimation(this);
+        m_gaugeAnim->setDuration(360);
+        m_gaugeAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_gaugeAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_displayPercent = v.toReal();
+            update();
+        });
+
+        m_copiedAnim = new QVariantAnimation(this);
+        m_copiedAnim->setDuration(260);
+        m_copiedAnim->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(m_copiedAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_copiedGlow = v.toReal();
+            update();
+        });
+
+        m_vpnPulseAnim = new QVariantAnimation(this);
+        m_vpnPulseAnim->setDuration(1800);
+        m_vpnPulseAnim->setStartValue(0.0);
+        m_vpnPulseAnim->setEndValue(1.0);
+        m_vpnPulseAnim->setLoopCount(-1);
+        m_vpnPulseAnim->setEasingCurve(QEasingCurve::InOutSine);
+        QObject::connect(m_vpnPulseAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_vpnPulsePhase = v.toReal();
+            update();
+        });
+
         m_copiedTimer.setSingleShot(true);
-        m_copiedTimer.setInterval(900);
+        m_copiedTimer.setInterval(950);
         QObject::connect(&m_copiedTimer, &QTimer::timeout, this, [this]() {
             m_copiedFlash = false;
+            m_copiedAnim->stop();
+            m_copiedAnim->setStartValue(m_copiedGlow);
+            m_copiedAnim->setEndValue(0.0);
+            m_copiedAnim->start();
             update();
         });
     }
@@ -400,11 +556,13 @@ public:
         m_sampleValueText = sampleValueText;
         const QFontMetrics fmVal(m_valueFont);
         const QFontMetrics fmTag(m_tagFont);
-        const int padLeft = (m_mode == Mode::VpnStatus) ? 24 : 9;
-        const int tagW = m_tag.isEmpty() ? 0 : (fmTag.horizontalAdvance(m_tag) + 6);
         m_sampleValWidth = fmVal.horizontalAdvance(sampleValueText);
-        const int sparkW = (m_mode == Mode::GaugeSpark) ? (kGaugeBaseSparkWidthPx + 8) : 0;
-        m_preferredWidth = padLeft + tagW + m_sampleValWidth + sparkW + 9;
+        if (m_mode == Mode::VpnStatus) {
+            m_preferredWidth = std::max(kMinCardPreferredWidthPx, 12 + m_sampleValWidth + 14);
+        } else {
+            const int tagW = m_tag.isEmpty() ? 0 : (fmTag.horizontalAdvance(m_tag) + 12);
+            m_preferredWidth = std::max(kMinCardPreferredWidthPx, 10 + tagW + 8 + m_sampleValWidth + 10);
+        }
         updateGeometry();
     }
 
@@ -421,7 +579,7 @@ public:
         const QFontMetrics fmCompact(m_compactFont);
         m_ipColWidth = fmCompact.horizontalAdvance(ipSample);
         m_rateColWidth = fmCompact.horizontalAdvance(rateSample);
-        m_preferredWidth = 9 + m_ipColWidth + 10 + m_rateColWidth + 8 + kNetBaseSparkWidthPx + 9;
+        m_preferredWidth = std::max(kMinCardPreferredWidthPx, 11 + m_ipColWidth + 10 + m_rateColWidth + 10);
         updateGeometry();
     }
 
@@ -435,8 +593,18 @@ public:
 
     void setGaugeData(const QString &valueText, double percent, const QColor &accent) {
         m_valueText = valueText;
-        m_percent = std::clamp(percent, 0.0, 100.0);
+        const double clamped = std::clamp(percent, 0.0, 100.0);
         m_accent = accent;
+        if (std::abs(clamped - m_percent) > 0.25 && isVisible()) {
+            m_percent = clamped;
+            m_gaugeAnim->stop();
+            m_gaugeAnim->setStartValue(m_displayPercent);
+            m_gaugeAnim->setEndValue(m_percent);
+            m_gaugeAnim->start();
+        } else {
+            m_percent = clamped;
+            m_displayPercent = clamped;
+        }
         update();
     }
 
@@ -446,6 +614,9 @@ public:
         m_publicIpText = publicIpText;
         m_downText = downText;
         m_upText = upText;
+        m_accent = (privateIpText == QLatin1String("offline"))
+                       ? QColor(GhosttyUnionTheme::kDimTextHex)
+                       : QColor(GhosttyUnionTheme::kCyanHex);
         m_valueText = QStringLiteral("PRI %1 | PUB %2  %3 %4")
                           .arg(privateIpText, publicIpText, downText, upText);
         update();
@@ -455,6 +626,7 @@ public:
         m_valueText = valueText;
         m_online = online;
         m_accent = accent;
+        syncVpnPulseState();
         update();
     }
 
@@ -484,16 +656,34 @@ public:
     }
 
 protected:
+    void showEvent(QShowEvent *event) override {
+        QWidget::showEvent(event);
+        syncVpnPulseState();
+    }
+
+    void hideEvent(QHideEvent *event) override {
+        QWidget::hideEvent(event);
+        if (m_vpnPulseAnim && m_vpnPulseAnim->state() == QAbstractAnimation::Running) {
+            m_vpnPulseAnim->stop();
+        }
+    }
+
     void enterEvent(QEnterEvent *event) override {
         m_hovered = true;
         m_hoverPos = event->position().toPoint();
-        update();
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(1.0);
+        m_hoverAnim->start();
         QWidget::enterEvent(event);
     }
 
     void leaveEvent(QEvent *event) override {
         m_hovered = false;
-        update();
+        m_hoverAnim->stop();
+        m_hoverAnim->setStartValue(m_hoverProgress);
+        m_hoverAnim->setEndValue(0.0);
+        m_hoverAnim->start();
         QWidget::leaveEvent(event);
     }
 
@@ -511,6 +701,10 @@ protected:
             if (!flashMsg.isEmpty()) {
                 m_copiedMessage = flashMsg;
                 m_copiedFlash = true;
+                m_copiedAnim->stop();
+                m_copiedAnim->setStartValue(0.0);
+                m_copiedAnim->setEndValue(1.0);
+                m_copiedAnim->start();
                 m_copiedTimer.start();
                 update();
             }
@@ -523,14 +717,66 @@ protected:
         p.setRenderHint(QPainter::Antialiasing, true);
 
         const QRectF cardRect = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-        QColor fillCol = palette().color(QPalette::Base);
-        fillCol.setAlpha(m_hovered ? 215 : 170);
-        const QColor borderCol = m_hovered ? QColor(255, 211, 0, 95)
-                                           : QColor(GhosttyUnionTheme::kDividerHex);
+        constexpr qreal radius = 9.0;
+        QPainterPath clip;
+        clip.addRoundedRect(cardRect, radius, radius);
 
-        p.setBrush(fillCol);
+        p.save();
+        p.setClipPath(clip);
+
+        // Layered obsidian glass surface gradient
+        QLinearGradient bgGrad(cardRect.topLeft(), cardRect.bottomLeft());
+        bgGrad.setColorAt(0.0, QColor(0x2B, 0x29, 0x35, 236));
+        bgGrad.setColorAt(0.45, QColor(0x21, 0x20, 0x29, 240));
+        bgGrad.setColorAt(1.0, QColor(0x18, 0x17, 0x1F, 246));
+        p.fillRect(cardRect, bgGrad);
+
+        // Subtle left-side semantic ambient glow
+        QRadialGradient accentBloom(QPointF(cardRect.left() + 8.0, cardRect.top() + 14.0), 64.0);
+        QColor bloomCol = m_accent;
+        bloomCol.setAlpha(static_cast<int>(28 + 26 * m_hoverProgress));
+        accentBloom.setColorAt(0.0, bloomCol);
+        accentBloom.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.fillRect(cardRect, accentBloom);
+
+        // Smooth animated Solar Forge hover / copy shimmer wash
+        const qreal highlight = std::max(m_hoverProgress, m_copiedGlow);
+        if (highlight > 0.01) {
+            QRadialGradient topSheen(QPointF(cardRect.center().x(), cardRect.top()), cardRect.width() * 0.65);
+            topSheen.setColorAt(0.0, QColor(255, 211, 0, static_cast<int>((m_copiedFlash ? 64.0 : 36.0) * highlight)));
+            topSheen.setColorAt(1.0, QColor(0, 0, 0, 0));
+            p.fillRect(cardRect, topSheen);
+        }
+
+        // Luminous 2.8px left vertical accent pill
+        const QColor barCol = m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent;
+        QLinearGradient leftBarGrad(QPointF(0.0, cardRect.top() + 7.0), QPointF(0.0, cardRect.bottom() - 7.0));
+        leftBarGrad.setColorAt(0.0, barCol.lighter(125));
+        leftBarGrad.setColorAt(1.0, barCol);
+        p.setPen(Qt::NoPen);
+        p.setBrush(leftBarGrad);
+        p.drawRoundedRect(QRectF(cardRect.left() + 2.2, cardRect.top() + 7.0, 2.8, cardRect.height() - 14.0),
+                          1.4, 1.4);
+
+        // Crisp glassmorphic top highlight hairline
+        p.fillRect(QRectF(cardRect.left() + 8.0, cardRect.top() + 0.5, cardRect.width() - 16.0, 1.0),
+                   QColor(255, 255, 255, static_cast<int>(26 + 32 * highlight)));
+        p.restore();
+
+        // Border shifts smoothly toward Solar Forge gold on hover/copy
+        QColor borderCol(GhosttyUnionTheme::kChromeBorderHex);
+        if (highlight > 0.01) {
+            const QColor targetBorder = m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex)
+                                                      : QColor(255, 211, 0, 170);
+            borderCol = QColor(
+                static_cast<int>(borderCol.red() + (targetBorder.red() - borderCol.red()) * highlight),
+                static_cast<int>(borderCol.green() + (targetBorder.green() - borderCol.green()) * highlight),
+                static_cast<int>(borderCol.blue() + (targetBorder.blue() - borderCol.blue()) * highlight),
+                static_cast<int>(188 + 67 * highlight));
+        }
+        p.setBrush(Qt::NoBrush);
         p.setPen(QPen(borderCol, 1.0));
-        p.drawRoundedRect(cardRect, 6.0, 6.0);
+        p.drawPath(clip);
 
         if (m_mode == Mode::GaugeSpark) {
             paintGaugeSpark(p);
@@ -542,194 +788,338 @@ protected:
     }
 
 private:
-    static void drawSparkSeries(QPainter &p, const QRectF &box, const std::deque<double> &samples,
-                                double maxScale, const QColor &lineColor, bool fillUnder) {
-        if (samples.empty() || box.width() <= 2.0 || box.height() <= 2.0) {
+    void syncVpnPulseState() {
+        if (!m_vpnPulseAnim) {
             return;
         }
+        if (m_mode == Mode::VpnStatus && m_online && isVisible()) {
+            if (m_vpnPulseAnim->state() != QAbstractAnimation::Running) {
+                m_vpnPulseAnim->start();
+            }
+        } else if (m_vpnPulseAnim->state() == QAbstractAnimation::Running) {
+            m_vpnPulseAnim->stop();
+        }
+    }
+
+    static void drawChartWell(QPainter &p, const QRectF &well, const QColor &accent) {
+        if (well.width() < kMinSparkWidthPx || well.height() <= 6.0) {
+            return;
+        }
+        constexpr qreal r = 5.0;
+        QPainterPath wellClip;
+        wellClip.addRoundedRect(well, r, r);
+
+        p.save();
+        p.setClipPath(wellClip);
+
+        // Deep recessed obsidian oscilloscope cavity
+        QLinearGradient cavityBg(well.topLeft(), well.bottomLeft());
+        cavityBg.setColorAt(0.0, QColor(0x0D, 0x0C, 0x12, 230));
+        cavityBg.setColorAt(1.0, QColor(0x15, 0x14, 0x1D, 215));
+        p.fillRect(well, cavityBg);
+
+        // Faint semantic ambient wash along the bottom floor of the well
+        QLinearGradient floorWash(well.bottomLeft(), QPointF(well.left(), well.top() + well.height() * 0.35));
+        QColor washCol = accent;
+        washCol.setAlpha(20);
+        floorWash.setColorAt(0.0, washCol);
+        floorWash.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.fillRect(well, floorWash);
+
+        // Subtle oscilloscope horizontal reference lines (25%, 50%, 75%)
+        const qreal y25 = well.top() + well.height() * 0.25;
+        const qreal y50 = well.top() + well.height() * 0.50;
+        const qreal y75 = well.top() + well.height() * 0.75;
+        p.setPen(QPen(QColor(255, 255, 255, 13), 0.75));
+        p.drawLine(QPointF(well.left() + 2.0, y25), QPointF(well.right() - 2.0, y25));
+        p.drawLine(QPointF(well.left() + 2.0, y75), QPointF(well.right() - 2.0, y75));
+
+        QPen midPen(QColor(255, 255, 255, 24), 0.8, Qt::CustomDashLine);
+        midPen.setDashPattern({2.5, 3.5});
+        p.setPen(midPen);
+        p.drawLine(QPointF(well.left() + 2.0, y50), QPointF(well.right() - 2.0, y50));
+
+        // Vertical time-division reticle ticks moving left from live right edge
+        p.setPen(QPen(QColor(255, 255, 255, 11), 0.75));
+        for (qreal gx = well.right() - 22.0; gx > well.left() + 6.0; gx -= 22.0) {
+            p.drawLine(QPointF(gx, well.top() + 2.0), QPointF(gx, well.bottom() - 2.0));
+        }
+
+        // Top inset shadow groove
+        p.fillRect(QRectF(well.left(), well.top(), well.width(), 1.2), QColor(0, 0, 0, 125));
+        p.restore();
+
+        // Subtle recessed rim border
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(255, 255, 255, 22), 0.9));
+        p.drawPath(wellClip);
+    }
+
+    static void drawSparkSeries(QPainter &p, const QRectF &well, const std::deque<double> &samples,
+                                double maxScale, const QColor &lineColor, bool fillUnder,
+                                bool secondarySeries = false) {
+        if (well.width() < kMinSparkWidthPx || well.height() <= 6.0) {
+            return;
+        }
+        const QRectF plot = well.adjusted(2.0, 3.0, -2.5, -2.0);
+        if (plot.width() <= 2.0 || plot.height() <= 2.0) {
+            return;
+        }
+
+        QPainterPath clipPath;
+        clipPath.addRoundedRect(well.adjusted(0.6, 0.6, -0.6, -0.6), 4.5, 4.5);
+
+        p.save();
+        p.setClipPath(clipPath);
+
+        if (samples.empty()) {
+            // Subtle idle baseline trace before live samples arrive
+            QColor idleCol = lineColor;
+            idleCol.setAlpha(secondarySeries ? 36 : 58);
+            p.setPen(QPen(idleCol, 1.1, Qt::DashLine));
+            p.drawLine(QPointF(plot.left(), plot.bottom() - 1.0), QPointF(plot.right(), plot.bottom() - 1.0));
+            p.restore();
+            return;
+        }
+
         const double denom = std::max(1e-6, maxScale);
         const size_t n = samples.size();
-        const qreal stepX = box.width() / static_cast<qreal>(kMaxSamples - 1);
-        const qreal startX = box.right() - static_cast<qreal>(n > 0 ? n - 1 : 0) * stepX;
+        const qreal stepX = plot.width() / static_cast<qreal>(kMaxSamples - 1);
+        const qreal startX = plot.right() - static_cast<qreal>(n - 1) * stepX;
 
-        QPainterPath linePath;
+        std::vector<QPointF> pts;
+        pts.reserve(n);
         for (size_t i = 0; i < n; ++i) {
             const double norm = std::clamp(samples[i] / denom, 0.0, 1.0);
-            const qreal x = (n == 1) ? box.left() : (startX + static_cast<qreal>(i) * stepX);
-            const qreal y = box.bottom() - norm * (box.height() - 2.0) - 1.0;
-            if (i == 0) {
-                linePath.moveTo(x, y);
-            } else {
-                linePath.lineTo(x, y);
-            }
+            const qreal x = (n == 1) ? plot.left() : (startX + static_cast<qreal>(i) * stepX);
+            const qreal y = plot.bottom() - norm * (plot.height() - 2.0) - 1.0;
+            pts.emplace_back(x, y);
         }
+
+        QPainterPath linePath;
+        linePath.moveTo(pts.front());
         if (n == 1) {
-            linePath.lineTo(box.right(), linePath.currentPosition().y());
+            linePath.lineTo(plot.right(), pts.front().y());
+        } else {
+            for (size_t i = 1; i < n; ++i) {
+                const QPointF &prev = pts[i - 1];
+                const QPointF &cur = pts[i];
+                const qreal midX = (prev.x() + cur.x()) * 0.5;
+                linePath.cubicTo(QPointF(midX, prev.y()), QPointF(midX, cur.y()), cur);
+            }
         }
 
         if (fillUnder) {
             QPainterPath fillPath = linePath;
-            const qreal firstX = (n == 1) ? box.left() : startX;
-            fillPath.lineTo(box.right(), box.bottom());
-            fillPath.lineTo(firstX, box.bottom());
+            const qreal firstX = pts.front().x();
+            fillPath.lineTo(plot.right(), well.bottom());
+            fillPath.lineTo(firstX, well.bottom());
             fillPath.closeSubpath();
 
-            QLinearGradient grad(box.topLeft(), box.bottomLeft());
+            QLinearGradient grad(plot.topLeft(), QPointF(plot.left(), well.bottom()));
             QColor topC = lineColor;
-            topC.setAlpha(85);
+            topC.setAlpha(secondarySeries ? 64 : 132);
+            QColor midC = lineColor;
+            midC.setAlpha(secondarySeries ? 22 : 48);
             QColor botC = lineColor;
-            botC.setAlpha(8);
+            botC.setAlpha(secondarySeries ? 2 : 8);
             grad.setColorAt(0.0, topC);
+            grad.setColorAt(0.58, midC);
             grad.setColorAt(1.0, botC);
             p.fillPath(fillPath, grad);
+
+            // Subtle vertical spectrum micro-scanlines clipped strictly under the primary waveform
+            if (!secondarySeries) {
+                p.save();
+                p.setClipPath(fillPath, Qt::IntersectClip);
+                QLinearGradient scanGrad(plot.topLeft(), QPointF(plot.left(), well.bottom()));
+                QColor scanTop = lineColor.lighter(135);
+                scanTop.setAlpha(46);
+                QColor scanBot = lineColor;
+                scanBot.setAlpha(0);
+                scanGrad.setColorAt(0.0, scanTop);
+                scanGrad.setColorAt(1.0, scanBot);
+                p.setPen(QPen(scanGrad, 1.0));
+                const qreal firstGrid = std::ceil(firstX / 5.0) * 5.0;
+                for (qreal sx = firstGrid; sx <= plot.right(); sx += 5.0) {
+                    p.drawLine(QPointF(sx, plot.top()), QPointF(sx, well.bottom()));
+                }
+                p.restore();
+            }
         }
 
-        p.setPen(QPen(lineColor, 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        // Triple-pass neon bloom stroke: outer halo -> inner glow -> bright filament core
         p.setBrush(Qt::NoBrush);
+        QColor outerGlow = lineColor;
+        outerGlow.setAlpha(secondarySeries ? 36 : 48);
+        p.setPen(QPen(outerGlow, secondarySeries ? 4.0 : 5.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         p.drawPath(linePath);
+
+        QColor midGlow = lineColor;
+        midGlow.setAlpha(secondarySeries ? 96 : 122);
+        p.setPen(QPen(midGlow, secondarySeries ? 2.1 : 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.drawPath(linePath);
+
+        QColor filament = lineColor.lighter(132);
+        filament.setAlpha(255);
+        p.setPen(QPen(filament, secondarySeries ? 1.25 : 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.drawPath(linePath);
+
+        // Luminous right-edge live sample beacon
+        const QPointF tip = (n == 1) ? QPointF(plot.right(), pts.front().y()) : pts.back();
+        QColor haloOuter = lineColor;
+        haloOuter.setAlpha(secondarySeries ? 48 : 64);
+        p.setPen(Qt::NoPen);
+        p.setBrush(haloOuter);
+        p.drawEllipse(tip, secondarySeries ? 4.0 : 4.8, secondarySeries ? 4.0 : 4.8);
+
+        QColor haloMid = lineColor;
+        haloMid.setAlpha(185);
+        p.setBrush(haloMid);
+        p.drawEllipse(tip, secondarySeries ? 2.2 : 2.6, secondarySeries ? 2.2 : 2.6);
+
+        p.setBrush(QColor(255, 255, 255, 235));
+        p.drawEllipse(tip, secondarySeries ? 1.05 : 1.25, secondarySeries ? 1.05 : 1.25);
+
+        p.restore();
     }
 
     void paintGaugeSpark(QPainter &p) const {
-        constexpr int leftPad = 9;
+        constexpr int leftPad = 10;
         const int rightEdge = width() - 9;
-        constexpr int textTop = 3;
-        const int textH = height() - 10;
+        constexpr int headerTop = 4;
+        constexpr int headerH = 19;
 
         const QFontMetrics fmTag(m_tagFont);
         const QFontMetrics fmVal(m_valueFont);
-        const int tagW = fmTag.horizontalAdvance(m_tag);
-        const int actualValW = fmVal.horizontalAdvance(m_valueText);
+        const int pillTagW = fmTag.horizontalAdvance(m_tag) + 10;
 
-        int sparkLeft = 0;
-        int sparkW = 0;
-        if (width() >= m_preferredWidth) {
-            sparkLeft = leftPad + tagW + 6 + std::max(m_sampleValWidth, actualValW) + 8;
-            sparkW = std::max(0, rightEdge - sparkLeft);
-        } else {
-            const int minSparkLeft = leftPad + tagW + 6 + actualValW + 6;
-            const int candidateSparkW = rightEdge - minSparkLeft;
-            if (candidateSparkW >= kMinSparkWidthPx) {
-                sparkW = std::min(kGaugeBaseSparkWidthPx, candidateSparkW);
-                sparkLeft = rightEdge - sparkW;
+        int x = leftPad;
+        if (rightEdge > x && !m_tag.isEmpty()) {
+            const int availTagW = std::max(0, rightEdge - x);
+            const int drawnPillW = std::min(pillTagW, availTagW);
+            if (drawnPillW >= 14) {
+                const QRectF pillRect(x, headerTop + 1.5, drawnPillW, headerH - 3.0);
+                QLinearGradient pillBg(pillRect.topLeft(), pillRect.bottomLeft());
+                QColor pillTop = m_accent;
+                pillTop.setAlpha(44);
+                QColor pillBot = m_accent;
+                pillBot.setAlpha(18);
+                pillBg.setColorAt(0.0, pillTop);
+                pillBg.setColorAt(1.0, pillBot);
+
+                QColor pillBorder = m_accent;
+                pillBorder.setAlpha(115);
+                p.setBrush(pillBg);
+                p.setPen(QPen(pillBorder, 0.9));
+                p.drawRoundedRect(pillRect, 4.5, 4.5);
+
+                p.setFont(m_tagFont);
+                p.setPen(m_accent.lighter(118));
+                const QString tagText = fmTag.elidedText(m_tag, Qt::ElideRight, std::max(4, drawnPillW - 6));
+                p.drawText(pillRect, Qt::AlignCenter, tagText);
+                x += drawnPillW + 6;
             }
         }
-        if (sparkW < kMinSparkWidthPx) {
-            sparkW = 0;
-        }
 
-        const int textRight = (sparkW > 0) ? (sparkLeft - 6) : rightEdge;
-        int x = leftPad;
-
-        if (textRight > x) {
-            p.setFont(m_tagFont);
-            p.setPen(m_accent);
-            const int availTagW = std::max(0, textRight - x);
-            const QString tagText = (availTagW < tagW)
-                                        ? fmTag.elidedText(m_tag, Qt::ElideRight, availTagW)
-                                        : m_tag;
-            const int drawnTagW = std::min(tagW, availTagW);
-            p.drawText(QRect(x, textTop, drawnTagW, textH), Qt::AlignVCenter | Qt::AlignLeft, tagText);
-            x += drawnTagW + 6;
-        }
-
-        if (textRight > x) {
+        if (rightEdge > x) {
             p.setFont(m_valueFont);
-            p.setPen(palette().color(QPalette::WindowText));
-            const int availValW = textRight - x;
+            p.setPen(QColor(GhosttyUnionTheme::kChromeTextHex));
+            const int availValW = rightEdge - x;
             const QString valText = fmVal.elidedText(m_valueText, Qt::ElideRight, availValW);
-            p.drawText(QRect(x, textTop, availValW, textH), Qt::AlignVCenter | Qt::AlignLeft, valText);
+            p.drawText(QRect(x, headerTop, availValW, headerH), Qt::AlignVCenter | Qt::AlignRight, valText);
         }
 
-        if (sparkW >= kMinSparkWidthPx) {
-            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 5.0, static_cast<qreal>(sparkW), 18.0);
-            drawSparkSeries(p, sparkBox, m_primaryHistory, 100.0, m_accent, true);
+        // Full-width recessed Solar Forge oscilloscope chart well
+        const qreal wellW = static_cast<qreal>(rightEdge - leftPad);
+        const QRectF wellRect(static_cast<qreal>(leftPad), 25.0, wellW, 29.0);
+        if (wellRect.width() >= kMinSparkWidthPx) {
+            drawChartWell(p, wellRect, m_accent);
+            drawSparkSeries(p, wellRect, m_primaryHistory, 100.0, m_accent, true);
+
+            if (wellRect.width() >= 96.0 && !m_primaryHistory.empty()) {
+                const double peak = *std::ranges::max_element(m_primaryHistory);
+                const QString peakStr = QStringLiteral("PK %1%").arg(qRound(peak));
+                const QFontMetrics fmMicro(m_microFont);
+                const QRectF badgeRect(wellRect.left() + 4.0, wellRect.top() + 2.5,
+                                       fmMicro.horizontalAdvance(peakStr) + 6.0, fmMicro.height() + 1.0);
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(0x0D, 0x0C, 0x12, 185));
+                p.drawRoundedRect(badgeRect, 3.0, 3.0);
+                p.setFont(m_microFont);
+                p.setPen(QColor(222, 226, 240, 155));
+                p.drawText(badgeRect, Qt::AlignCenter, peakStr);
+            }
         }
 
-        // Bottom inset progress gauge
-        const qreal trackW = std::max(0.0, static_cast<qreal>(width()) - 14.0);
-        if (trackW > 0.0) {
-            const QRectF trackRect(7.0, height() - 4.5, trackW, 2.5);
+        // Smooth animated bottom inset Solar Forge gradient gauge with specular tip
+        const qreal trackW = std::max(0.0, static_cast<qreal>(rightEdge - leftPad));
+        if (trackW > 4.0) {
+            const QRectF trackRect(static_cast<qreal>(leftPad), 57.0, trackW, 3.6);
             p.setPen(Qt::NoPen);
-            p.setBrush(QColor(255, 255, 255, 24));
-            p.drawRoundedRect(trackRect, 1.25, 1.25);
+            p.setBrush(QColor(255, 255, 255, 20));
+            p.drawRoundedRect(trackRect, 1.8, 1.8);
 
-            if (m_percent > 0.0) {
-                const qreal fillW = std::max(3.0, trackRect.width() * (m_percent / 100.0));
-                const QRectF fillRect(trackRect.left(), trackRect.top(),
-                                      std::min(trackRect.width(), fillW), trackRect.height());
-                p.setBrush(m_accent);
-                p.drawRoundedRect(fillRect, 1.25, 1.25);
+            // Subtle 25/50/75% scale ticks on gauge track
+            p.setPen(QPen(QColor(0, 0, 0, 95), 0.8));
+            for (const qreal frac : {0.25, 0.50, 0.75}) {
+                const qreal tx = trackRect.left() + trackRect.width() * frac;
+                p.drawLine(QPointF(tx, trackRect.top() + 0.4), QPointF(tx, trackRect.bottom() - 0.4));
+            }
+
+            if (m_displayPercent > 0.1) {
+                const qreal fillW = std::min(trackRect.width(),
+                                             std::max(4.0, trackRect.width() * (m_displayPercent / 100.0)));
+                const QRectF fillRect(trackRect.left(), trackRect.top(), fillW, trackRect.height());
+                QLinearGradient gaugeGrad(fillRect.topLeft(), fillRect.topRight());
+                QColor startC = m_accent;
+                startC.setAlpha(165);
+                gaugeGrad.setColorAt(0.0, startC);
+                gaugeGrad.setColorAt(0.82, m_accent);
+                gaugeGrad.setColorAt(1.0, m_accent.lighter(145));
+                p.setPen(Qt::NoPen);
+                p.setBrush(gaugeGrad);
+                p.drawRoundedRect(fillRect, 1.8, 1.8);
+
+                // Tiny luminous specular tip at the gauge head
+                p.setBrush(QColor(255, 255, 255, 195));
+                p.drawEllipse(QPointF(fillRect.right() - 1.6, fillRect.center().y()), 1.15, 1.15);
             }
         }
     }
 
     void paintNetDualSpark(QPainter &p) const {
-        constexpr int leftPad = 9;
+        constexpr int leftPad = 10;
         const int rightEdge = width() - 9;
+        const int contentW = std::max(0, rightEdge - leftPad);
 
         const QFontMetrics fm(m_compactFont);
-        const int actualIpW = std::max(
-            fm.horizontalAdvance(QStringLiteral("PRI ") + m_privateIpText),
-            fm.horizontalAdvance(QStringLiteral("PUB ") + m_publicIpText));
-        const int actualRateW = std::max(
-            fm.horizontalAdvance(m_downText),
-            fm.horizontalAdvance(m_upText));
-
-        const int steadyIpW = std::max(m_ipColWidth, actualIpW);
-        const int steadyRateW = std::max(m_rateColWidth, actualRateW);
-
-        int ipColW = steadyIpW;
-        int rateColW = steadyRateW;
-        int colGap = 10;
-        int sparkLeft = 0;
-        int sparkW = 0;
-
-        if (width() >= m_preferredWidth) {
-            sparkLeft = leftPad + ipColW + colGap + rateColW + 8;
-            sparkW = std::max(0, rightEdge - sparkLeft);
-        } else if (leftPad + steadyIpW + 10 + steadyRateW + 8 + kNetBaseSparkWidthPx <= rightEdge) {
-            sparkLeft = leftPad + steadyIpW + 10 + steadyRateW + 8;
-            sparkW = std::max(0, rightEdge - sparkLeft);
-        } else {
-            ipColW = actualIpW;
-            rateColW = actualRateW;
-            colGap = 8;
-            const int minSparkLeft = leftPad + ipColW + colGap + rateColW + 6;
-            const int candidateSparkW = rightEdge - minSparkLeft;
-            if (candidateSparkW >= kMinSparkWidthPx) {
-                sparkW = std::min(kNetBaseSparkWidthPx, candidateSparkW);
-                sparkLeft = rightEdge - sparkW;
-            }
-        }
-        if (sparkW < kMinSparkWidthPx) {
-            sparkW = 0;
-        }
-
-        const int textRight = (sparkW > 0) ? (sparkLeft - 6) : rightEdge;
 
         if (m_copiedFlash) {
             const QFontMetrics fmVal(m_valueFont);
             p.setFont(m_valueFont);
             p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-            const int availFlashW = std::max(0, textRight - leftPad);
-            const QString flashText = fmVal.elidedText(m_copiedMessage, Qt::ElideRight, availFlashW);
-            p.drawText(QRect(leftPad, 0, availFlashW, height()),
-                       Qt::AlignVCenter | Qt::AlignLeft, flashText);
+            const QString flashText = fmVal.elidedText(m_copiedMessage, Qt::ElideRight, contentW);
+            p.drawText(QRect(leftPad, 3, contentW, 26), Qt::AlignVCenter | Qt::AlignLeft, flashText);
         } else {
-            constexpr int ipX = leftPad;
-            const int ipW = std::min(ipColW, std::max(0, textRight - ipX));
-            const int rateX = ipX + ipW + colGap;
-            const int rateW = std::max(0, textRight - rateX);
-            const QRect topIpRect(ipX, 2, ipW, 14);
-            const QRect botIpRect(ipX, 16, ipW, 14);
+            const int actualRateW = std::max(fm.horizontalAdvance(m_downText), fm.horizontalAdvance(m_upText));
+            const int minRateW = fm.horizontalAdvance(QStringLiteral("↓0B"));
+            const bool showRates = (contentW >= minRateW + 46);
+            const int rateW = showRates ? std::min(std::max(m_rateColWidth, actualRateW), contentW / 2) : 0;
+            const int colGap = showRates ? 8 : 0;
+            const int ipW = std::max(0, contentW - rateW - colGap);
+            const int rateX = leftPad + ipW + colGap;
 
-            if (m_hovered && ipW > 0) {
-                const bool hoverTop = (m_hoverPos.y() < height() / 2);
-                const QRectF hlRect = QRectF(hoverTop ? topIpRect : botIpRect).adjusted(-2.0, 0.0, 2.0, 0.0);
+            const QRect topIpRect(leftPad, 3, ipW, 13);
+            const QRect botIpRect(leftPad, 16, ipW, 13);
+
+            if (m_hoverProgress > 0.02 && ipW > 0 && m_hoverPos.y() < 31) {
+                const bool hoverTop = (m_hoverPos.y() < kNetRowSplitY);
+                const QRectF hlRect = QRectF(hoverTop ? topIpRect : botIpRect).adjusted(-2.5, 0.0, 2.5, 0.0);
                 p.save();
-                p.setPen(Qt::NoPen);
-                p.setBrush(QColor(255, 211, 0, 22));
-                p.drawRoundedRect(hlRect, 3.0, 3.0);
+                p.setPen(QPen(QColor(255, 211, 0, static_cast<int>(78.0 * m_hoverProgress)), 0.8));
+                p.setBrush(QColor(255, 211, 0, static_cast<int>(30.0 * m_hoverProgress)));
+                p.drawRoundedRect(hlRect, 3.5, 3.5);
                 p.restore();
             }
 
@@ -768,18 +1158,19 @@ private:
             drawLabeledIpRow(topIpRect, QStringLiteral("PRI "), m_privateIpText, priCol);
             drawLabeledIpRow(botIpRect, QStringLiteral("PUB "), m_publicIpText, pubCol);
 
-            if (rateW >= fm.horizontalAdvance(QStringLiteral("↓0B"))) {
+            if (showRates && rateW > 0) {
                 p.setPen(QColor(GhosttyUnionTheme::kGreenHex));
-                p.drawText(QRect(rateX, 2, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft,
+                p.drawText(QRect(rateX, 3, rateW, 13), Qt::AlignVCenter | Qt::AlignRight,
                            fm.elidedText(m_downText, Qt::ElideRight, rateW));
                 p.setPen(QColor(GhosttyUnionTheme::kGoldHex));
-                p.drawText(QRect(rateX, 16, rateW, 14), Qt::AlignVCenter | Qt::AlignLeft,
+                p.drawText(QRect(rateX, 16, rateW, 13), Qt::AlignVCenter | Qt::AlignRight,
                            fm.elidedText(m_upText, Qt::ElideRight, rateW));
             }
         }
 
-        if (sparkW >= kMinSparkWidthPx) {
-            const QRectF sparkBox(static_cast<qreal>(sparkLeft), 6.0, static_cast<qreal>(sparkW), 20.0);
+        // Full-width recessed dual oscilloscope chart well (DL green + UL cyan)
+        const QRectF wellRect(static_cast<qreal>(leftPad), 31.0, static_cast<qreal>(contentW), 29.0);
+        if (wellRect.width() >= kMinSparkWidthPx) {
             double peak = 65536.0;
             for (double v : m_primaryHistory) {
                 peak = std::max(peak, v);
@@ -787,37 +1178,121 @@ private:
             for (double v : m_secondaryHistory) {
                 peak = std::max(peak, v);
             }
-            drawSparkSeries(p, sparkBox, m_primaryHistory, peak, QColor(GhosttyUnionTheme::kGreenHex), true);
-            drawSparkSeries(p, sparkBox, m_secondaryHistory, peak, QColor(GhosttyUnionTheme::kCyanHex), false);
+            drawChartWell(p, wellRect, QColor(GhosttyUnionTheme::kCyanHex));
+            drawSparkSeries(p, wellRect, m_primaryHistory, peak, QColor(GhosttyUnionTheme::kGreenHex), true, false);
+            drawSparkSeries(p, wellRect, m_secondaryHistory, peak, QColor(GhosttyUnionTheme::kCyanHex), true, true);
+
+            if (wellRect.width() >= 96.0) {
+                const QString scaleStr = formatNetBytesPerSec(peak);
+                const QFontMetrics fmMicro(m_microFont);
+                const QRectF badgeRect(wellRect.left() + 4.0, wellRect.top() + 2.5,
+                                       fmMicro.horizontalAdvance(scaleStr) + 6.0, fmMicro.height() + 1.0);
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(0x0D, 0x0C, 0x12, 185));
+                p.drawRoundedRect(badgeRect, 3.0, 3.0);
+                p.setFont(m_microFont);
+                p.setPen(QColor(222, 226, 240, 155));
+                p.drawText(badgeRect, Qt::AlignCenter, scaleStr);
+            }
         }
     }
 
     void paintVpnStatus(QPainter &p) const {
-        const qreal cy = height() * 0.5;
-        constexpr qreal cx = 14.0;
+        constexpr int leftPad = 10;
+        const int rightEdge = width() - 9;
+
+        // Top row: live animated beacon + VPN badge + right status state
+        const qreal cy = 15.0;
+        constexpr qreal cx = 17.0;
         if (m_online) {
+            const qreal pulse = std::sin(m_vpnPulsePhase * 3.14159265358979323846);
+            const qreal haloR = 5.6 + 3.6 * pulse;
             QColor halo = m_accent;
-            halo.setAlpha(55);
+            halo.setAlpha(static_cast<int>(86.0 - 54.0 * pulse));
             p.setPen(Qt::NoPen);
             p.setBrush(halo);
-            p.drawEllipse(QPointF(cx, cy), 7.0, 7.0);
+            p.drawEllipse(QPointF(cx, cy), haloR, haloR);
 
             p.setBrush(m_accent);
-            p.drawEllipse(QPointF(cx, cy), 4.0, 4.0);
+            p.drawEllipse(QPointF(cx, cy), 3.8, 3.8);
+            p.setBrush(QColor(255, 255, 255, 175));
+            p.drawEllipse(QPointF(cx - 1.0, cy - 1.0), 1.15, 1.15);
         } else {
             p.setBrush(Qt::NoBrush);
             p.setPen(QPen(QColor(GhosttyUnionTheme::kDimTextHex), 1.4));
-            p.drawEllipse(QPointF(cx, cy), 3.5, 3.5);
+            p.drawEllipse(QPointF(cx, cy), 3.6, 3.6);
         }
 
-        const int textW = std::max(0, width() - 32);
+        const QFontMetrics fmTag(m_tagFont);
+        const QString vpnLabel = QStringLiteral("VPN");
+        const int pillW = std::min(fmTag.horizontalAdvance(vpnLabel) + 10, std::max(0, rightEdge - 26));
+        if (pillW >= 18) {
+            const QRectF pillRect(26.0, 7.0, static_cast<qreal>(pillW), 16.0);
+            QColor pillBg = m_accent;
+            pillBg.setAlpha(m_online ? 38 : 22);
+            QColor pillBorder = m_accent;
+            pillBorder.setAlpha(m_online ? 115 : 65);
+            p.setBrush(pillBg);
+            p.setPen(QPen(pillBorder, 0.9));
+            p.drawRoundedRect(pillRect, 4.5, 4.5);
+
+            p.setFont(m_tagFont);
+            p.setPen(m_online ? m_accent.lighter(118) : QColor(GhosttyUnionTheme::kDimTextHex));
+            p.drawText(pillRect, Qt::AlignCenter, vpnLabel);
+        }
+
+        const int stateLeft = 26 + pillW + 6;
+        if (rightEdge - stateLeft >= 34) {
+            p.setFont(m_microFont);
+            p.setPen(m_online ? QColor(GhosttyUnionTheme::kGreenHex) : QColor(GhosttyUnionTheme::kDimTextHex));
+            const QString stateText = m_online ? QStringLiteral("ACTIVE") : QStringLiteral("IDLE");
+            p.drawText(QRect(stateLeft, 7, rightEdge - stateLeft, 16), Qt::AlignVCenter | Qt::AlignRight, stateText);
+        }
+
+        // Middle readout: tunnel IP or status (cleanly stripped of redundant "VPN " prefix)
+        const int textW = std::max(0, rightEdge - leftPad);
         if (textW > 0) {
+            QString display;
+            if (m_copiedFlash) {
+                display = m_copiedMessage;
+            } else if (m_online && m_valueText.startsWith(QLatin1String("VPN "))) {
+                display = m_valueText.mid(4);
+            } else if (!m_online) {
+                display = QStringLiteral("No tunnel");
+            } else {
+                display = m_valueText;
+            }
             p.setFont(m_valueFont);
-            p.setPen(m_copiedFlash ? QColor(GhosttyUnionTheme::kGoldHex) : m_accent);
-            const QString display = m_copiedFlash ? m_copiedMessage : m_valueText;
+            p.setPen(m_copiedFlash
+                         ? QColor(GhosttyUnionTheme::kGoldHex)
+                         : (m_online ? QColor(GhosttyUnionTheme::kChromeTextHex)
+                                     : QColor(GhosttyUnionTheme::kDimTextHex)));
             const QFontMetrics fmVal(m_valueFont);
-            p.drawText(QRect(24, 0, textW, height()), Qt::AlignVCenter | Qt::AlignLeft,
+            p.drawText(QRect(leftPad, 28, textW, 22), Qt::AlignVCenter | Qt::AlignLeft,
                        fmVal.elidedText(display, Qt::ElideRight, textW));
+        }
+
+        // Bottom recessed tunnel status bar with breathing live sheen when connected
+        const qreal trackW = std::max(0.0, static_cast<qreal>(rightEdge - leftPad));
+        if (trackW > 4.0) {
+            const QRectF trackRect(static_cast<qreal>(leftPad), 56.5, trackW, 3.6);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(255, 255, 255, 18));
+            p.drawRoundedRect(trackRect, 1.8, 1.8);
+
+            if (m_online) {
+                const qreal pulse = std::sin(m_vpnPulsePhase * 3.14159265358979323846);
+                QLinearGradient liveGrad(trackRect.topLeft(), trackRect.topRight());
+                QColor g0(GhosttyUnionTheme::kGreenHex);
+                g0.setAlpha(160);
+                QColor g1(GhosttyUnionTheme::kTealHex);
+                g1.setAlpha(static_cast<int>(195 + 55 * pulse));
+                liveGrad.setColorAt(0.0, g0);
+                liveGrad.setColorAt(std::clamp(0.15 + 0.7 * m_vpnPulsePhase, 0.05, 0.95), g1.lighter(120));
+                liveGrad.setColorAt(1.0, g0);
+                p.setBrush(liveGrad);
+                p.drawRoundedRect(trackRect, 1.8, 1.8);
+            }
         }
     }
 
@@ -825,6 +1300,7 @@ private:
     QString m_tag;
     QFont m_valueFont;
     QFont m_compactFont;
+    QFont m_microFont;
     QFont m_tagFont;
 
     QString m_valueText;
@@ -836,16 +1312,24 @@ private:
     int m_sampleValWidth = 0;
     int m_ipColWidth = 0;
     int m_rateColWidth = 0;
-    int m_preferredWidth = kMinItemWidthPx;
+    int m_preferredWidth = kMinCardPreferredWidthPx;
     double m_percent = 0.0;
+    double m_displayPercent = 0.0;
     bool m_online = false;
     QColor m_accent{GhosttyUnionTheme::kGoldHex};
 
     bool m_hovered = false;
     QPoint m_hoverPos;
+    qreal m_hoverProgress = 0.0;
+    qreal m_copiedGlow = 0.0;
+    qreal m_vpnPulsePhase = 0.0;
     bool m_copiedFlash = false;
     QString m_copiedMessage;
     QTimer m_copiedTimer;
+    QVariantAnimation *m_hoverAnim = nullptr;
+    QVariantAnimation *m_gaugeAnim = nullptr;
+    QVariantAnimation *m_copiedAnim = nullptr;
+    QVariantAnimation *m_vpnPulseAnim = nullptr;
     std::function<QString(const QPoint &)> m_onClick;
 
     std::deque<double> m_primaryHistory;
@@ -1084,25 +1568,48 @@ StatsBarWidget::~StatsBarWidget() {
 
 void StatsBarWidget::paintEvent(QPaintEvent *event) {
     QPainter p(this);
-    const QColor barBg = palette().color(QPalette::Window).darker(108);
+    QLinearGradient barBg(0.0, 0.0, 0.0, static_cast<qreal>(height()));
+    barBg.setColorAt(0.0, QColor(0x14, 0x13, 0x19));
+    barBg.setColorAt(0.55, QColor(0x19, 0x18, 0x20));
+    barBg.setColorAt(1.0, QColor(0x1E, 0x1D, 0x25));
     p.fillRect(rect(), barBg);
-    p.fillRect(0, 0, width(), 1, QColor(255, 211, 0, 30));
-    p.fillRect(0, height() - 1, width(), 1, QColor(GhosttyUnionTheme::kDividerHex));
+
+    // Subtle warm central Solar Forge ambient glow along the top rim
+    QRadialGradient topAmbient(QPointF(width() * 0.5, 0.0), std::max(width() * 0.48, 220.0));
+    topAmbient.setColorAt(0.0, QColor(255, 185, 0, 18));
+    topAmbient.setColorAt(0.6, QColor(255, 120, 0, 7));
+    topAmbient.setColorAt(1.0, QColor(0, 0, 0, 0));
+    p.fillRect(rect(), topAmbient);
+
+    // Subtle Solar Forge top hairline glow
+    QLinearGradient topRibbon(0.0, 0.0, static_cast<qreal>(width()), 0.0);
+    topRibbon.setColorAt(0.0, QColor(255, 211, 0, 14));
+    topRibbon.setColorAt(0.35, QColor(255, 211, 0, 78));
+    topRibbon.setColorAt(0.65, QColor(255, 152, 0, 62));
+    topRibbon.setColorAt(1.0, QColor(255, 61, 0, 16));
+    p.fillRect(0, 0, width(), 1, topRibbon);
+
+    // Crisp bottom divider with warm center highlight
+    QLinearGradient botLine(0.0, 0.0, static_cast<qreal>(width()), 0.0);
+    botLine.setColorAt(0.0, QColor(GhosttyUnionTheme::kDividerHex));
+    botLine.setColorAt(0.5, QColor(0x59, 0x4D, 0x3A));
+    botLine.setColorAt(1.0, QColor(GhosttyUnionTheme::kDividerHex));
+    p.fillRect(0, height() - 1, width(), 1, botLine);
     QWidget::paintEvent(event);
 }
 
 void StatsBarWidget::buildUi() {
     m_rowLayout = new EvenDeltaRowLayout(this);
-    m_rowLayout->setContentsMargins(10, 4, 10, 4);
+    m_rowLayout->setContentsMargins(10, 5, 10, 5);
     m_rowLayout->setSpacing(8);
 
     m_valueFont = QFont(QStringLiteral("FiraCode Nerd Font SemBd"));
     m_valueFont.setStyleHint(QFont::Monospace);
-    m_valueFont.setPointSizeF(9.2);
+    m_valueFont.setPointSizeF(9.0);
 
     m_tagFont = QFont(QStringLiteral("FiraCode Nerd Font SemBd"));
     m_tagFont.setStyleHint(QFont::Monospace);
-    m_tagFont.setPointSizeF(8.0);
+    m_tagFont.setPointSizeF(7.8);
     m_tagFont.setBold(true);
 
     setFont(m_valueFont);
@@ -1110,19 +1617,19 @@ void StatsBarWidget::buildUi() {
     m_cpuCard = new StatsCardWidget(StatsCardWidget::Mode::GaugeSpark, QStringLiteral("CPU"),
                                     m_valueFont, m_tagFont, this);
     m_cpuCard->setWidthSample(QStringLiteral("100% · 100°C"));
-    m_cpuCard->setToolTip(QStringLiteral("CPU usage, max package temperature & 1Hz trend (ksystemstats)"));
+    m_cpuCard->setToolTip(QStringLiteral("CPU usage, max package temperature & 1Hz oscilloscope trend (ksystemstats)"));
 
     m_ramCard = new StatsCardWidget(StatsCardWidget::Mode::GaugeSpark, QStringLiteral("RAM"),
                                     m_valueFont, m_tagFont, this);
     m_ramCard->setWidthSample(QStringLiteral("99.9G · 100%"));
-    m_ramCard->setToolTip(QStringLiteral("Physical RAM used (GiB & %) + 1Hz trend (ksystemstats)"));
+    m_ramCard->setToolTip(QStringLiteral("Physical RAM used (GiB & %) + 1Hz oscilloscope trend (ksystemstats)"));
 
     m_netCard = new StatsCardWidget(StatsCardWidget::Mode::NetDualSpark, QString(),
                                     m_valueFont, m_tagFont, this);
     m_netCard->setNetWidthSample(QStringLiteral("PRI 255.255.255.255"), QStringLiteral("↓999.9M/s"));
     updateNetToolTip();
     m_netCard->setOnClick([this](const QPoint &pos) -> QString {
-        if (pos.y() < m_netCard->height() / 2) {
+        if (pos.y() < kNetRowSplitY) {
             if (m_lastPrivateIp.isEmpty()) {
                 return {};
             }
@@ -1138,7 +1645,7 @@ void StatsBarWidget::buildUi() {
 
     m_vpnCard = new StatsCardWidget(StatsCardWidget::Mode::VpnStatus, QString(),
                                     m_valueFont, m_tagFont, this);
-    m_vpnCard->setWidthSample(QStringLiteral("VPN 192.168.100.100"));
+    m_vpnCard->setWidthSample(QStringLiteral("192.168.100.100"));
     m_vpnCard->setToolTip(QStringLiteral("WireGuard home-lan tunnel status — click to copy VPN IP"));
     m_vpnCard->setOnClick([this](const QPoint & /*pos*/) -> QString {
         if (m_lastVpnIp.isEmpty()) {
@@ -1153,10 +1660,14 @@ void StatsBarWidget::buildUi() {
     m_rowLayout->addWidget(m_netCard);
     m_rowLayout->addWidget(m_vpnCard);
 
-    QFont timeFont = m_valueFont;
-    timeFont.setBold(true);
+    QFont clockDateFont = m_valueFont;
+    clockDateFont.setPointSizeF(8.3);
 
-    m_clockPill = new ClockPillWidget(m_valueFont, timeFont, this);
+    QFont clockTimeFont = m_valueFont;
+    clockTimeFont.setPointSizeF(12.8);
+    clockTimeFont.setBold(true);
+
+    m_clockPill = new ClockPillWidget(clockDateFont, clockTimeFont, this);
     m_clockPill->setToolTip(QStringLiteral("Local date & 1s clock"));
     m_rowLayout->addWidget(m_clockPill);
 
