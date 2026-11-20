@@ -1428,6 +1428,67 @@ private Q_SLOTS:
         QCOMPARE(tabs->currentWidget(), static_cast<QWidget *>(pane0));
         QTRY_VERIFY_WITH_TIMEOUT(term0->hasFocus(), 2000);
     }
+
+    [[maybe_unused]] static void testAdaptiveTabBarSizing() {
+        MainWindow win;
+        win.resize(1000, 600);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+        win.activateWindow();
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QTabBar *bar = tabs->tabBar();
+        QVERIFY(bar != nullptr);
+        QCOMPARE(bar->elideMode(), Qt::ElideMiddle);
+
+        // Short path title must NOT shrink tab below preferred width (200px)
+        tabs->setTabText(0, QStringLiteral("~"));
+        QApplication::processEvents();
+        QCOMPARE(bar->tabRect(0).width(), 200);
+
+        // Very long path title must stay capped at preferred width (200px)
+        tabs->setTabText(0, QStringLiteral("/home/ak/projects/very/deeply/nested/workspace/directory/path"));
+        QApplication::processEvents();
+        QCOMPARE(bar->tabRect(0).width(), 200);
+
+        // 3 tabs on 1000px window still have plenty of space -> all remain 200px
+        for (int i = 0; i < 2; ++i) {
+            QTest::keyClick(QApplication::focusWidget(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), i + 2, 3000);
+        }
+        tabs->setTabText(1, QStringLiteral("/"));
+        tabs->setTabText(2, QStringLiteral("zsh"));
+        QApplication::processEvents();
+        for (int i = 0; i < 3; ++i) {
+            QCOMPARE(bar->tabRect(i).width(), 200);
+        }
+
+        // Add 3 more tabs (total 6 -> 1200px > ~970px container): tabs shrink evenly to fit
+        for (int i = 0; i < 3; ++i) {
+            QTest::keyClick(QApplication::focusWidget(), Qt::Key_T, Qt::ControlModifier | Qt::ShiftModifier);
+            QTRY_COMPARE_WITH_TIMEOUT(tabs->count(), i + 4, 3000);
+        }
+        QApplication::processEvents();
+        const int shrunkWidth = bar->tabRect(0).width();
+        QVERIFY2(shrunkWidth < 200 && shrunkWidth >= 90,
+                 qPrintable(QStringLiteral("Expected shrunk width in [90, 200), got %1").arg(shrunkWidth)));
+        for (int i = 1; i < 6; ++i) {
+            QCOMPARE(bar->tabRect(i).width(), shrunkWidth);
+        }
+        QVERIFY(shrunkWidth * 6 <= tabs->width());
+
+        // Widening window so 6 * 200 fits restores tabs back to 200px
+        win.resize(1400, 600);
+        QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 200, 2000);
+        for (int i = 1; i < 6; ++i) {
+            QCOMPARE(bar->tabRect(i).width(), 200);
+        }
+
+        // Narrowing window below 6 * 90 clamps tabs to minimum floor (90px)
+        win.resize(450, 600);
+        QTRY_COMPARE_WITH_TIMEOUT(bar->tabRect(0).width(), 90, 2000);
+    }
 };
 
 #include "smoke_test.moc"

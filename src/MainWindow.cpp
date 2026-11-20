@@ -4,7 +4,9 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
+#include <QCoreApplication>
 #include <QDir>
+#include <QEvent>
 #include <QKeySequence>
 #include <QMessageBox>
 #include <QPushButton>
@@ -18,6 +20,94 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+
+namespace {
+
+class AdaptiveTabBar final : public QTabBar {
+public:
+    static constexpr int kPreferredTabWidth = 200;
+    static constexpr int kMinTabWidth = 90;
+
+    explicit AdaptiveTabBar(QWidget *parent = nullptr)
+        : QTabBar(parent) {
+        setElideMode(Qt::ElideMiddle);
+    }
+
+    void refreshTabGeometry() {
+        QEvent ev(QEvent::FontChange);
+        QCoreApplication::sendEvent(this, &ev);
+        updateGeometry();
+    }
+
+protected:
+    [[nodiscard]] QSize tabSizeHint(int index) const override {
+        const QSize base = QTabBar::tabSizeHint(index);
+        return {targetTabWidth(), base.height()};
+    }
+
+    [[nodiscard]] QSize minimumTabSizeHint(int index) const override {
+        const QSize base = QTabBar::minimumTabSizeHint(index);
+        return {std::min(kMinTabWidth, targetTabWidth()), base.height()};
+    }
+
+    void tabInserted(int index) override {
+        QTabBar::tabInserted(index);
+        updateGeometry();
+    }
+
+    void tabRemoved(int index) override {
+        QTabBar::tabRemoved(index);
+        updateGeometry();
+    }
+
+private:
+    [[nodiscard]] int availableContainerWidth() const {
+        const auto *tw = qobject_cast<const QTabWidget *>(parentWidget());
+        if (!tw) {
+            return width();
+        }
+        int avail = tw->width();
+        if (const QWidget *rightCorner = tw->cornerWidget(Qt::TopRightCorner)) {
+            avail -= std::max(rightCorner->width(), rightCorner->sizeHint().width());
+        }
+        if (const QWidget *leftCorner = tw->cornerWidget(Qt::TopLeftCorner)) {
+            avail -= std::max(leftCorner->width(), leftCorner->sizeHint().width());
+        }
+        return std::max(0, avail - 4);
+    }
+
+    [[nodiscard]] int targetTabWidth() const {
+        const int n = std::max(1, count());
+        const int avail = availableContainerWidth();
+        if (avail <= 0) {
+            return kPreferredTabWidth;
+        }
+        const int floorW = std::min(kMinTabWidth, avail);
+        return std::clamp(avail / n, floorW, kPreferredTabWidth);
+    }
+};
+
+class TerminalTabWidget final : public QTabWidget {
+public:
+    explicit TerminalTabWidget(QWidget *parent = nullptr)
+        : QTabWidget(parent)
+        , m_adaptiveTabBar(new AdaptiveTabBar(this)) {
+        setTabBar(m_adaptiveTabBar);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        if (m_adaptiveTabBar) {
+            m_adaptiveTabBar->refreshTabGeometry();
+        }
+        QTabWidget::resizeEvent(event);
+    }
+
+private:
+    AdaptiveTabBar *m_adaptiveTabBar = nullptr;
+};
+
+} // namespace
 
 MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     : QMainWindow(parent) {
@@ -33,7 +123,7 @@ MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
     m_statsBar = new StatsBarWidget(central);
     vbox->addWidget(m_statsBar);
 
-    m_tabs = new QTabWidget(central);
+    m_tabs = new TerminalTabWidget(central);
     m_tabs->setDocumentMode(true);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
@@ -93,6 +183,7 @@ void MainWindow::wirePaneSignals(TerminalTabPane *pane) {
         const int tabIdx = m_tabs->indexOf(pane);
         if (tabIdx >= 0) {
             m_tabs->setTabText(tabIdx, t);
+            m_tabs->setTabToolTip(tabIdx, t);
         }
         if (pane == currentPane()) {
             updateWindowTitle();
@@ -120,6 +211,7 @@ void MainWindow::addNewTab(const QString &cwd) {
     auto *pane = new TerminalTabPane(dir, m_tabs);
     wirePaneSignals(pane);
     const int idx = m_tabs->addTab(pane, pane->title());
+    m_tabs->setTabToolTip(idx, pane->title());
 
     m_tabs->setCurrentIndex(idx);
     recordTabVisit(pane);
@@ -134,6 +226,7 @@ void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
     auto *pane = new TerminalTabPane(term, m_tabs);
     wirePaneSignals(pane);
     const int idx = m_tabs->addTab(pane, pane->title());
+    m_tabs->setTabToolTip(idx, pane->title());
 
     m_tabs->setCurrentIndex(idx);
     recordTabVisit(pane);
