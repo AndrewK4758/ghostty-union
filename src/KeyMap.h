@@ -2,7 +2,6 @@
 
 #include <QByteArray>
 #include <Qt>
-#include <cstdint>
 #include <ghostty/vt.h>
 
 class QKeyEvent;
@@ -10,10 +9,10 @@ class QMouseEvent;
 
 namespace GhosttyUnionKeyMap {
 
-/// Map a full QKeyEvent to a Ghostty physical key identifier (keypad-aware, evdev scancode, XKB keysym, and Qt::Key fallback).
+/// Map a full QKeyEvent to a Ghostty physical key identifier (keypad-aware, evdev scancode, XKB key symbol, and Qt::Key fallback).
 GhosttyKey mapQtKey(const QKeyEvent *event);
 
-/// Map Qt key code + optional Linux XKB/evdev native scan code, modifiers, and XKB keysym to a Ghostty physical key identifier.
+/// Map Qt key code + optional Linux XKB/evdev native scan code, modifiers, and XKB key symbol to a Ghostty physical key identifier.
 GhosttyKey mapQtKey(int qtKey,
                     quint32 nativeScanCode,
                     Qt::KeyboardModifiers mods = Qt::NoModifier,

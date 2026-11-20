@@ -10,22 +10,17 @@
 #include <QDBusPendingReply>
 #include <QDateTime>
 #include <QDir>
-#include <QEnterEvent>
 #include <QFile>
 #include <QFont>
 #include <QFontMetrics>
-#include <QHBoxLayout>
-#include <QHostAddress>
+#include <QLayout>
 #include <QLinearGradient>
 #include <QMap>
 #include <QMargins>
 #include <QMouseEvent>
-#include <QNetworkAccessManager>
-#include <QNetworkAddressEntry>
 #include <QNetworkInterface>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
@@ -103,12 +98,60 @@ void pushBoundedSample(std::deque<double> &buf, double value) {
  * each item's `minimumSize().width()` when shrinking unless the row is narrower
  * than the combined floor.
  */
-class EvenDeltaRowLayout final : public QHBoxLayout {
+class EvenDeltaRowLayout final : public QLayout {
 public:
     explicit EvenDeltaRowLayout(QWidget *parent = nullptr)
-        : QHBoxLayout(parent) {}
+        : QLayout(parent) {}
 
-    QSize minimumSize() const override {
+    ~EvenDeltaRowLayout() override {
+        qDeleteAll(m_items);
+    }
+
+    void addItem(QLayoutItem *item) override {
+        m_items.append(item);
+    }
+
+    [[nodiscard]] int count() const override {
+        return static_cast<int>(m_items.size());
+    }
+
+    [[nodiscard]] QLayoutItem *itemAt(int index) const override {
+        return m_items.value(index, nullptr);
+    }
+
+    QLayoutItem *takeAt(int index) override {
+        if (index < 0 || index >= m_items.size()) {
+            return nullptr;
+        }
+        return m_items.takeAt(index);
+    }
+
+    void insertWidget(int index, QWidget *w) {
+        if (!w) {
+            return;
+        }
+        addChildWidget(w);
+        const int clamped = std::clamp(index, 0, static_cast<int>(m_items.size()));
+        m_items.insert(clamped, new QWidgetItem(w));
+        invalidate();
+    }
+
+    [[nodiscard]] QSize sizeHint() const override {
+        int totalW = 0;
+        int active = 0;
+        for (const QLayoutItem *it : m_items) {
+            if (it && !it->isEmpty()) {
+                totalW += std::max(0, it->sizeHint().width());
+                ++active;
+            }
+        }
+        const QMargins m = contentsMargins();
+        const int gap = std::max(0, spacing());
+        const int gapsW = active > 1 ? gap * (active - 1) : 0;
+        return {m.left() + m.right() + totalW + gapsW, kBarHeightPx};
+    }
+
+    [[nodiscard]] QSize minimumSize() const override {
         int active = 0;
         for (int i = 0; i < count(); ++i) {
             if (const QLayoutItem *it = itemAt(i); it && !it->isEmpty()) {
@@ -118,7 +161,7 @@ public:
         const QMargins m = contentsMargins();
         const int gap = std::max(0, spacing());
         const int minW = m.left() + m.right() + (active > 0 ? gap * (active - 1) + active * 24 : 0);
-        return QSize(minW, kBarHeightPx);
+        return {minW, kBarHeightPx};
     }
 
     void setGeometry(const QRect &rect) override {
@@ -217,6 +260,9 @@ public:
             x += w[i] + gap;
         }
     }
+
+private:
+    QList<QLayoutItem *> m_items;
 };
 
 /**
@@ -224,10 +270,10 @@ public:
  */
 class ClockPillWidget final : public QWidget {
 public:
-    ClockPillWidget(const QFont &dateFont, const QFont &timeFont, QWidget *parent = nullptr)
+    ClockPillWidget(QFont dateFont, QFont timeFont, QWidget *parent = nullptr)
         : QWidget(parent)
-        , m_dateFont(dateFont)
-        , m_timeFont(timeFont) {
+        , m_dateFont(std::move(dateFont))
+        , m_timeFont(std::move(timeFont)) {
         setObjectName(QStringLiteral("ClockPill"));
         setFixedHeight(kCardHeightPx);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -248,12 +294,12 @@ public:
         update();
     }
 
-    QSize sizeHint() const override {
-        return QSize(m_preferredWidth, kCardHeightPx);
+    [[nodiscard]] QSize sizeHint() const override {
+        return {m_preferredWidth, kCardHeightPx};
     }
 
-    QSize minimumSizeHint() const override {
-        return QSize(std::min(kMinItemWidthPx, m_preferredWidth), kCardHeightPx);
+    [[nodiscard]] QSize minimumSizeHint() const override {
+        return {std::min(kMinItemWidthPx, m_preferredWidth), kCardHeightPx};
     }
 
 protected:
@@ -323,14 +369,14 @@ public:
         VpnStatus,
     };
 
-    StatsCardWidget(Mode mode, const QString &tag, const QFont &valueFont,
-                    const QFont &tagFont, QWidget *parent = nullptr)
+    StatsCardWidget(Mode mode, QString tag, const QFont &valueFont,
+                    QFont tagFont, QWidget *parent = nullptr)
         : QWidget(parent)
         , m_mode(mode)
-        , m_tag(tag)
+        , m_tag(std::move(tag))
         , m_valueFont(valueFont)
         , m_compactFont(valueFont)
-        , m_tagFont(tagFont) {
+        , m_tagFont(std::move(tagFont)) {
         m_compactFont.setPointSizeF(7.8);
         setFixedHeight(kCardHeightPx);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -362,8 +408,6 @@ public:
         updateGeometry();
     }
 
-    QString tag() const { return m_tag; }
-
     void setTag(const QString &tag) {
         if (m_tag == tag) {
             return;
@@ -381,12 +425,12 @@ public:
         updateGeometry();
     }
 
-    QSize sizeHint() const override {
-        return QSize(m_preferredWidth, kCardHeightPx);
+    [[nodiscard]] QSize sizeHint() const override {
+        return {m_preferredWidth, kCardHeightPx};
     }
 
-    QSize minimumSizeHint() const override {
-        return QSize(std::min(kMinItemWidthPx, m_preferredWidth), kCardHeightPx);
+    [[nodiscard]] QSize minimumSizeHint() const override {
+        return {std::min(kMinItemWidthPx, m_preferredWidth), kCardHeightPx};
     }
 
     void setGaugeData(const QString &valueText, double percent, const QColor &accent) {
@@ -425,7 +469,7 @@ public:
         update();
     }
 
-    QString summaryText() const {
+    [[nodiscard]] QString summaryText() const {
         if (m_mode == Mode::NetDualSpark) {
             return m_valueText;
         }
@@ -435,7 +479,7 @@ public:
         return QStringLiteral("%1 %2").arg(m_tag, m_valueText);
     }
 
-    int sampleCount() const {
+    [[nodiscard]] int sampleCount() const {
         return static_cast<int>(m_primaryHistory.size());
     }
 
@@ -498,14 +542,14 @@ protected:
     }
 
 private:
-    void drawSparkSeries(QPainter &p, const QRectF &box, const std::deque<double> &samples,
-                         double maxScale, const QColor &lineColor, bool fillUnder) const {
+    static void drawSparkSeries(QPainter &p, const QRectF &box, const std::deque<double> &samples,
+                                double maxScale, const QColor &lineColor, bool fillUnder) {
         if (samples.empty() || box.width() <= 2.0 || box.height() <= 2.0) {
             return;
         }
         const double denom = std::max(1e-6, maxScale);
         const size_t n = samples.size();
-        const qreal stepX = (kMaxSamples > 1) ? (box.width() / static_cast<qreal>(kMaxSamples - 1)) : box.width();
+        const qreal stepX = box.width() / static_cast<qreal>(kMaxSamples - 1);
         const qreal startX = box.right() - static_cast<qreal>(n > 0 ? n - 1 : 0) * stepX;
 
         QPainterPath linePath;
@@ -545,10 +589,10 @@ private:
         p.drawPath(linePath);
     }
 
-    void paintGaugeSpark(QPainter &p) {
-        const int leftPad = 9;
+    void paintGaugeSpark(QPainter &p) const {
+        constexpr int leftPad = 9;
         const int rightEdge = width() - 9;
-        const int textTop = 3;
+        constexpr int textTop = 3;
         const int textH = height() - 10;
 
         const QFontMetrics fmTag(m_tagFont);
@@ -619,8 +663,8 @@ private:
         }
     }
 
-    void paintNetDualSpark(QPainter &p) {
-        const int leftPad = 9;
+    void paintNetDualSpark(QPainter &p) const {
+        constexpr int leftPad = 9;
         const int rightEdge = width() - 9;
 
         const QFontMetrics fm(m_compactFont);
@@ -672,7 +716,7 @@ private:
             p.drawText(QRect(leftPad, 0, availFlashW, height()),
                        Qt::AlignVCenter | Qt::AlignLeft, flashText);
         } else {
-            const int ipX = leftPad;
+            constexpr int ipX = leftPad;
             const int ipW = std::min(ipColW, std::max(0, textRight - ipX));
             const int rateX = ipX + ipW + colGap;
             const int rateW = std::max(0, textRight - rateX);
@@ -748,9 +792,9 @@ private:
         }
     }
 
-    void paintVpnStatus(QPainter &p) {
+    void paintVpnStatus(QPainter &p) const {
         const qreal cy = height() * 0.5;
-        const qreal cx = 14.0;
+        constexpr qreal cx = 14.0;
         if (m_online) {
             QColor halo = m_accent;
             halo.setAlpha(55);
@@ -841,10 +885,10 @@ bool StatsBarWidget::isIntegratedGpuName(const QString &name) {
     if (reApu.match(trimmed).hasMatch()) {
         return true;
     }
-    static const QRegularExpression reGenericIgpu(
+    static const QRegularExpression reGenericIntegratedGpu(
         QStringLiteral("^(?:AMD\\s+Radeon(?:\\(TM\\))?\\s+Graphics|Intel\\(R\\)\\s+Graphics)$"),
         QRegularExpression::CaseInsensitiveOption);
-    return reGenericIgpu.match(trimmed).hasMatch();
+    return reGenericIntegratedGpu.match(trimmed).hasMatch();
 }
 
 QString StatsBarWidget::formatGpuShortTag(const QString &name, int fallbackIndex) {
@@ -920,13 +964,13 @@ QList<StatsBarWidget::GpuDescriptor> StatsBarWidget::selectActiveGpus(
     QList<GpuDescriptor> connected;
     connected.reserve(candidates.size());
 
-    for (const GpuDescriptor &cand : candidates) {
-        const bool isNvidia = cand.name.contains(QLatin1String("NVIDIA"), Qt::CaseInsensitive) ||
-                              cand.name.contains(QLatin1String("GeForce"), Qt::CaseInsensitive);
+    for (const GpuDescriptor &candidate : candidates) {
+        const bool isNvidia = candidate.name.contains(QLatin1String("NVIDIA"), Qt::CaseInsensitive) ||
+                              candidate.name.contains(QLatin1String("GeForce"), Qt::CaseInsensitive);
         if (enforceNvidiaProcFilter && isNvidia) {
             int matchIdx = -1;
             for (int i = 0; i < remainingNvidia.size(); ++i) {
-                if (remainingNvidia[i].compare(cand.name.trimmed(), Qt::CaseInsensitive) == 0) {
+                if (remainingNvidia[i].compare(candidate.name.trimmed(), Qt::CaseInsensitive) == 0) {
                     matchIdx = i;
                     break;
                 }
@@ -936,16 +980,16 @@ QList<StatsBarWidget::GpuDescriptor> StatsBarWidget::selectActiveGpus(
             }
             remainingNvidia.removeAt(matchIdx);
         }
-        connected.append(cand);
+        connected.append(candidate);
     }
 
     QList<GpuDescriptor> discrete;
     QList<GpuDescriptor> integrated;
-    for (const GpuDescriptor &cand : connected) {
-        if (isIntegratedGpuName(cand.name)) {
-            integrated.append(cand);
+    for (const GpuDescriptor &candidate : connected) {
+        if (isIntegratedGpuName(candidate.name)) {
+            integrated.append(candidate);
         } else {
-            discrete.append(cand);
+            discrete.append(candidate);
         }
     }
 
@@ -1027,7 +1071,7 @@ StatsBarWidget::StatsBarWidget(QWidget *parent)
 
 StatsBarWidget::~StatsBarWidget() {
     if (m_publicIpReply) {
-        m_publicIpReply->disconnect(this);
+        static_cast<void>(m_publicIpReply->disconnect(this));
         m_publicIpReply->abort();
         m_publicIpReply->deleteLater();
         m_publicIpReply.clear();
@@ -1464,12 +1508,9 @@ void StatsBarWidget::onNewSensorData(const KSysGuard::SensorDataList &updates) {
         if (m_baseSensorIds.contains(id) || m_subscribedSensorIds.contains(id)) {
             return true;
         }
-        for (const GpuCardEntry &g : m_gpuEntries) {
-            if (id == g.usageId || id == g.tempId || id == g.powerId || id == g.nameId) {
-                return true;
-            }
-        }
-        return false;
+        return std::ranges::any_of(m_gpuEntries, [&id](const GpuCardEntry &g) {
+            return id == g.usageId || id == g.tempId || id == g.powerId || id == g.nameId;
+        });
     };
 
     bool touched = false;
@@ -1534,20 +1575,17 @@ bool StatsBarWidget::isVirtualOrTunnelInterface(const QString &ifName) {
         "docker", "br-", "veth", "virbr", "cni", "podman",
         "wg", "tun", "tap", "tailscale", "zt",
     };
-    for (const char *prefix : kVirtualPrefixes) {
-        if (ifName.startsWith(QLatin1String(prefix))) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(kVirtualPrefixes, [&ifName](const char *prefix) {
+        return ifName.startsWith(QLatin1String(prefix));
+    });
 }
 
 QString StatsBarWidget::queryIpv4ForInterface(const QString &ifName) {
-    const QNetworkInterface iface = QNetworkInterface::interfaceFromName(ifName);
-    if (!iface.isValid() || !iface.flags().testFlag(QNetworkInterface::IsUp)) {
+    const QNetworkInterface netInterface = QNetworkInterface::interfaceFromName(ifName);
+    if (!netInterface.isValid() || !netInterface.flags().testFlag(QNetworkInterface::IsUp)) {
         return {};
     }
-    for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
+    for (const QNetworkAddressEntry &entry : netInterface.addressEntries()) {
         if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol) {
             return entry.ip().toString();
         }
@@ -1556,29 +1594,29 @@ QString StatsBarWidget::queryIpv4ForInterface(const QString &ifName) {
 }
 
 QString StatsBarWidget::queryPrimaryPrivateIpv4() {
-    const QString wlanIp = queryIpv4ForInterface(QStringLiteral("wlan0"));
+    QString wlanIp = queryIpv4ForInterface(QStringLiteral("wlan0"));
     if (!wlanIp.isEmpty()) {
         return wlanIp;
     }
 
     QString fallbackIp;
-    const QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
-    for (const QNetworkInterface &iface : ifaces) {
-        if (!iface.isValid()) {
+    const QList<QNetworkInterface> interfaces = QNetworkInterface::allInterfaces();
+    for (const QNetworkInterface &netInterface : interfaces) {
+        if (!netInterface.isValid()) {
             continue;
         }
-        const auto flags = iface.flags();
+        const auto flags = netInterface.flags();
         if (!flags.testFlag(QNetworkInterface::IsUp) ||
             !flags.testFlag(QNetworkInterface::IsRunning) ||
             flags.testFlag(QNetworkInterface::IsLoopBack) ||
             flags.testFlag(QNetworkInterface::IsPointToPoint)) {
             continue;
         }
-        const QString name = iface.name();
+        const QString name = netInterface.name();
         if (isVirtualOrTunnelInterface(name)) {
             continue;
         }
-        for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
+        for (const QNetworkAddressEntry &entry : netInterface.addressEntries()) {
             const QHostAddress ip = entry.ip();
             if (ip.protocol() == QAbstractSocket::IPv4Protocol &&
                 !ip.isLoopback() && !ip.isLinkLocal()) {
@@ -1628,7 +1666,7 @@ void StatsBarWidget::setPublicIpForTesting(const QString &ip) {
         m_publicIpTimer->stop();
     }
     if (m_publicIpReply) {
-        m_publicIpReply->disconnect(this);
+        static_cast<void>(m_publicIpReply->disconnect(this));
         m_publicIpReply->abort();
         m_publicIpReply->deleteLater();
         m_publicIpReply.clear();
@@ -1646,7 +1684,7 @@ void StatsBarWidget::refreshPublicIp() {
 
 void StatsBarWidget::requestPublicIpEndpoint(int endpointIndex) {
     if (m_publicIpReply) {
-        m_publicIpReply->disconnect(this);
+        static_cast<void>(m_publicIpReply->disconnect(this));
         m_publicIpReply->abort();
         m_publicIpReply->deleteLater();
         m_publicIpReply.clear();
@@ -1700,7 +1738,7 @@ void StatsBarWidget::schedulePublicIpRefresh() {
         m_prevPublicIpTriggerVpn = m_lastVpnIp;
         if (m_lastPrivateIp.isEmpty() && m_lastVpnIp.isEmpty()) {
             if (m_publicIpReply) {
-                m_publicIpReply->disconnect(this);
+                static_cast<void>(m_publicIpReply->disconnect(this));
                 m_publicIpReply->abort();
                 m_publicIpReply->deleteLater();
                 m_publicIpReply.clear();
@@ -1718,7 +1756,7 @@ void StatsBarWidget::schedulePublicIpRefresh() {
     }
 }
 
-void StatsBarWidget::updateNetToolTip() {
+void StatsBarWidget::updateNetToolTip() const {
     if (!m_netCard) {
         return;
     }
