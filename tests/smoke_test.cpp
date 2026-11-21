@@ -7,6 +7,7 @@
 
 #include <QAbstractButton>
 #include <QApplication> // IWYU pragma: keep
+#include <QBuffer>
 #include <QClipboard>
 #include <QContextMenuEvent>
 #include <QCoreApplication>
@@ -1959,6 +1960,220 @@ private Q_SLOTS:
         }
         termMenu->close();
         QVERIFY(hasSoftReset);
+    }
+
+    [[maybe_unused]] static void testKittyGraphicsVirtualPlaceholdersOsc1337AndInspector() {
+        QTemporaryDir tmpDir;
+        QVERIFY(tmpDir.isValid());
+
+        MainWindow win(tmpDir.path());
+        win.resize(920, 560);
+        win.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&win));
+
+        auto *tabs = win.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        auto *pane = qobject_cast<TerminalTabPane *>(tabs->currentWidget());
+        QVERIFY(pane != nullptr);
+
+        TerminalWidget term(tmpDir.path(), &win, /*startShell=*/false);
+        term.setGeometry(20, 60, 820, 380);
+        term.show();
+        term.raise();
+        QVERIFY(QTest::qWaitForWindowExposed(&term));
+
+        const QSize cs = term.cellSize();
+        const int cw = cs.width();
+        const int ch = cs.height();
+        constexpr QPoint pad = TerminalWidget::viewportOffset();
+        auto cellCenter = [&](int col, int row) {
+            return QPoint(pad.x() + col * cw + cw / 2, pad.y() + row * ch + ch / 2);
+        };
+
+        auto encodePngBase64 = [](int w, int h, const QColor &fillCol) -> QByteArray {
+            QImage src(w, h, QImage::Format_RGBA8888);
+            src.fill(fillCol);
+            QByteArray pngBytes;
+            QBuffer buf(&pngBytes);
+            buf.open(QIODevice::WriteOnly);
+            src.save(&buf, "PNG");
+            return pngBytes.toBase64();
+        };
+
+        // 1. Kitty f=100 PNG virtual placement (U=1) + U+10EEEE placeholder cells (Swarm board layout)
+        //    Place two separate 4x2 avatars sharing imageId=7 (placementId=0) at cols 0..3 and cols 24..27
+        const QByteArray magentaPngB64 = encodePngBase64(cw * 4, ch * 2, QColor(0xFF, 0x00, 0xCC));
+        const QString row0Placeholders = QStringLiteral(
+            "\U0010EEEE\u0305\u0305\U0010EEEE\u0305\u030d\U0010EEEE\u0305\u030e\U0010EEEE\u0305\u0310");
+        const QString row1Placeholders = QStringLiteral(
+            "\U0010EEEE\u030d\u0305\U0010EEEE\u030d\u030d\U0010EEEE\u030d\u030e\U0010EEEE\u030d\u0310");
+
+        QByteArray swarmSeq;
+        swarmSeq.append("\x1b_Ga=T,U=1,f=100,i=7,c=4,r=2,q=2;");
+        swarmSeq.append(magentaPngB64);
+        swarmSeq.append("\x1b\\");
+        swarmSeq.append("\x1b[38;2;0;0;7m");
+        swarmSeq.append(row0Placeholders.toUtf8());
+        swarmSeq.append("\x1b[0m  SwarmHeader        \x1b[38;2;0;0;7m");
+        swarmSeq.append(row0Placeholders.toUtf8());
+        swarmSeq.append("\x1b[0m  SecondAvatar\r\n\x1b[38;2;0;0;7m");
+        swarmSeq.append(row1Placeholders.toUtf8());
+        swarmSeq.append("\x1b[0m  Active             \x1b[38;2;0;0;7m");
+        swarmSeq.append(row1Placeholders.toUtf8());
+        swarmSeq.append("\x1b[0m  Working\r\n");
+        term.feedVtBytes(swarmSeq);
+
+        // Two 4x2 virtual blocks -> 4 single-row virtual placement slices
+        QCOMPARE(term.visibleImagePlacementCount(), 4);
+
+        const QString swarmPlain = term.plainTextSnapshot();
+        QVERIFY(swarmPlain.contains(QLatin1String("SwarmHeader")));
+        QVERIFY(swarmPlain.contains(QLatin1String("SecondAvatar")));
+        QVERIFY(!swarmPlain.contains(QChar(QChar::highSurrogate(0x10EEEEU))));
+        QVERIFY(!swarmPlain.contains(QChar(0x0305)));
+        QVERIFY(!swarmPlain.contains(QChar(0x030D)));
+
+        // Placeholder cells must not trigger false-positive regex links
+        QVERIFY(!GhosttyUnionLink::resolveAt(
+                     nullptr, 80, 24, 0, 0, tmpDir.path())
+                     .isValid());
+
+        const QImage grab1 = term.grab().toImage();
+        const qreal dpr = grab1.devicePixelRatio();
+        auto sampleAt = [&](const QPoint &pt) {
+            return grab1.pixelColor(static_cast<int>(std::lround(pt.x() * dpr)),
+                                    static_cast<int>(std::lround(pt.y() * dpr)));
+        };
+        const QColor avatarPx = sampleAt(cellCenter(1, 0));
+        QVERIFY2(avatarPx.red() > 200 && avatarPx.blue() > 150 && avatarPx.green() < 45,
+                 qPrintable(QStringLiteral("Expected magenta virtual image pixel, got %1").arg(avatarPx.name())));
+
+        // 2. 5-layer z-ordering: BELOW_TEXT (z=-1) keeps foreground text readable above image,
+        //    whereas ABOVE_TEXT (z=+5) covers text; deleting images (a=d) clears placements even with DIRTY_FALSE.
+        const QByteArray navyPngB64 = encodePngBase64(cw * 6, ch, QColor(0x08, 0x18, 0x48));
+        QByteArray belowTextSeq;
+        belowTextSeq.append("\x1b[4;1H\x1b[38;2;255;255;255m████████");
+        belowTextSeq.append("\x1b[4;1H\x1b_Ga=T,f=100,i=10,c=6,r=1,z=-1,C=1,q=2;");
+        belowTextSeq.append(navyPngB64);
+        belowTextSeq.append("\x1b\\");
+        term.feedVtBytes(belowTextSeq);
+        {
+            const QImage grabBelow = term.grab().toImage();
+            const QColor fgOverImg = grabBelow.pixelColor(
+                static_cast<int>(std::lround(cellCenter(1, 3).x() * grabBelow.devicePixelRatio())),
+                static_cast<int>(std::lround(cellCenter(1, 3).y() * grabBelow.devicePixelRatio())));
+            QVERIFY2(fgOverImg.red() > 230 && fgOverImg.green() > 230 && fgOverImg.blue() > 230,
+                     qPrintable(QStringLiteral("BELOW_TEXT image obscured foreground glyph: %1").arg(fgOverImg.name())));
+        }
+
+        const QByteArray goldPngB64 = encodePngBase64(cw * 4, ch * 2, QColor(0xFF, 0xD3, 0x00));
+        QByteArray layerSeq;
+        layerSeq.append("\x1b[6;1H\x1b[38;2;0;0;0m████████"); // solid black block glyphs on row 5 (1-based row 6)
+        layerSeq.append("\x1b[6;1H\x1b_Ga=T,f=100,i=11,c=4,r=1,z=5,C=1,q=2;");
+        layerSeq.append(goldPngB64);
+        layerSeq.append("\x1b\\");
+        term.feedVtBytes(layerSeq);
+        QCOMPARE(term.visibleImagePlacementCount(), 6);
+
+        const QImage grabAbove = term.grab().toImage();
+        const QColor abovePx = grabAbove.pixelColor(
+            static_cast<int>(std::lround(cellCenter(1, 5).x() * grabAbove.devicePixelRatio())),
+            static_cast<int>(std::lround(cellCenter(1, 5).y() * grabAbove.devicePixelRatio())));
+        QVERIFY2(abovePx.red() > 220 && abovePx.green() > 180 && abovePx.blue() < 40,
+                 qPrintable(QStringLiteral("ABOVE_TEXT gold image did not cover black block glyph: %1").arg(abovePx.name())));
+
+        // Delete screen placements (d=A) without touching text cells -> removes fixed i=10 & i=11 (6 -> 4),
+        // uncovers black block glyph even with RENDER_STATE_DIRTY_FALSE, and keeps virtual U=1 i=7 until d=I,i=7.
+        term.feedVtBytes(QByteArrayLiteral("\x1b_Ga=d,d=A,q=2;\x1b\\"));
+        QCOMPARE(term.visibleImagePlacementCount(), 4);
+        const QImage grabAfterDel = term.grab().toImage();
+        const QColor uncoveredPx = grabAfterDel.pixelColor(
+            static_cast<int>(std::lround(cellCenter(1, 5).x() * grabAfterDel.devicePixelRatio())),
+            static_cast<int>(std::lround(cellCenter(1, 5).y() * grabAfterDel.devicePixelRatio())));
+        QVERIFY2(uncoveredPx.red() < 20 && uncoveredPx.green() < 20 && uncoveredPx.blue() < 20,
+                 qPrintable(QStringLiteral("Deleted image remained on screen: %1").arg(uncoveredPx.name())));
+
+        term.feedVtBytes(QByteArrayLiteral("\x1b_Ga=d,d=I,i=7,q=2;\x1b\\"));
+        QCOMPARE(term.visibleImagePlacementCount(), 0);
+
+        // 3. iTerm2 OSC 1337 ; File=inline=1:<base64> multi-protocol bridge (split across chunks + 7-bit ST, zero PTY replies)
+        QByteArray ptyOut;
+        term.setPtyOutputSpyForTesting([&](const QByteArray &b) { ptyOut.append(b); });
+
+        const QByteArray emeraldPngB64 = encodePngBase64(36, 36, QColor(0x10, 0xD8, 0x76));
+        const qsizetype halfB64 = emeraldPngB64.size() / 2;
+        QByteArray oscChunk1("\x1b[1;1H\x1b]1337;File=width=4;height=2;preserveAspectRatio=0;inline=1:");
+        oscChunk1.append(emeraldPngB64.left(halfB64));
+        QByteArray oscChunk2(emeraldPngB64.mid(halfB64));
+        oscChunk2.append("\x1b");
+        term.feedVtBytes(oscChunk1);
+        term.feedVtBytes(oscChunk2);
+        term.feedVtBytes(QByteArrayLiteral("\\"));
+
+        QVERIFY(ptyOut.isEmpty());
+        QCOMPARE(term.visibleImagePlacementCount(), 1);
+        const QImage grabOsc = term.grab().toImage();
+        const QColor emeraldPx = grabOsc.pixelColor(
+            static_cast<int>(std::lround(cellCenter(1, 0).x() * grabOsc.devicePixelRatio())),
+            static_cast<int>(std::lround(cellCenter(1, 0).y() * grabOsc.devicePixelRatio())));
+        QVERIFY2(emeraldPx.green() > 180 && emeraldPx.red() < 50,
+                 qPrintable(QStringLiteral("OSC 1337 inline image did not render emerald pixel: %1").arg(emeraldPx.name())));
+
+        // 4. Solar Forge interactive image UX: Ctrl+Hover, context menu Copy/Save, and Ctrl+Click Lightbox under mouse tracking
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1000h\x1b[?1006h")); // TUI mouse tracking enabled
+        ptyOut.clear();
+
+        const QPoint imgPt = cellCenter(1, 0);
+        QMouseEvent ctrlHover(QEvent::MouseMove, QPointF(imgPt), QPointF(term.mapToGlobal(imgPt)),
+                              Qt::NoButton, Qt::NoButton, Qt::ControlModifier);
+        QCoreApplication::sendEvent(&term, &ctrlHover);
+        QVERIFY(term.hasHoveredImage());
+        QCOMPARE(term.cursor().shape(), Qt::PointingHandCursor);
+
+        // Shift+RightClick opens Solar Forge context menu with Inspect / Copy / Save Image actions
+        QTest::mouseClick(&term, Qt::RightButton, Qt::ShiftModifier, imgPt);
+        QMenu *imgMenu = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((imgMenu = term.findChild<QMenu *>(QStringLiteral("terminalContextMenu"))) != nullptr &&
+                                     imgMenu->isVisible(),
+                                 2000);
+        QAction *copyImgAct = nullptr;
+        QAction *inspectImgAct = nullptr;
+        for (QAction *act : imgMenu->actions()) {
+            if (act->text().contains(QLatin1String("Copy Image"))) {
+                copyImgAct = act;
+            } else if (act->text().contains(QLatin1String("Inspect Image"))) {
+                inspectImgAct = act;
+            }
+        }
+        QVERIFY(copyImgAct != nullptr);
+        QVERIFY(inspectImgAct != nullptr);
+        copyImgAct->trigger();
+        imgMenu->close();
+
+        const QImage clipImg = QApplication::clipboard()->image(QClipboard::Clipboard);
+        QCOMPARE(clipImg.size(), QSize(36, 36));
+        QVERIFY(clipImg.pixelColor(18, 18).green() > 180);
+
+        const QString savedPath = tmpDir.filePath(QStringLiteral("exported.png"));
+        QVERIFY(term.saveKittyImageToFile(0xF0000001U, savedPath));
+        QCOMPARE(QImage(savedPath).size(), QSize(36, 36));
+
+        // Ctrl+Click opens Solar Forge Image Lightbox without leaking SGR mouse click to PTY; Escape closes it
+        ptyOut.clear();
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::ControlModifier, imgPt);
+        QVERIFY(ptyOut.isEmpty());
+
+        QWidget *lightbox = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((lightbox = win.findChild<QWidget *>(QStringLiteral("imagePreviewLightbox"))) != nullptr &&
+                                     lightbox->isVisible(),
+                                 2000);
+        auto *zoomInBtn = lightbox->findChild<QPushButton *>(QStringLiteral("lightboxZoomInButton"));
+        QVERIFY(zoomInBtn != nullptr);
+        QTest::mouseClick(zoomInBtn, Qt::LeftButton);
+        QVERIFY(!lightbox->grab().toImage().isNull());
+
+        QTest::keyClick(lightbox, Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(win.findChild<QWidget *>(QStringLiteral("imagePreviewLightbox")) == nullptr, 2000);
     }
 };
 
