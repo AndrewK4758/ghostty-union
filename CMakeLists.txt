@@ -10,16 +10,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Network DBus Test)
 find_package(KSysGuard CONFIG REQUIRED)
 
-find_path(GHOSTTY_VT_INCLUDE_DIR
-    NAMES ghostty/vt.h
-    PATHS /usr/include /usr/local/include
-    REQUIRED
-)
-find_library(GHOSTTY_VT_LIBRARY
-    NAMES ghostty-vt
-    PATHS /usr/lib /usr/local/lib
-    REQUIRED
-)
+find_package(ghostty-vt 1.0 CONFIG QUIET)
+if(NOT TARGET ghostty-vt::ghostty-vt)
+    find_path(GHOSTTY_VT_INCLUDE_DIR
+        NAMES ghostty/vt.h
+        PATHS /usr/include /usr/local/include
+        REQUIRED
+    )
+    find_library(GHOSTTY_VT_LIBRARY
+        NAMES ghostty-vt
+        PATHS /usr/lib /usr/local/lib
+        REQUIRED
+    )
+endif()
 
 add_library(ghostty-union-core STATIC
     src/MainWindow.cpp
@@ -39,7 +42,6 @@ add_library(ghostty-union-core STATIC
 
 target_include_directories(ghostty-union-core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${GHOSTTY_VT_INCLUDE_DIR}
 )
 
 target_link_libraries(ghostty-union-core PUBLIC
@@ -50,8 +52,13 @@ target_link_libraries(ghostty-union-core PUBLIC
     Qt6::DBus
     KSysGuard::SystemStats
     KSysGuard::Formatter
-    ${GHOSTTY_VT_LIBRARY}
 )
+if(TARGET ghostty-vt::ghostty-vt)
+    target_link_libraries(ghostty-union-core PUBLIC ghostty-vt::ghostty-vt)
+else()
+    target_include_directories(ghostty-union-core PUBLIC ${GHOSTTY_VT_INCLUDE_DIR})
+    target_link_libraries(ghostty-union-core PUBLIC ${GHOSTTY_VT_LIBRARY})
+endif()
 
 target_compile_definitions(ghostty-union-core PUBLIC
     QT_NO_KEYWORDS

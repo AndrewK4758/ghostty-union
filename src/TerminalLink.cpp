@@ -99,7 +99,7 @@ bool rowHasWrapOut(GhosttyTerminal terminal, uint16_t row) {
         .tag = GHOSTTY_POINT_TAG_VIEWPORT,
         .value = {.coordinate = {.x = 0, .y = row}},
     };
-    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef ref{};
     if (ghostty_terminal_grid_ref(terminal, pt, &ref) != GHOSTTY_SUCCESS) {
         return false;
     }
@@ -117,7 +117,7 @@ bool rowIsWrapContinuation(GhosttyTerminal terminal, uint16_t row) {
         .tag = GHOSTTY_POINT_TAG_VIEWPORT,
         .value = {.coordinate = {.x = 0, .y = row}},
     };
-    GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef ref{};
     if (ghostty_terminal_grid_ref(terminal, pt, &ref) != GHOSTTY_SUCCESS) {
         return false;
     }
@@ -477,7 +477,7 @@ ResolvedLink resolveAt(GhosttyTerminal terminal,
             .tag = GHOSTTY_POINT_TAG_VIEWPORT,
             .value = {.coordinate = {.x = col, .y = row}},
         };
-        outRef = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+        outRef = {};
         return ghostty_terminal_grid_ref(terminal, pt, &outRef) == GHOSTTY_SUCCESS;
     };
 
