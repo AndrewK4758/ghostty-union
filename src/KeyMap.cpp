@@ -702,9 +702,13 @@ void populateGhosttyKeyEvent(GhosttyKeyEvent outEvent,
     ghostty_key_event_set_unshifted_codepoint(outEvent, unshifted);
 
     if (!utf8Storage.isEmpty()) {
-        ghostty_key_event_set_utf8(outEvent, utf8Storage.constData(), static_cast<size_t>(utf8Storage.size()));
+        const GhosttyString utf8{
+            reinterpret_cast<const uint8_t *>(utf8Storage.constData()),
+            static_cast<size_t>(utf8Storage.size()),
+        };
+        ghostty_key_event_set_utf8(outEvent, utf8);
     } else {
-        ghostty_key_event_set_utf8(outEvent, nullptr, 0);
+        ghostty_key_event_set_utf8(outEvent, GhosttyString{nullptr, 0});
     }
 }
 

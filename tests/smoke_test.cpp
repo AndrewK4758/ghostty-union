@@ -53,18 +53,18 @@ private Q_SLOTS:
                                const QKeyEvent &qev,
                                GhosttyKeyAction action = GHOSTTY_KEY_ACTION_PRESS) -> QByteArray {
             constexpr bool altEsc = true;
-            ghostty_key_encoder_setopt(enc, GHOSTTY_KEY_ENCODER_OPT_ALT_ESC_PREFIX, &altEsc);
-            ghostty_key_encoder_setopt(enc, GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS, &kittyFlags);
+            ghostty_key_encoder_set(enc, GHOSTTY_KEY_ENCODER_OPT_ALT_ESC_PREFIX, &altEsc);
+            ghostty_key_encoder_set(enc, GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS, &kittyFlags);
 
             QByteArray utf8Storage;
             GhosttyUnionKeyMap::populateGhosttyKeyEvent(ev, &qev, action, utf8Storage);
 
-            char buf[128];
+            uint8_t buf[128];
             size_t len = 0;
             if (ghostty_key_encoder_encode(enc, ev, buf, sizeof(buf), &len) != GHOSTTY_SUCCESS) {
                 return QByteArrayLiteral("<ENCODE_ERROR>");
             }
-            return {buf, static_cast<qsizetype>(len)};
+            return {reinterpret_cast<const char *>(buf), static_cast<qsizetype>(len)};
         };
 
         auto encodeQt = [&](GhosttyKittyKeyFlags kittyFlags,
@@ -1859,6 +1859,106 @@ private Q_SLOTS:
         QVERIFY(closeTargetLbl->text().contains(QLatin1String("Logs")));
         QTest::mouseClick(closeCancelBtn, Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(!closeModal->isVisible(), 2000);
+    }
+
+    [[maybe_unused]] static void testLeakedTuiModesSanitizedOnCommandEndAndSoftReset() {
+        TerminalWidget term(QString(), nullptr, /*startShell=*/false);
+        term.resize(760, 260);
+        term.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&term));
+
+        QByteArray ptyBytes;
+        term.setPtyOutputSpyForTesting([&](const QByteArray &b) {
+            ptyBytes.append(b);
+        });
+
+        auto pressAndRelease = [&](int qtKey, Qt::KeyboardModifiers mods, const QString &text = {}) -> QByteArray {
+            ptyBytes.clear();
+            QKeyEvent press(QEvent::KeyPress, qtKey, mods, text);
+            QCoreApplication::sendEvent(&term, &press);
+            QKeyEvent release(QEvent::KeyRelease, qtKey, mods, text);
+            QCoreApplication::sendEvent(&term, &release);
+            return ptyBytes;
+        };
+
+        // Baseline primary screen scrollback content that must survive sanitization & soft reset
+        term.feedVtBytes(QByteArrayLiteral("PRIMARY_SCROLLBACK_MARKER\r\n"));
+        QVERIFY(term.plainTextSnapshot().contains(QLatin1String("PRIMARY_SCROLLBACK_MARKER")));
+
+        // 1. Simulate remote TUI killed mid-session over SSH (alt screen + Kitty flags=15 + modifyOtherKeys=2 + mouse + focus + paste)
+        term.feedVtBytes(QByteArrayLiteral(
+            "\x1b[?1049h\x1b[>15u\x1b[>4;2m\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[?25l"
+            "REMOTE_TUI_ALT_SCREEN"));
+        QCOMPARE(pressAndRelease(Qt::Key_Up, Qt::NoModifier),
+                 QByteArrayLiteral("\x1b[1;1:1A\x1b[1;1:3A"));
+        QCOMPARE(pressAndRelease(Qt::Key_L, Qt::ControlModifier, QStringLiteral("\x0c")),
+                 QByteArrayLiteral("\x1b[108;5u\x1b[108;5:3u"));
+        QCOMPARE(pressAndRelease(Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r")),
+                 QByteArrayLiteral("\x1b[13u\x1b[13;1:3u"));
+
+        // 2. Local zsh returns from dead SSH with OSC 133;D;255 + OSC 133;A + prompt + bracketed paste in ONE read chunk
+        term.feedVtBytes(QByteArrayLiteral(
+            "\x1b]133;D;255\x07\x1b]133;A;cl=line\x07LOCAL_PROMPT$ \x1b]133;B\x07\x1b[?2004h"));
+
+        const QString snapAfterReturn = term.plainTextSnapshot();
+        QVERIFY(snapAfterReturn.contains(QLatin1String("PRIMARY_SCROLLBACK_MARKER")));
+        QVERIFY(snapAfterReturn.contains(QLatin1String("LOCAL_PROMPT$")));
+        QCOMPARE(pressAndRelease(Qt::Key_Up, Qt::NoModifier), QByteArrayLiteral("\x1b[A"));
+        QCOMPARE(pressAndRelease(Qt::Key_L, Qt::ControlModifier, QStringLiteral("\x0c")), QByteArrayLiteral("\x0c"));
+        QCOMPARE(pressAndRelease(Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r")), QByteArrayLiteral("\r"));
+
+        // Focus events must be disabled after sanitization
+        ptyBytes.clear();
+        {
+            QFocusEvent fin(QEvent::FocusIn, Qt::ActiveWindowFocusReason);
+            QCoreApplication::sendEvent(&term, &fin);
+        }
+        QVERIFY(ptyBytes.isEmpty());
+
+        // Bracketed paste enabled AFTER OSC 133;D in the same chunk must still be active
+        ptyBytes.clear();
+        term.pasteText(QStringLiteral("hello"));
+        QCOMPARE(ptyBytes, QByteArrayLiteral("\x1b[200~hello\x1b[201~"));
+
+        // 3. Repeated OSC 133;A prompt redraw (e.g. p10k async refresh) without OSC 133;D must NOT reset active prompt modes
+        term.feedVtBytes(QByteArrayLiteral("\x1b]133;A;cl=line\x07LOCAL_PROMPT$ \x1b]133;B\x07"));
+        ptyBytes.clear();
+        term.pasteText(QStringLiteral("still_bracketed"));
+        QCOMPARE(ptyBytes, QByteArrayLiteral("\x1b[200~still_bracketed\x1b[201~"));
+
+        // 4. 7-bit ST-terminated OSC 133;D split right between ESC and '\' across chunks also sanitizes before prompt
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1049h\x1b[>7u\x1b[>4;2m\x1b]133;D;1\x1b"));
+        term.feedVtBytes(QByteArrayLiteral("\\\x1b]133;A\x07" "AFTER_ST_PROMPT$ \x1b]133;B\x07"));
+        QVERIFY(term.plainTextSnapshot().contains(QLatin1String("AFTER_ST_PROMPT$")));
+        QCOMPARE(pressAndRelease(Qt::Key_Up, Qt::NoModifier), QByteArrayLiteral("\x1b[A"));
+        QCOMPARE(pressAndRelease(Qt::Key_L, Qt::ControlModifier, QStringLiteral("\x0c")), QByteArrayLiteral("\x0c"));
+
+        // 5. Manual Ctrl+Shift+K soft reset clears leaked modes + unfinished OSC without wiping primary scrollback
+        term.feedVtBytes(QByteArrayLiteral("\x1b[?1049h\x1b[>15u\x1b[>4;2m\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b]2;unterminated"));
+        QTest::keyClick(&term, Qt::Key_K, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(term.plainTextSnapshot().contains(QLatin1String("PRIMARY_SCROLLBACK_MARKER")));
+        QCOMPARE(pressAndRelease(Qt::Key_Up, Qt::NoModifier), QByteArrayLiteral("\x1b[A"));
+        QCOMPARE(pressAndRelease(Qt::Key_L, Qt::ControlModifier, QStringLiteral("\x0c")), QByteArrayLiteral("\x0c"));
+        QCOMPARE(pressAndRelease(Qt::Key_Return, Qt::NoModifier, QStringLiteral("\r")), QByteArrayLiteral("\r"));
+        ptyBytes.clear();
+        QTest::mouseClick(&term, Qt::LeftButton, Qt::NoModifier, QPoint(40, 40));
+        QVERIFY(!ptyBytes.contains("\x1b[<"));
+
+        // Context menu exposes "Reset Input Modes" alongside "Clear / Reset Terminal"
+        QTest::mouseClick(&term, Qt::RightButton, Qt::NoModifier, QPoint(40, 40));
+        QMenu *termMenu = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((termMenu = term.findChild<QMenu *>(QStringLiteral("terminalContextMenu"))) != nullptr &&
+                                     termMenu->isVisible(),
+                                 2000);
+        bool hasSoftReset = false;
+        for (QAction *act : termMenu->actions()) {
+            if (act->text().contains(QLatin1String("Reset Input Modes"))) {
+                hasSoftReset = true;
+                break;
+            }
+        }
+        termMenu->close();
+        QVERIFY(hasSoftReset);
     }
 };
 
