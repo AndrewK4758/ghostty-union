@@ -79,7 +79,8 @@ QString readRefText(const GhosttyGridRef &ref) {
     size_t len = 0;
     GhosttyResult res = ghostty_grid_ref_graphemes(&ref, stackCps, 16, &len);
     if (res == GHOSTTY_SUCCESS) {
-        if (len == 0 || stackCps[0] == 0U) {
+        // U+10EEEE is the Kitty Graphics Protocol virtual image Unicode placeholder.
+        if (len == 0 || stackCps[0] == 0U || stackCps[0] == 0x10EEEEU) {
             return {};
         }
         return QString::fromUcs4(reinterpret_cast<const char32_t *>(stackCps), static_cast<qsizetype>(len));
@@ -87,7 +88,7 @@ QString readRefText(const GhosttyGridRef &ref) {
     if (res == GHOSTTY_OUT_OF_SPACE && len > 0 && len <= 128) {
         std::vector<uint32_t> heapCps(len);
         res = ghostty_grid_ref_graphemes(&ref, heapCps.data(), heapCps.size(), &len);
-        if (res == GHOSTTY_SUCCESS && len > 0 && heapCps[0] != 0U) {
+        if (res == GHOSTTY_SUCCESS && len > 0 && heapCps[0] != 0U && heapCps[0] != 0x10EEEEU) {
             return QString::fromUcs4(reinterpret_cast<const char32_t *>(heapCps.data()), static_cast<qsizetype>(len));
         }
     }

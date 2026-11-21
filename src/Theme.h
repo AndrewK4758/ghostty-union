@@ -73,6 +73,9 @@ enum class MenuIcon {
     Copy,
     Paste,
     OpenLink,
+    InspectImage,
+    CopyImage,
+    SaveImage,
     Rename,
     ResetName,
     NewTab,
@@ -114,6 +117,42 @@ inline QIcon makeSolarForgeMenuIcon(MenuIcon kind, const QColor &accent = QColor
         p.drawLine(QPointF(7.5, 8.5), QPointF(13.5, 2.5));
         p.drawLine(QPointF(9.5, 2.5), QPointF(13.5, 2.5));
         p.drawLine(QPointF(13.5, 2.5), QPointF(13.5, 6.5));
+        break;
+    case MenuIcon::InspectImage: {
+        p.drawRoundedRect(QRectF(2.2, 2.8, 9.6, 8.4), 1.6, 1.6);
+        p.drawEllipse(QPointF(5.2, 5.6), 1.0, 1.0);
+        QPainterPath mtn;
+        mtn.moveTo(3.2, 9.8);
+        mtn.lineTo(6.0, 7.2);
+        mtn.lineTo(8.0, 9.0);
+        mtn.lineTo(9.6, 7.6);
+        mtn.lineTo(10.8, 9.8);
+        p.drawPath(mtn);
+        p.drawEllipse(QPointF(11.2, 11.2), 2.1, 2.1);
+        p.drawLine(QPointF(12.7, 12.7), QPointF(14.2, 14.2));
+        break;
+    }
+    case MenuIcon::CopyImage: {
+        p.drawRoundedRect(QRectF(4.8, 4.2, 8.6, 9.0), 1.6, 1.6);
+        p.drawLine(QPointF(2.6, 10.6), QPointF(2.6, 2.8));
+        p.drawLine(QPointF(2.6, 2.8), QPointF(10.0, 2.8));
+        p.drawEllipse(QPointF(7.4, 6.8), 0.9, 0.9);
+        QPainterPath mtn;
+        mtn.moveTo(5.8, 11.6);
+        mtn.lineTo(8.2, 8.8);
+        mtn.lineTo(10.0, 10.6);
+        mtn.lineTo(11.3, 9.3);
+        mtn.lineTo(12.4, 11.6);
+        p.drawPath(mtn);
+        break;
+    }
+    case MenuIcon::SaveImage:
+        p.drawLine(QPointF(8.0, 2.6), QPointF(8.0, 10.2));
+        p.drawLine(QPointF(5.2, 7.6), QPointF(8.0, 10.4));
+        p.drawLine(QPointF(10.8, 7.6), QPointF(8.0, 10.4));
+        p.drawLine(QPointF(3.0, 11.2), QPointF(3.0, 13.4));
+        p.drawLine(QPointF(3.0, 13.4), QPointF(13.0, 13.4));
+        p.drawLine(QPointF(13.0, 13.4), QPointF(13.0, 11.2));
         break;
     case MenuIcon::Rename: {
         QPainterPath path;
