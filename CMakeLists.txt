@@ -83,9 +83,47 @@ add_executable(ghostty-union-tests
 target_link_libraries(ghostty-union-tests PRIVATE ghostty-union-core Qt6::Test)
 target_compile_options(ghostty-union-tests PRIVATE -Wall -Wextra -Wpedantic)
 
+include(GNUInstallDirs)
+
 add_test(NAME ghostty_union_smoke COMMAND ghostty-union-tests)
 set_tests_properties(ghostty_union_smoke PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;GHOSTTY_UNION_BUILD_DESKTOP=${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.desktop"
 )
 
-install(TARGETS ghostty-union RUNTIME DESTINATION bin)
+set(GHOSTTY_UNION_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/ghostty-union")
+set(GHOSTTY_UNION_ICON "com.mitchellh.ghostty")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/ghostty-union.desktop.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.desktop"
+    @ONLY
+)
+
+install(TARGETS ghostty-union RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghostty-union.svg"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
+
+# Configure ghostty-union.desktop at `cmake --install` time so `--prefix ~/.local`
+# (which is often absent from KDE Plasma / systemd user session PATH) always embeds
+# the exact absolute binary path in TryExec= and Exec=.
+install(CODE "
+    set(GHOSTTY_UNION_EXEC \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/ghostty-union\")
+    set(GHOSTTY_UNION_ICON \"ghostty-union\")
+    if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
+        if(EXISTS \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/icons/candy-icons/apps/scalable/com.mitchellh.ghostty.svg\"
+           OR EXISTS \"/usr/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png\"
+           OR EXISTS \"/usr/share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png\")
+            set(GHOSTTY_UNION_ICON \"com.mitchellh.ghostty\")
+        endif()
+    endif()
+    configure_file(
+        \"${CMAKE_CURRENT_SOURCE_DIR}/ghostty-union.desktop.in\"
+        \"${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.install.desktop\"
+        @ONLY
+    )
+    file(INSTALL
+        DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/applications\"
+        TYPE FILE
+        RENAME \"ghostty-union.desktop\"
+        FILES \"${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.install.desktop\"
+    )
+")

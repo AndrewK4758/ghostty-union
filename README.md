@@ -134,10 +134,10 @@ The test suite runs headlessly using `QT_QPA_PLATFORM=offscreen` and covers key 
 
 ### Install Binary & Desktop Entry
 
+User-local install (`~/.local/bin/ghostty-union`, `~/.local/share/applications/ghostty-union.desktop` with resolved absolute `Exec=`/`TryExec=`, and `hicolor` fallback icon):
 ```bash
-# User-local install (example)
-ln -sf "$(pwd)/build/ghostty-union" ~/.local/bin/ghostty-union
-install -Dm644 ghostty-union.desktop ~/.local/share/applications/ghostty-union.desktop
+cmake --install build --prefix ~/.local
+kbuildsycoca6 --noincremental 2>/dev/null || true
 ```
 
 Or install system-wide via CMake:
@@ -163,7 +163,9 @@ ghostty-union --help                  # Show CLI options
 ```text
 .
 ├── CMakeLists.txt           # CMake build (C++20, Qt6 6.8+, KSysGuard, libghostty-vt 1.0+)
-├── ghostty-union.desktop    # FreeDesktop application launcher entry
+├── ghostty-union.desktop.in # FreeDesktop launcher template (configured with absolute Exec= path)
+├── assets/
+│   └── ghostty-union.svg    # Fallback hicolor scalable vector application icon
 ├── src/
 │   ├── main.cpp             # Application entry point & CLI parser
 │   ├── MainWindow.{h,cpp}   # Window shell, tabs, shortcuts, Solar Forge modals
