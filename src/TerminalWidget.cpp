@@ -4,6 +4,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QClipboard>
 #include <QCursor>
 #include <QDBusInterface>
@@ -11,9 +12,14 @@
 #include <QDragEnterEvent> // IWYU pragma: keep
 #include <QDropEvent> // IWYU pragma: keep
 #include <QEasingCurve>
+#include <QEvent>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFontMetricsF>
+#include <QHBoxLayout>
+#include <QImageReader>
 #include <QKeyEvent> // IWYU pragma: keep
+#include <QLabel>
 #include <QLinearGradient>
 #include <QMenu>
 #include <QMessageBox>
@@ -21,12 +27,15 @@
 #include <QMouseEvent> // IWYU pragma: keep
 #include <QPainter>
 #include <QPainterPath>
+#include <QPointer>
+#include <QPushButton>
 #include <QSocketNotifier>
+#include <QStandardPaths>
 #include <QTransform>
+#include <QVBoxLayout>
 #include <QVariantAnimation>
 #include <QVariantList>
 #include <QVariantMap>
-#include <QEvent>
 #include <QWheelEvent> // IWYU pragma: keep
 
 #include <algorithm>
@@ -35,6 +44,8 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
+#include <mutex>
 #include <pty.h>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -127,18 +138,461 @@ bool isBoxDrawing(uint32_t cp) {
     return cp >= 0x2500U && cp <= 0x257FU;
 }
 
+constexpr uint32_t kKittyUnicodePlaceholder = 0x10EEEEU;
+
 bool isPowerlineSymbol(uint32_t cp) {
     return cp >= 0xE0B0U && cp <= 0xE0BFU;
 }
 
 bool isNerdFontPua(uint32_t cp) {
-    if (isPowerlineSymbol(cp)) {
+    if (isPowerlineSymbol(cp) || cp == kKittyUnicodePlaceholder) {
         return false;
     }
     return (cp >= 0xE000U && cp <= 0xF8FFU) ||
            (cp >= 0xF0000U && cp <= 0xFFFFDU) ||
            (cp >= 0x100000U && cp <= 0x10FFFDU);
 }
+
+bool decodeKittyImagePayload(void * /*userdata*/,
+                             const GhosttyAllocator *allocator,
+                             const uint8_t *data,
+                             size_t dataLen,
+                             GhosttySysImage *out) {
+    if (!data || dataLen == 0 || dataLen > 128ULL * 1024ULL * 1024ULL || !out) {
+        return false;
+    }
+
+    const QByteArray raw = QByteArray::fromRawData(reinterpret_cast<const char *>(data),
+                                                   static_cast<qsizetype>(dataLen));
+    QBuffer buffer;
+    buffer.setData(raw);
+    if (!buffer.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    QImageReader reader(&buffer);
+    reader.setAllocationLimit(256);
+    QImage decoded = reader.read();
+    if (decoded.isNull() || decoded.width() <= 0 || decoded.height() <= 0) {
+        return false;
+    }
+    if (decoded.format() != QImage::Format_RGBA8888) {
+        decoded = decoded.convertToFormat(QImage::Format_RGBA8888);
+    }
+    if (decoded.isNull()) {
+        return false;
+    }
+
+    const auto w = static_cast<uint64_t>(decoded.width());
+    const auto h = static_cast<uint64_t>(decoded.height());
+    if (w == 0 || h == 0 || w > 16384ULL || h > 16384ULL || w * h > 64ULL * 1024ULL * 1024ULL) {
+        return false;
+    }
+
+    const size_t rowBytes = static_cast<size_t>(w * 4ULL);
+    const size_t totalBytes = static_cast<size_t>(w * h * 4ULL);
+    uint8_t *dst = ghostty_alloc(allocator, totalBytes);
+    if (!dst) {
+        return false;
+    }
+
+    if (static_cast<size_t>(decoded.bytesPerLine()) == rowBytes) {
+        std::memcpy(dst, decoded.constBits(), totalBytes);
+    } else {
+        for (int y = 0; y < decoded.height(); ++y) {
+            std::memcpy(dst + static_cast<size_t>(y) * rowBytes, decoded.constScanLine(y), rowBytes);
+        }
+    }
+
+    out->width = static_cast<uint32_t>(w);
+    out->height = static_cast<uint32_t>(h);
+    out->data = dst;
+    out->data_len = totalBytes;
+    return true;
+}
+
+void ensureGhosttySysImageDecoderInstalled() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG,
+                        reinterpret_cast<const void *>(&decodeKittyImagePayload));
+    });
+}
+
+class SolarForgeImageLightbox final : public QWidget {
+public:
+    SolarForgeImageLightbox(const QImage &image, uint32_t imageId, QWidget *returnFocus, QWidget *parentWindow)
+        : QWidget(parentWindow)
+        , m_image(image.convertToFormat(QImage::Format_RGBA8888_Premultiplied))
+        , m_exportImage(image.convertToFormat(QImage::Format_RGBA8888))
+        , m_imageId(imageId)
+        , m_returnFocus(returnFocus) {
+        setObjectName(QStringLiteral("imagePreviewLightbox"));
+        setAttribute(Qt::WA_DeleteOnClose, true);
+        setFocusPolicy(Qt::StrongFocus);
+        setMouseTracking(true);
+        if (parentWindow) {
+            setGeometry(parentWindow->rect());
+            parentWindow->installEventFilter(this);
+        }
+
+        auto *rootLayout = new QVBoxLayout(this);
+        rootLayout->setContentsMargins(28, 28, 28, 28);
+
+        m_card = new QWidget(this);
+        m_card->setObjectName(QStringLiteral("imagePreviewCard"));
+        auto *cardLayout = new QVBoxLayout(m_card);
+        cardLayout->setContentsMargins(16, 14, 16, 14);
+        cardLayout->setSpacing(10);
+
+        auto *headerRow = new QHBoxLayout();
+        headerRow->setSpacing(8);
+
+        m_titleLabel = new QLabel(m_card);
+        m_titleLabel->setStyleSheet(QStringLiteral(
+            "color: #F1F0F6; font-weight: 700; font-size: 13px; background: transparent;"));
+        headerRow->addWidget(m_titleLabel);
+        headerRow->addStretch(1);
+
+        auto makeToolBtn = [this](const QString &text, const QString &objName, bool accent = false) {
+            auto *btn = new QPushButton(text, m_card);
+            btn->setObjectName(objName);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setFocusPolicy(Qt::NoFocus);
+            btn->setStyleSheet(accent
+                ? QStringLiteral(
+                      "QPushButton { background: rgba(255, 211, 0, 36); color: #FFD300;"
+                      " border: 1px solid rgba(255, 211, 0, 130); border-radius: 6px;"
+                      " padding: 4px 10px; font-size: 12px; font-weight: 600; }"
+                      "QPushButton:hover { background: rgba(255, 211, 0, 68); }")
+                : QStringLiteral(
+                      "QPushButton { background: rgba(255, 255, 255, 16); color: #E5E4EE;"
+                      " border: 1px solid #45413B; border-radius: 6px;"
+                      " padding: 4px 9px; font-size: 12px; }"
+                      "QPushButton:hover { border-color: #FFD300; color: #FFD300; }"));
+            return btn;
+        };
+
+        auto *zoomOutBtn = makeToolBtn(QStringLiteral("−"), QStringLiteral("lightboxZoomOutButton"));
+        auto *zoomResetBtn = makeToolBtn(QStringLiteral("1:1"), QStringLiteral("lightboxResetZoomButton"));
+        auto *fitBtn = makeToolBtn(QStringLiteral("Fit"), QStringLiteral("lightboxFitButton"));
+        auto *zoomInBtn = makeToolBtn(QStringLiteral("+"), QStringLiteral("lightboxZoomInButton"));
+        auto *gridBtn = makeToolBtn(QStringLiteral("Alpha Grid"), QStringLiteral("lightboxGridButton"));
+        auto *copyBtn = makeToolBtn(QStringLiteral("Copy"), QStringLiteral("lightboxCopyButton"), true);
+        auto *saveBtn = makeToolBtn(QStringLiteral("Save As…"), QStringLiteral("lightboxSaveButton"));
+        auto *closeBtn = makeToolBtn(QStringLiteral("Close"), QStringLiteral("lightboxCloseButton"));
+
+        connect(zoomOutBtn, &QPushButton::clicked, this, [this]() { stepZoom(1.0 / 1.25); });
+        connect(zoomResetBtn, &QPushButton::clicked, this, [this]() {
+            m_fitMode = false;
+            m_zoom = 1.0;
+            m_panOffset = {0.0, 0.0};
+            refreshHeader();
+            update();
+        });
+        connect(fitBtn, &QPushButton::clicked, this, [this]() {
+            m_fitMode = true;
+            m_panOffset = {0.0, 0.0};
+            recomputeFitZoom();
+            refreshHeader();
+            update();
+        });
+        connect(zoomInBtn, &QPushButton::clicked, this, [this]() { stepZoom(1.25); });
+        connect(gridBtn, &QPushButton::clicked, this, [this]() {
+            m_checkerboard = !m_checkerboard;
+            update();
+        });
+        connect(copyBtn, &QPushButton::clicked, this, [this, copyBtn]() {
+            if (QClipboard *cb = QApplication::clipboard()) {
+                cb->setImage(m_exportImage, QClipboard::Clipboard);
+                copyBtn->setText(QStringLiteral("Copied"));
+            }
+        });
+        connect(saveBtn, &QPushButton::clicked, this, [this]() {
+            const QString picturesDir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+            const QString baseDir = picturesDir.isEmpty() ? QDir::homePath() : picturesDir;
+            const QString suggested = QDir(baseDir).filePath(
+                QStringLiteral("ghostty-union-image-%1.png").arg(m_imageId));
+            const QString target = QFileDialog::getSaveFileName(
+                this,
+                QStringLiteral("Save Terminal Image"),
+                suggested,
+                QStringLiteral("PNG Image (*.png);;WebP Image (*.webp);;JPEG Image (*.jpg *.jpeg)"));
+            if (!target.isEmpty()) {
+                m_exportImage.save(target);
+            }
+        });
+        connect(closeBtn, &QPushButton::clicked, this, &SolarForgeImageLightbox::dismiss);
+
+        headerRow->addWidget(zoomOutBtn);
+        headerRow->addWidget(zoomResetBtn);
+        headerRow->addWidget(fitBtn);
+        headerRow->addWidget(zoomInBtn);
+        headerRow->addWidget(gridBtn);
+        headerRow->addWidget(copyBtn);
+        headerRow->addWidget(saveBtn);
+        headerRow->addWidget(closeBtn);
+        cardLayout->addLayout(headerRow);
+
+        m_canvas = new QWidget(m_card);
+        m_canvas->setObjectName(QStringLiteral("imagePreviewCanvas"));
+        m_canvas->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        m_canvas->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        cardLayout->addWidget(m_canvas, 1);
+
+        rootLayout->addWidget(m_card, 1);
+        recomputeFitZoom();
+        refreshHeader();
+    }
+
+    void dismiss() {
+        const QPointer<QWidget> target = m_returnFocus;
+        close();
+        if (target) {
+            target->setFocus(Qt::OtherFocusReason);
+        }
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override {
+        if (watched == parentWidget() && event->type() == QEvent::Resize && parentWidget()) {
+            setGeometry(parentWidget()->rect());
+            if (m_fitMode) {
+                recomputeFitZoom();
+                refreshHeader();
+            }
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+    void resizeEvent(QResizeEvent *event) override {
+        QWidget::resizeEvent(event);
+        if (m_fitMode) {
+            recomputeFitZoom();
+            refreshHeader();
+        }
+    }
+
+    void keyPressEvent(QKeyEvent *event) override {
+        if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Q) {
+            dismiss();
+            event->accept();
+            return;
+        }
+        if (event->modifiers().testFlag(Qt::ControlModifier) && event->key() == Qt::Key_C) {
+            if (QClipboard *cb = QApplication::clipboard()) {
+                cb->setImage(m_exportImage, QClipboard::Clipboard);
+            }
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Plus || event->key() == Qt::Key_Equal) {
+            stepZoom(1.25);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Minus) {
+            stepZoom(1.0 / 1.25);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_0 || event->key() == Qt::Key_1) {
+            m_fitMode = false;
+            m_zoom = 1.0;
+            m_panOffset = {0.0, 0.0};
+            refreshHeader();
+            update();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_F) {
+            m_fitMode = true;
+            m_panOffset = {0.0, 0.0};
+            recomputeFitZoom();
+            refreshHeader();
+            update();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_G) {
+            m_checkerboard = !m_checkerboard;
+            update();
+            event->accept();
+            return;
+        }
+        QWidget::keyPressEvent(event);
+    }
+
+    void wheelEvent(QWheelEvent *event) override {
+        const int dy = event->angleDelta().y();
+        if (dy != 0) {
+            stepZoom(dy > 0 ? 1.18 : (1.0 / 1.18));
+            event->accept();
+            return;
+        }
+        QWidget::wheelEvent(event);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton) {
+            if (m_card && !m_card->geometry().contains(event->position().toPoint())) {
+                dismiss();
+                event->accept();
+                return;
+            }
+            m_panning = true;
+            m_lastPanPos = event->position();
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
+            return;
+        }
+        QWidget::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override {
+        if (m_panning) {
+            const QPointF delta = event->position() - m_lastPanPos;
+            m_lastPanPos = event->position();
+            m_panOffset += delta;
+            update();
+            event->accept();
+            return;
+        }
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton && m_panning) {
+            m_panning = false;
+            unsetCursor();
+            event->accept();
+            return;
+        }
+        QWidget::mouseReleaseEvent(event);
+    }
+
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.fillRect(rect(), QColor(15, 14, 19, 224));
+
+        if (!m_card || !m_canvas) {
+            return;
+        }
+
+        const QRectF cardRect = QRectF(m_card->geometry()).adjusted(0.5, 0.5, -0.5, -0.5);
+        QPainterPath cardClip;
+        cardClip.addRoundedRect(cardRect, 14.0, 14.0);
+        p.save();
+        p.setClipPath(cardClip);
+
+        QLinearGradient cardBg(cardRect.topLeft(), cardRect.bottomLeft());
+        cardBg.setColorAt(0.0, QColor(0x2B, 0x29, 0x33, 250));
+        cardBg.setColorAt(1.0, QColor(0x1B, 0x1A, 0x21, 252));
+        p.fillRect(cardRect, cardBg);
+
+        QLinearGradient topBar(cardRect.topLeft(), cardRect.topRight());
+        topBar.setColorAt(0.0, QColor(GhosttyUnionTheme::kGoldHex));
+        topBar.setColorAt(0.6, QColor(GhosttyUnionTheme::kAmberHex));
+        topBar.setColorAt(1.0, QColor(GhosttyUnionTheme::kRedOrangeHex));
+        p.fillRect(QRectF(cardRect.left(), cardRect.top(), cardRect.width(), 2.5), topBar);
+        p.restore();
+
+        p.setPen(QPen(QColor(GhosttyUnionTheme::kChromeBorderHex), 1.0));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(cardRect, 14.0, 14.0);
+
+        const QRect canvasInSelf = m_canvas->geometry().translated(m_card->pos());
+        const QRectF viewRect = QRectF(canvasInSelf).adjusted(2.0, 2.0, -2.0, -2.0);
+        if (viewRect.width() <= 4.0 || viewRect.height() <= 4.0 || m_image.isNull()) {
+            return;
+        }
+
+        p.save();
+        QPainterPath viewClip;
+        viewClip.addRoundedRect(viewRect, 8.0, 8.0);
+        p.setClipPath(viewClip);
+        p.fillRect(viewRect, QColor(0x14, 0x13, 0x18));
+
+        const qreal drawW = m_image.width() * m_zoom;
+        const qreal drawH = m_image.height() * m_zoom;
+        const QPointF center = viewRect.center() + m_panOffset;
+        const QRectF imgRect(center.x() - drawW * 0.5, center.y() - drawH * 0.5, drawW, drawH);
+
+        if (m_checkerboard) {
+            const QRectF visImg = imgRect.intersected(viewRect);
+            constexpr int tile = 10;
+            const int x0 = static_cast<int>(std::floor(visImg.left() / tile)) * tile;
+            const int y0 = static_cast<int>(std::floor(visImg.top() / tile)) * tile;
+            p.save();
+            p.setClipRect(visImg);
+            p.setRenderHint(QPainter::Antialiasing, false);
+            for (int cy = y0; cy < visImg.bottom(); cy += tile) {
+                for (int cx = x0; cx < visImg.right(); cx += tile) {
+                    const bool dark = (((cx / tile) + (cy / tile)) & 1) == 0;
+                    p.fillRect(cx, cy, tile, tile, dark ? QColor(0x22, 0x21, 0x28) : QColor(0x2E, 0x2C, 0x36));
+                }
+            }
+            p.restore();
+        }
+
+        p.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 2.0);
+        p.drawImage(imgRect, m_image);
+
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setPen(QPen(QColor(255, 211, 0, 90), 1.0));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(imgRect);
+        p.restore();
+    }
+
+private:
+    void recomputeFitZoom() {
+        if (m_image.isNull()) {
+            m_zoom = 1.0;
+            return;
+        }
+        const QSize avail = (m_canvas && m_canvas->width() > 32 && m_canvas->height() > 32)
+                                ? m_canvas->size() - QSize(24, 24)
+                                : QSize(std::max(120, width() - 120), std::max(100, height() - 140));
+        const qreal sx = static_cast<qreal>(avail.width()) / static_cast<qreal>(m_image.width());
+        const qreal sy = static_cast<qreal>(avail.height()) / static_cast<qreal>(m_image.height());
+        m_zoom = std::clamp(std::min({sx, sy, 4.0}), 0.10, 16.0);
+    }
+
+    void stepZoom(qreal factor) {
+        m_fitMode = false;
+        m_zoom = std::clamp(m_zoom * factor, 0.10, 16.0);
+        refreshHeader();
+        update();
+    }
+
+    void refreshHeader() {
+        if (!m_titleLabel) {
+            return;
+        }
+        const int pct = static_cast<int>(std::lround(m_zoom * 100.0));
+        m_titleLabel->setText(QStringLiteral("IMAGE INSPECTOR  ·  #%1  ·  %2 × %3 px  ·  %4%")
+                                  .arg(m_imageId)
+                                  .arg(m_image.width())
+                                  .arg(m_image.height())
+                                  .arg(pct));
+    }
+
+    QImage m_image;
+    QImage m_exportImage;
+    uint32_t m_imageId = 0;
+    QPointer<QWidget> m_returnFocus;
+    QWidget *m_card = nullptr;
+    QWidget *m_canvas = nullptr;
+    QLabel *m_titleLabel = nullptr;
+    qreal m_zoom = 1.0;
+    bool m_fitMode = true;
+    bool m_checkerboard = true;
+    QPointF m_panOffset{0.0, 0.0};
+    bool m_panning = false;
+    QPointF m_lastPanPos;
+};
 
 void drawBlockElement(QPainter &p, uint32_t cp, int x, int w, int h, const QColor &fg) {
     p.setRenderHint(QPainter::Antialiasing, false);
@@ -760,6 +1214,9 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
     m_resizeCoalesceTimer.setInterval(20);
     connect(&m_resizeCoalesceTimer, &QTimer::timeout, this, &TerminalWidget::resizeTerminalToWidget);
 
+    m_kittyAnimTimer.setSingleShot(true);
+    connect(&m_kittyAnimTimer, &QTimer::timeout, this, &TerminalWidget::onKittyAnimationTimer);
+
     m_scrollbarHoverAnim = new QVariantAnimation(this);
     m_scrollbarHoverAnim->setDuration(140);
     m_scrollbarHoverAnim->setEasingCurve(QEasingCurve::OutCubic);
@@ -776,6 +1233,7 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
         update();
     });
 
+    ensureGhosttySysImageDecoderInstalled();
     updateFontMetrics();
     if (!initGhostty()) {
         return;
@@ -840,6 +1298,25 @@ void TerminalWidget::updateFontMetrics() {
     m_rowCache.clear();
 }
 
+QRectF TerminalWidget::viewportGridRect() const {
+    return {
+        static_cast<qreal>(kPadX),
+        static_cast<qreal>(kPadY),
+        static_cast<qreal>(m_cols) * static_cast<qreal>(m_cellWidth),
+        static_cast<qreal>(m_rows) * static_cast<qreal>(m_cellHeight),
+    };
+}
+
+int TerminalWidget::deviceCellWidth() const {
+    const qreal dpr = std::max(1.0, m_metricsDpr > 0.0 ? m_metricsDpr : devicePixelRatioF());
+    return std::max(1, static_cast<int>(std::lround(static_cast<qreal>(m_cellWidth) * dpr)));
+}
+
+int TerminalWidget::deviceCellHeight() const {
+    const qreal dpr = std::max(1.0, m_metricsDpr > 0.0 ? m_metricsDpr : devicePixelRatioF());
+    return std::max(1, static_cast<int>(std::lround(static_cast<qreal>(m_cellHeight) * dpr)));
+}
+
 bool TerminalWidget::initGhostty() {
     if (ghostty_terminal_new(nullptr, &m_terminal, m_cols, m_rows) != GHOSTTY_SUCCESS) {
         return false;
@@ -848,9 +1325,15 @@ bool TerminalWidget::initGhostty() {
     m_appliedVtRows = m_rows;
     m_appliedCellWidth = m_cellWidth;
     m_appliedCellHeight = m_cellHeight;
+    m_appliedVtCellWidth = deviceCellWidth();
+    m_appliedVtCellHeight = deviceCellHeight();
+    ghostty_terminal_resize(m_terminal, m_cols, m_rows,
+                            static_cast<uint32_t>(m_appliedVtCellWidth),
+                            static_cast<uint32_t>(m_appliedVtCellHeight));
     if (ghostty_render_state_new(nullptr, &m_renderState) != GHOSTTY_SUCCESS ||
         ghostty_render_state_row_iterator_new(nullptr, &m_rowIter) != GHOSTTY_SUCCESS ||
         ghostty_render_state_row_cells_new(nullptr, &m_cellsIter) != GHOSTTY_SUCCESS ||
+        ghostty_render_state_image_iterator_new(nullptr, &m_imageIter) != GHOSTTY_SUCCESS ||
         ghostty_key_encoder_new(nullptr, &m_keyEncoder) != GHOSTTY_SUCCESS ||
         ghostty_key_event_new(nullptr, &m_keyEvent) != GHOSTTY_SUCCESS ||
         ghostty_mouse_encoder_new(nullptr, &m_mouseEncoder) != GHOSTTY_SUCCESS ||
@@ -877,6 +1360,23 @@ bool TerminalWidget::initGhostty() {
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_RESET, reinterpret_cast<const void *>(&TerminalWidget::onReset));
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, reinterpret_cast<const void *>(&TerminalWidget::onSemanticPrompt));
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, reinterpret_cast<const void *>(&TerminalWidget::onDesktopNotification));
+
+    // Match Ghostty 1.4 Kitty Graphics defaults (320 MB budget + direct/file/temp/shm mediums)
+    constexpr uint64_t kittyStorageLimitBytes = 320000000ULL;
+    constexpr bool enableMedium = true;
+    constexpr size_t maxKittyApcBytes = 128ULL * 1024ULL * 1024ULL;
+    const QByteArray tempDirBytes = QDir::tempPath().toUtf8();
+    const GhosttyString tempDirStr{
+        reinterpret_cast<const uint8_t *>(tempDirBytes.constData()),
+        static_cast<size_t>(tempDirBytes.size()),
+    };
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &kittyStorageLimitBytes);
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE, &enableMedium);
+    if (!tempDirBytes.isEmpty()) {
+        ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, &tempDirStr);
+    }
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &enableMedium);
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES_KITTY, &maxKittyApcBytes);
 
     const bool hasGhosttyTerminfo = QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty"));
     const char *terminfoName = hasGhosttyTerminfo ? "xterm-ghostty" : "xterm-256color";
@@ -931,23 +1431,32 @@ void TerminalWidget::destroyGhostty() {
     m_keyEvent = nullptr;
     m_keyEncoder = nullptr;
 
+    ghostty_render_state_image_iterator_free(m_imageIter);
     ghostty_render_state_row_cells_free(m_cellsIter);
     ghostty_render_state_row_iterator_free(m_rowIter);
     ghostty_render_state_free(m_renderState);
+    m_imageIter = nullptr;
     m_cellsIter = nullptr;
     m_rowIter = nullptr;
     m_renderState = nullptr;
+
+    m_kittyAnimTimer.stop();
+    m_visiblePlacements.clear();
+    m_textureCache.clear();
+    m_pendingOsc1337Seqs.clear();
 
     ghostty_terminal_free(m_terminal);
     m_terminal = nullptr;
 }
 
 bool TerminalWidget::spawnShell(const QString &workingDirectory) {
+    const int devCw = deviceCellWidth();
+    const int devCh = deviceCellHeight();
     winsize ws{
         .ws_row = m_rows,
         .ws_col = m_cols,
-        .ws_xpixel = static_cast<unsigned short>(m_cols * m_cellWidth),
-        .ws_ypixel = static_cast<unsigned short>(m_rows * m_cellHeight),
+        .ws_xpixel = static_cast<unsigned short>(std::min<int>(65535, static_cast<int>(m_cols) * devCw)),
+        .ws_ypixel = static_cast<unsigned short>(std::min<int>(65535, static_cast<int>(m_rows) * devCh)),
     };
 
     int masterFd = -1;
@@ -1150,17 +1659,73 @@ void TerminalWidget::ensureShellSpawned() {
     spawnShell(m_pwd);
 }
 
+void TerminalWidget::appendOscCaptureBytes(const uint8_t *bytes, size_t count) {
+    if (!bytes || count == 0 || m_oscCaptureState == OscCaptureState::Idle) {
+        return;
+    }
+    static constexpr char kOsc1337Prefix[] = "1337;file=";
+    static constexpr qsizetype kPrefixLen = sizeof(kOsc1337Prefix) - 1;
+    static constexpr size_t kMaxOsc1337Bytes = 32ULL * 1024ULL * 1024ULL;
+
+    size_t idx = 0;
+    if (m_oscCaptureState == OscCaptureState::CheckingPrefix) {
+        while (idx < count && m_osc1337Buffer.size() < kPrefixLen) {
+            const char ch = static_cast<char>(bytes[idx]);
+            const char lower = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+            if (lower != kOsc1337Prefix[m_osc1337Buffer.size()]) {
+                m_oscCaptureState = OscCaptureState::Idle;
+                m_osc1337Buffer.clear();
+                return;
+            }
+            m_osc1337Buffer.append(ch);
+            ++idx;
+        }
+        if (m_osc1337Buffer.size() == kPrefixLen) {
+            m_oscCaptureState = OscCaptureState::Capturing1337File;
+        }
+    }
+
+    if (m_oscCaptureState == OscCaptureState::Capturing1337File && idx < count) {
+        const size_t rem = count - idx;
+        if (static_cast<size_t>(m_osc1337Buffer.size()) + rem > kMaxOsc1337Bytes) {
+            m_oscCaptureState = OscCaptureState::Idle;
+            m_osc1337Buffer.clear();
+            return;
+        }
+        m_osc1337Buffer.append(reinterpret_cast<const char *>(bytes + idx),
+                               static_cast<qsizetype>(rem));
+    }
+}
+
 void TerminalWidget::feedVtStream(const uint8_t *data, size_t len) {
     if (!m_terminal || !data || len == 0) {
         return;
     }
 
-    auto tryFlushSanitize = [this]() {
-        if (!m_pendingCommandEndSanitize) {
+    auto hasPendingGroundWork = [this]() {
+        return m_pendingCommandEndSanitize || !m_pendingOsc1337Seqs.isEmpty();
+    };
+
+    auto tryFlushAtGround = [this, &hasPendingGroundWork]() {
+        if (!hasPendingGroundWork()) {
             return;
         }
         bool atGround = false;
-        if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &atGround) == GHOSTTY_SUCCESS && atGround) {
+        if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_VT_GROUND, &atGround) != GHOSTTY_SUCCESS || !atGround) {
+            return;
+        }
+        if (!m_pendingOsc1337Seqs.isEmpty()) {
+            const QVector<QByteArray> queued = std::move(m_pendingOsc1337Seqs);
+            m_pendingOsc1337Seqs.clear();
+            for (const QByteArray &seq : queued) {
+                if (!seq.isEmpty()) {
+                    ghostty_terminal_vt_write(m_terminal,
+                                              reinterpret_cast<const uint8_t *>(seq.constData()),
+                                              static_cast<size_t>(seq.size()));
+                }
+            }
+        }
+        if (m_pendingCommandEndSanitize) {
             m_pendingCommandEndSanitize = false;
             applySoftModeSanitization();
         }
@@ -1169,32 +1734,62 @@ void TerminalWidget::feedVtStream(const uint8_t *data, size_t len) {
     size_t off = 0;
     GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
     while (off < len) {
-        tryFlushSanitize();
-        const uint32_t boundaries = m_pendingCommandEndSanitize
+        tryFlushAtGround();
+        const uint32_t boundaries = (hasPendingGroundWork() && m_oscCaptureState == OscCaptureState::Idle)
                                         ? GHOSTTY_TERMINAL_BOUNDARY_GROUND
-                                        : GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
+                                        : (GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END);
         const GhosttyResult res = ghostty_terminal_vt_write_until(
             m_terminal, data + off, len - off, boundaries, &stop);
         if (res == GHOSTTY_NO_VALUE) {
+            if (m_oscCaptureState != OscCaptureState::Idle) {
+                appendOscCaptureBytes(data + off, len - off);
+            }
             break;
         }
         if (res != GHOSTTY_SUCCESS) {
+            m_oscCaptureState = OscCaptureState::Idle;
+            m_osc1337Buffer.clear();
             ghostty_terminal_vt_write(m_terminal, data + off, len - off);
             break;
         }
         if (stop.consumed == 0) {
-            if ((stop.reached & GHOSTTY_TERMINAL_BOUNDARY_GROUND) != 0 && m_pendingCommandEndSanitize) {
-                m_pendingCommandEndSanitize = false;
-                applySoftModeSanitization();
+            if ((stop.reached & GHOSTTY_TERMINAL_BOUNDARY_GROUND) != 0 && hasPendingGroundWork()) {
+                tryFlushAtGround();
                 continue;
             }
+            m_oscCaptureState = OscCaptureState::Idle;
+            m_osc1337Buffer.clear();
             ghostty_terminal_vt_write(m_terminal, data + off, len - off);
             break;
         }
+
+        if (m_oscCaptureState != OscCaptureState::Idle) {
+            if ((stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_END) != 0) {
+                if (stop.consumed > 1) {
+                    appendOscCaptureBytes(data + off, stop.consumed - 1);
+                }
+                if ((stop.end == GHOSTTY_TERMINAL_STRING_END_BEL ||
+                     stop.end == GHOSTTY_TERMINAL_STRING_END_ST_ESC) &&
+                    m_oscCaptureState == OscCaptureState::Capturing1337File) {
+                    enqueueOsc1337ImageSequence(
+                        reinterpret_cast<const uint8_t *>(m_osc1337Buffer.constData()),
+                        static_cast<size_t>(m_osc1337Buffer.size()));
+                }
+                m_oscCaptureState = OscCaptureState::Idle;
+                m_osc1337Buffer.clear();
+            } else {
+                appendOscCaptureBytes(data + off, stop.consumed);
+            }
+        }
+        if ((stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_START) != 0) {
+            m_oscCaptureState = OscCaptureState::CheckingPrefix;
+            m_osc1337Buffer.clear();
+        }
+
         off += stop.consumed;
-        tryFlushSanitize();
+        tryFlushAtGround();
     }
-    tryFlushSanitize();
+    tryFlushAtGround();
 }
 
 void TerminalWidget::applySoftModeSanitization() {
@@ -1229,7 +1824,10 @@ void TerminalWidget::applySoftModeSanitization() {
 
     m_hoveredLink = {};
     m_pressedLink = {};
+    m_hoveredImage = {};
+    m_pressedImage = {};
     m_linkClickPending = false;
+    m_imageClickPending = false;
     m_renderHeld = false;
     m_renderHoldTimer.stop();
     m_blinkVisible = true;
@@ -1286,14 +1884,21 @@ void TerminalWidget::resizeTerminalToWidget() {
         m_rowCache.clear();
     }
 
+    const int devCw = deviceCellWidth();
+    const int devCh = deviceCellHeight();
     const bool cellMetricsChanged =
-        (m_cellWidth != m_appliedCellWidth || m_cellHeight != m_appliedCellHeight);
+        (m_cellWidth != m_appliedCellWidth ||
+         m_cellHeight != m_appliedCellHeight ||
+         devCw != m_appliedVtCellWidth ||
+         devCh != m_appliedVtCellHeight);
     if (m_cols != m_appliedVtCols || m_rows != m_appliedVtRows || cellMetricsChanged) {
         ghostty_terminal_resize(m_terminal, m_cols, m_rows,
-                                static_cast<uint32_t>(m_cellWidth),
-                                static_cast<uint32_t>(m_cellHeight));
+                                static_cast<uint32_t>(devCw),
+                                static_cast<uint32_t>(devCh));
         m_appliedVtCols = m_cols;
         m_appliedVtRows = m_rows;
+        m_appliedVtCellWidth = devCw;
+        m_appliedVtCellHeight = devCh;
     }
 
     if (m_ptyMasterFd >= 0 &&
@@ -1301,8 +1906,8 @@ void TerminalWidget::resizeTerminalToWidget() {
         winsize ws{
             .ws_row = m_rows,
             .ws_col = m_cols,
-            .ws_xpixel = static_cast<unsigned short>(m_cols * m_cellWidth),
-            .ws_ypixel = static_cast<unsigned short>(m_rows * m_cellHeight),
+            .ws_xpixel = static_cast<unsigned short>(std::min<int>(65535, static_cast<int>(m_cols) * devCw)),
+            .ws_ypixel = static_cast<unsigned short>(std::min<int>(65535, static_cast<int>(m_rows) * devCh)),
         };
         ::ioctl(m_ptyMasterFd, TIOCSWINSZ, &ws);
         m_appliedPtyCols = m_cols;
@@ -1336,7 +1941,27 @@ void TerminalWidget::updateRenderState(bool forceAllDirty) {
     const qreal dpr = std::max(1.0, devicePixelRatioF());
     if (std::abs(dpr - m_metricsDpr) > 0.001) {
         updateFontMetrics();
+        const int devCw = deviceCellWidth();
+        const int devCh = deviceCellHeight();
+        if (devCw != m_appliedVtCellWidth || devCh != m_appliedVtCellHeight) {
+            ghostty_terminal_resize(m_terminal, m_cols, m_rows,
+                                    static_cast<uint32_t>(devCw),
+                                    static_cast<uint32_t>(devCh));
+            m_appliedVtCellWidth = devCw;
+            m_appliedVtCellHeight = devCh;
+        }
         forceAllDirty = true;
+    }
+
+    bool hasActiveAnim = false;
+    uint64_t animNowMs = 0;
+    uint64_t nextAnimMs = 0;
+    {
+        GhosttyKittyGraphics kg = nullptr;
+        if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &kg) == GHOSTTY_SUCCESS && kg) {
+            animNowMs = static_cast<uint64_t>(std::max<qint64>(0, m_clock.elapsed()));
+            hasActiveAnim = (ghostty_kitty_graphics_animation_tick(kg, animNowMs, &nextAnimMs) == GHOSTTY_SUCCESS);
+        }
     }
 
     if (ghostty_render_state_update(m_renderState, m_terminal) != GHOSTTY_SUCCESS) {
@@ -1412,8 +2037,14 @@ void TerminalWidget::updateRenderState(bool forceAllDirty) {
         }
     }
 
+    const uint64_t prevPlacementsGen = m_lastPlacementsGen;
+    refreshImagePlacements(forceAllDirty);
+    const bool placementsChanged = (m_lastPlacementsGen != prevPlacementsGen);
+    scheduleKittyAnimationTick(hasActiveAnim, animNowMs, nextAnimMs);
+
     ghostty_render_state_clean(m_renderState);
-    if (dirtyState != GHOSTTY_RENDER_STATE_DIRTY_FALSE && m_hoveredLink.isValid()) {
+    if ((dirtyState != GHOSTTY_RENDER_STATE_DIRTY_FALSE || placementsChanged) &&
+        (m_hoveredLink.isValid() || m_hoveredImage.isValid() || m_mouseInside)) {
         if (m_mouseInside) {
             updateHoveredLink(m_lastMousePos, QApplication::keyboardModifiers());
         } else {
@@ -1429,6 +2060,7 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
     const int rowPxW = std::max(1, static_cast<int>(m_cols) * m_cellWidth);
     const int rowPxH = m_cellHeight;
 
+    m_rowCache[y].bgRuns.clear();
     QPixmap &pm = m_rowCache[y].pixmap;
     const QSize targetSize(static_cast<int>(std::ceil(rowPxW * dpr)),
                            static_cast<int>(std::ceil(rowPxH * dpr)));
@@ -1441,7 +2073,7 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
     const QColor selBg = GhosttyUnionTheme::toQColor(GhosttyUnionTheme::kOllieSelectionBg);
     const QColor selFg = GhosttyUnionTheme::toQColor(GhosttyUnionTheme::kOllieSelectionFg);
 
-    pm.fill(defaultBg);
+    pm.fill(Qt::transparent);
     QPainter p(&pm);
     p.setRenderHint(QPainter::TextAntialiasing, true);
 
@@ -1527,6 +2159,14 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
             ghostty_cell_get(rawCell, GHOSTTY_CELL_DATA_CODEPOINT, &cp);
         }
 
+        // Suppress glyph & underline metadata on Kitty Graphics virtual placeholder cells (U+10EEEE).
+        // Their foreground/underline RGB and combining diacritics encode (image_id, placement_id, row, col)
+        // for GhosttyRenderStateImageIterator and must never be rasterized as visible text.
+        if (cp == kKittyUnicodePlaceholder) {
+            ++col;
+            continue;
+        }
+
         const bool hasDecorations = (GHOSTTY_STYLE_UNDERLINE(style) != GHOSTTY_SGR_UNDERLINE_NONE) ||
                                     (style.flags & GHOSTTY_STYLE_FLAG_STRIKETHROUGH) != 0 ||
                                     (style.flags & GHOSTTY_STYLE_FLAG_OVERLINE) != 0;
@@ -1577,8 +2217,7 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
         ++col;
     }
 
-    // Pass 1: merged contiguous background runs eliminate HiDPI seams and never clip neighboring glyphs
-    p.setRenderHint(QPainter::Antialiasing, false);
+    // Pass 1: record merged contiguous non-default background runs for 5-layer compositing in paintEvent()
     int c = 0;
     while (c < m_cols) {
         if (colBgs[c] == defaultBg) {
@@ -1590,7 +2229,7 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
         while (end < m_cols && colBgs[end] == runBg) {
             ++end;
         }
-        p.fillRect(c * m_cellWidth, 0, (end - c) * m_cellWidth, rowPxH, runBg);
+        m_rowCache[y].bgRuns.push_back(BgRun{c, end, runBg});
         c = end;
     }
 
@@ -1710,6 +2349,29 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
     const QColor bg = GhosttyUnionTheme::toQColor(m_colors.background);
     p.fillRect(rect(), bg);
 
+    // Layer 1: Kitty images below cell backgrounds (z < -1,073,741,824)
+    drawImagePlacementsLayer(p, GHOSTTY_IMAGE_LAYER_BELOW_BACKGROUND);
+
+    // Layer 2: Non-default cell backgrounds & selection spans
+    p.setRenderHint(QPainter::Antialiasing, false);
+    for (int y = 0; y < m_rowCache.size(); ++y) {
+        if (!m_rowCache[y].valid || m_rowCache[y].bgRuns.empty()) {
+            continue;
+        }
+        const int rowY = kPadY + y * m_cellHeight;
+        for (const BgRun &run : m_rowCache[y].bgRuns) {
+            p.fillRect(kPadX + run.startCol * m_cellWidth,
+                       rowY,
+                       (run.endCol - run.startCol) * m_cellWidth,
+                       m_cellHeight,
+                       run.color);
+        }
+    }
+
+    // Layer 3: Kitty images above cell backgrounds & below text (-1,073,741,824 <= z <= -1, incl. U+10EEEE virtual placements)
+    drawImagePlacementsLayer(p, GHOSTTY_IMAGE_LAYER_BELOW_TEXT);
+
+    // Layer 4: Foreground text, procedural box/block/Powerline, Nerd Font icons, underlines
     const qreal dpr = std::max(1.0, devicePixelRatioF());
     const bool exactRowHeight = std::abs(m_cellHeight * dpr - std::round(m_cellHeight * dpr)) < 0.01;
     for (int y = 0; y < m_rowCache.size(); ++y) {
@@ -1723,7 +2385,10 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         }
     }
 
-    // Ctrl+Hover link underline overlay
+    // Layer 5: Kitty images above text (z >= 0)
+    drawImagePlacementsLayer(p, GHOSTTY_IMAGE_LAYER_ABOVE_TEXT);
+
+    // Ctrl+Hover link underline overlay (or Solar Forge inline image highlight frame)
     if (m_hoveredLink.isValid()) {
         p.save();
         p.setRenderHint(QPainter::Antialiasing, false);
@@ -1738,6 +2403,14 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
             const int uy = kPadY + static_cast<int>(span.row) * m_cellHeight + underlineOffset;
             p.drawLine(ux0, uy, ux1, uy);
         }
+        p.restore();
+    } else if (m_hoveredImage.isValid()) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, true);
+        const QRectF frameRect = m_hoveredImage.unionRect.adjusted(0.5, 0.5, -0.5, -0.5);
+        p.setPen(QPen(QColor(GhosttyUnionTheme::kGoldHex), 1.4));
+        p.setBrush(QColor(255, 211, 0, 18));
+        p.drawRoundedRect(frameRect, 4.0, 4.0);
         p.restore();
     }
 
@@ -1817,9 +2490,15 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         p.restore();
     }
 
-    // Solar Forge glassmorphic `link-previews = true` pill overlay
-    if (m_hoveredLink.isValid()) {
-        const QString rawPreview = m_hoveredLink.previewText();
+    // Solar Forge glassmorphic `link-previews = true` pill overlay (links & inline images)
+    if (m_hoveredLink.isValid() || m_hoveredImage.isValid()) {
+        const bool isImgPill = !m_hoveredLink.isValid();
+        const QString rawPreview = isImgPill
+                                       ? QStringLiteral("Image #%1 · %2×%3 px · Ctrl+Click to inspect")
+                                             .arg(m_hoveredImage.imageId)
+                                             .arg(m_hoveredImage.sourcePixelWidth)
+                                             .arg(m_hoveredImage.sourcePixelHeight)
+                                       : m_hoveredLink.previewText();
         if (!rawPreview.isEmpty()) {
             p.save();
             QFont uiFont = QApplication::font();
@@ -1830,7 +2509,7 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
             const int maxPillW = std::max(80, width() - 28);
             constexpr int hPad = 10;
             constexpr int vPad = 5;
-            const QString badgePrefix = QStringLiteral("↗ ");
+            const QString badgePrefix = isImgPill ? QStringLiteral("◈ ") : QStringLiteral("↗ ");
             const int prefixW = fm.horizontalAdvance(badgePrefix);
             const QString elided = fm.elidedText(rawPreview, Qt::ElideMiddle,
                                                  std::max(24, maxPillW - 2 * hPad - prefixW));
@@ -1838,11 +2517,15 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
             const int pillH = fm.height() + 2 * vPad;
 
             bool bottomBlocked = false;
-            const uint16_t bottomThreshold = (m_rows >= 2) ? static_cast<uint16_t>(m_rows - 2) : 0;
-            for (const auto &span : m_hoveredLink.spans) {
-                if (span.row >= bottomThreshold) {
-                    bottomBlocked = true;
-                    break;
+            if (isImgPill) {
+                bottomBlocked = m_hoveredImage.unionRect.bottom() >= static_cast<qreal>(height() - pillH - 16);
+            } else {
+                const uint16_t bottomThreshold = (m_rows >= 2) ? static_cast<uint16_t>(m_rows - 2) : 0;
+                for (const auto &span : m_hoveredLink.spans) {
+                    if (span.row >= bottomThreshold) {
+                        bottomBlocked = true;
+                        break;
+                    }
                 }
             }
             const int pillY = bottomBlocked ? 8 : std::max(8, height() - pillH - 8);
@@ -1861,7 +2544,7 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
             p.drawText(QRectF(pillRect.left() + hPad, pillRect.top(), prefixW, pillRect.height()),
                        Qt::AlignVCenter | Qt::AlignLeft, badgePrefix);
 
-            p.setPen(QColor(GhosttyUnionTheme::kCyanHex));
+            p.setPen(QColor(isImgPill ? GhosttyUnionTheme::kAmberHex : GhosttyUnionTheme::kCyanHex));
             p.drawText(pillRect.adjusted(hPad + prefixW, 0, -hPad, 0), Qt::AlignVCenter | Qt::AlignLeft, elided);
             p.restore();
         }
@@ -2228,8 +2911,9 @@ void TerminalWidget::updateScrollbarHoverState(const QPointF &pos) {
 }
 
 void TerminalWidget::clearHoveredLink() {
-    if (m_hoveredLink.isValid()) {
+    if (m_hoveredLink.isValid() || m_hoveredImage.isValid()) {
         m_hoveredLink = {};
+        m_hoveredImage = {};
         refreshMouseCursor();
         update();
     }
@@ -2240,24 +2924,33 @@ void TerminalWidget::updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers
     const bool ctrlOnly = (nonKeypadMods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) == Qt::ControlModifier;
 
     GhosttyUnionLink::ResolvedLink resolved;
+    HoveredImageInfo resolvedImg;
     uint16_t col = 0;
     uint16_t row = 0;
     if (m_terminal && m_mouseInside && ctrlOnly && !m_selecting && !m_scrollbarDragging &&
-        !isInScrollbarZone(pos) && strictCellAt(pos, col, row)) {
-        resolved = GhosttyUnionLink::resolveAt(
-            m_terminal, m_cols, m_rows, col, row, m_pwd, /*allowBareCwdFiles=*/true);
+        !isInScrollbarZone(pos)) {
+        if (strictCellAt(pos, col, row)) {
+            resolved = GhosttyUnionLink::resolveAt(
+                m_terminal, m_cols, m_rows, col, row, m_pwd, /*allowBareCwdFiles=*/true);
+        }
+        if (!resolved.isValid()) {
+            resolvedImg = resolveImageAt(pos);
+        }
     }
 
-    bool changed = (resolved.isValid() != m_hoveredLink.isValid());
-    if (!changed && resolved.isValid()) {
-        changed = !resolved.sameDestination(m_hoveredLink) ||
-                  resolved.spans.size() != m_hoveredLink.spans.size() ||
-                  (!resolved.spans.isEmpty() && !m_hoveredLink.spans.isEmpty() &&
-                   (resolved.spans.first().row != m_hoveredLink.spans.first().row ||
-                    resolved.spans.first().startCol != m_hoveredLink.spans.first().startCol));
+    bool linkChanged = (resolved.isValid() != m_hoveredLink.isValid());
+    if (!linkChanged && resolved.isValid()) {
+        linkChanged = !resolved.sameDestination(m_hoveredLink) ||
+                      resolved.spans.size() != m_hoveredLink.spans.size() ||
+                      (!resolved.spans.isEmpty() && !m_hoveredLink.spans.isEmpty() &&
+                       (resolved.spans.first().row != m_hoveredLink.spans.first().row ||
+                        resolved.spans.first().startCol != m_hoveredLink.spans.first().startCol));
     }
-    if (changed) {
+    const bool imgChanged = (resolvedImg.isValid() != m_hoveredImage.isValid()) ||
+                            (resolvedImg.isValid() && !resolvedImg.sameTarget(m_hoveredImage));
+    if (linkChanged || imgChanged) {
         m_hoveredLink = std::move(resolved);
+        m_hoveredImage = resolvedImg;
         refreshMouseCursor();
         update();
     }
@@ -2271,7 +2964,7 @@ void TerminalWidget::refreshMouseCursor() {
         desired = Qt::OpenHandCursor;
     } else if (m_scrollbarDragging || m_scrollbarHovered) {
         desired = Qt::ArrowCursor;
-    } else if (m_hoveredLink.isValid()) {
+    } else if (m_hoveredLink.isValid() || m_hoveredImage.isValid()) {
         desired = Qt::PointingHandCursor;
     } else if (m_terminal) {
         GhosttyMouseShape shape = GHOSTTY_MOUSE_SHAPE_TEXT;
@@ -2348,6 +3041,8 @@ void TerminalWidget::softResetTerminalModes() {
         ghostty_terminal_vt_write(m_terminal, &canByte, 1);
     }
     m_pendingCommandEndSanitize = false;
+    m_oscCaptureState = OscCaptureState::Idle;
+    m_osc1337Buffer.clear();
     m_selecting = false;
     applySoftModeSanitization();
     updateRenderState(true);
@@ -2360,10 +3055,22 @@ void TerminalWidget::resetTerminal() {
     }
     m_hoveredLink = {};
     m_pressedLink = {};
+    m_hoveredImage = {};
+    m_pressedImage = {};
     m_linkClickPending = false;
+    m_imageClickPending = false;
     m_selecting = false;
     m_renderHeld = false;
     m_pendingCommandEndSanitize = false;
+    m_oscCaptureState = OscCaptureState::Idle;
+    m_osc1337Buffer.clear();
+    m_pendingOsc1337Seqs.clear();
+    m_visiblePlacements.clear();
+    m_textureCache.clear();
+    m_lastPlacementsGen = 0;
+    m_lastKittyStorageGen = 0;
+    m_placementsInitialized = false;
+    m_kittyAnimTimer.stop();
     m_renderHoldTimer.stop();
     ghostty_terminal_reset(m_terminal);
     updateRenderState(true);
@@ -2380,6 +3087,45 @@ void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &glob
     const QColor cyanCol(GhosttyUnionTheme::kCyanHex);
     const QColor amberCol(GhosttyUnionTheme::kAmberHex);
     const QColor redCol(GhosttyUnionTheme::kRedOrangeHex);
+
+    const HoveredImageInfo ctxImg = resolveImageAt(localPos);
+    if (ctxImg.isValid()) {
+        const uint32_t imgId = ctxImg.imageId;
+        QAction *inspectImgAct = menu->addAction(
+            GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::InspectImage, goldCol),
+            QStringLiteral("Inspect Image (%1×%2)…\tCtrl+Click")
+                .arg(ctxImg.sourcePixelWidth)
+                .arg(ctxImg.sourcePixelHeight));
+        connect(inspectImgAct, &QAction::triggered, this, [this, imgId]() {
+            inspectKittyImage(imgId);
+        });
+
+        QAction *copyImgAct = menu->addAction(
+            GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::CopyImage, cyanCol),
+            QStringLiteral("Copy Image"));
+        connect(copyImgAct, &QAction::triggered, this, [this, imgId]() {
+            copyKittyImageToClipboard(imgId);
+        });
+
+        QAction *saveImgAct = menu->addAction(
+            GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::SaveImage, amberCol),
+            QStringLiteral("Save Image As…"));
+        connect(saveImgAct, &QAction::triggered, this, [this, imgId]() {
+            const QString picturesDir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+            const QString baseDir = picturesDir.isEmpty() ? m_pwd : picturesDir;
+            const QString suggested = QDir(baseDir).filePath(
+                QStringLiteral("ghostty-union-image-%1.png").arg(imgId));
+            const QString target = QFileDialog::getSaveFileName(
+                this,
+                QStringLiteral("Save Terminal Image"),
+                suggested,
+                QStringLiteral("PNG Image (*.png);;WebP Image (*.webp);;JPEG Image (*.jpg *.jpeg)"));
+            if (!target.isEmpty()) {
+                saveKittyImageToFile(imgId, target);
+            }
+        });
+        menu->addSeparator();
+    }
 
     uint16_t col = 0;
     uint16_t row = 0;
@@ -2540,11 +3286,23 @@ void TerminalWidget::mousePressEvent(QMouseEvent *event) {
                 m_pressedLink = link;
                 m_pressPos = event->position();
                 m_hoveredLink = link;
+                m_hoveredImage = {};
                 refreshMouseCursor();
                 update();
                 event->accept();
                 return;
             }
+        }
+        const HoveredImageInfo imgHit = resolveImageAt(event->position());
+        if (imgHit.isValid()) {
+            m_imageClickPending = true;
+            m_pressedImage = imgHit;
+            m_pressPos = event->position();
+            m_hoveredImage = imgHit;
+            refreshMouseCursor();
+            update();
+            event->accept();
+            return;
         }
     }
 
@@ -2598,6 +3356,19 @@ void TerminalWidget::mouseReleaseEvent(QMouseEvent *event) {
         updateScrollbarHoverState(event->position());
         animateScrollbarHover(m_scrollbarHovered ? 1.0 : 0.0);
         update();
+        event->accept();
+        return;
+    }
+
+    if (m_imageClickPending && event->button() == Qt::LeftButton) {
+        const HoveredImageInfo pressed = m_pressedImage;
+        m_imageClickPending = false;
+        m_pressedImage = {};
+        const HoveredImageInfo released = resolveImageAt(event->position());
+        if (released.isValid() && released.imageId == pressed.imageId) {
+            inspectKittyImage(pressed.imageId);
+        }
+        updateHoveredLink(event->position(), event->modifiers());
         event->accept();
         return;
     }
@@ -2687,6 +3458,16 @@ void TerminalWidget::mouseMoveEvent(QMouseEvent *event) {
         scrollViewportToThumbTop(event->position().y() - m_scrollbarDragGrabOffset);
         event->accept();
         return;
+    }
+
+    if (m_imageClickPending) {
+        if ((event->position() - m_pressPos).manhattanLength() > 6.0) {
+            m_imageClickPending = false;
+            m_pressedImage = {};
+        } else {
+            event->accept();
+            return;
+        }
     }
 
     if (m_linkClickPending) {
@@ -3108,6 +3889,58 @@ void TerminalWidget::clearSelection() const {
 
 namespace {
 
+bool isKittyPlaceholderMark(uint32_t cp) {
+    return QChar::isMark(cp) ||
+           (cp >= 0x0300U && cp <= 0x036FU) ||
+           (cp >= 0x1AB0U && cp <= 0x1AFFU) ||
+           (cp >= 0x1DC0U && cp <= 0x1DFFU) ||
+           (cp >= 0x20D0U && cp <= 0x20FFU) ||
+           (cp >= 0xFE20U && cp <= 0xFE2FU);
+}
+
+QString sanitizeKittyPlaceholdersFromPlainText(const QString &raw) {
+    const char16_t hi = QChar::highSurrogate(kKittyUnicodePlaceholder);
+    if (!raw.contains(QChar(hi))) {
+        return raw;
+    }
+    const QList<uint> ucs4 = raw.toUcs4();
+    std::vector<char32_t> cleaned;
+    cleaned.reserve(static_cast<size_t>(ucs4.size()));
+    bool lineHadPlaceholder = false;
+
+    auto trimTrailingSpaces = [&]() {
+        if (!lineHadPlaceholder) {
+            return;
+        }
+        while (!cleaned.empty() && cleaned.back() == U' ') {
+            cleaned.pop_back();
+        }
+        lineHadPlaceholder = false;
+    };
+
+    for (qsizetype i = 0; i < ucs4.size(); ++i) {
+        const uint32_t cp = ucs4[i];
+        if (cp == kKittyUnicodePlaceholder) {
+            lineHadPlaceholder = true;
+            cleaned.push_back(U' ');
+            while (i + 1 < ucs4.size() && isKittyPlaceholderMark(ucs4[i + 1])) {
+                ++i;
+            }
+            continue;
+        }
+        if (cp == U'\n') {
+            trimTrailingSpaces();
+            cleaned.push_back(U'\n');
+            continue;
+        }
+        cleaned.push_back(static_cast<char32_t>(cp));
+    }
+    trimTrailingSpaces();
+    return cleaned.empty()
+               ? QString()
+               : QString::fromUcs4(cleaned.data(), static_cast<qsizetype>(cleaned.size()));
+}
+
 QString formatTerminalPlainText(GhosttyTerminal terminal, const GhosttySelection *selection) {
     if (!terminal) {
         return {};
@@ -3130,7 +3963,8 @@ QString formatTerminalPlainText(GhosttyTerminal terminal, const GhosttySelection
     size_t len = 0;
     QString out;
     if (ghostty_formatter_format_alloc(formatter, nullptr, &ptr, &len) == GHOSTTY_SUCCESS && ptr && len > 0) {
-        out = QString::fromUtf8(reinterpret_cast<const char *>(ptr), static_cast<qsizetype>(len));
+        out = sanitizeKittyPlaceholdersFromPlainText(
+            QString::fromUtf8(reinterpret_cast<const char *>(ptr), static_cast<qsizetype>(len)));
     }
     if (ptr) {
         ghostty_free(nullptr, ptr, len);
@@ -3274,7 +4108,9 @@ void TerminalWidget::focusInEvent(QFocusEvent *event) {
 void TerminalWidget::focusOutEvent(QFocusEvent *event) {
     QWidget::focusOutEvent(event);
     m_linkClickPending = false;
+    m_imageClickPending = false;
     m_pressedLink = {};
+    m_pressedImage = {};
     if (m_splitDragArmed) {
         const bool wasDragging = m_splitDragging;
         m_splitDragArmed = false;
@@ -3343,6 +4179,614 @@ void TerminalWidget::onCursorBlink() {
     }
 }
 
+void TerminalWidget::onKittyAnimationTimer() {
+    if (!m_terminal || m_renderHeld) {
+        return;
+    }
+    updateRenderState(false);
+    update();
+}
+
+const TerminalWidget::CachedKittyTexture *TerminalWidget::ensureKittyTexture(
+    GhosttyKittyGraphics kg,
+    uint32_t imageId,
+    uint64_t expectedGeneration) {
+    if (!kg || imageId == 0) {
+        return nullptr;
+    }
+
+    if (expectedGeneration != 0) {
+        auto it = m_textureCache.constFind(expectedGeneration);
+        if (it != m_textureCache.constEnd() && it->imageId == imageId && !it->premulImage.isNull()) {
+            return &it.value();
+        }
+    }
+
+    const GhosttyKittyGraphicsImage imgHandle = ghostty_kitty_graphics_image(kg, imageId);
+    if (!imgHandle) {
+        return nullptr;
+    }
+
+    uint64_t actualGen = 0;
+    uint32_t imgW = 0;
+    uint32_t imgH = 0;
+    GhosttyKittyImageFormat fmt = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+    GhosttyString pixels{};
+
+    if (ghostty_kitty_graphics_image_get(imgHandle, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, &actualGen) != GHOSTTY_SUCCESS ||
+        ghostty_kitty_graphics_image_get(imgHandle, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &imgW) != GHOSTTY_SUCCESS ||
+        ghostty_kitty_graphics_image_get(imgHandle, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &imgH) != GHOSTTY_SUCCESS ||
+        ghostty_kitty_graphics_image_get(imgHandle, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT, &fmt) != GHOSTTY_SUCCESS ||
+        ghostty_kitty_graphics_image_get(imgHandle, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS, &pixels) != GHOSTTY_SUCCESS) {
+        return nullptr;
+    }
+
+    if (actualGen == 0 || imgW == 0 || imgH == 0 || imgW > 16384U || imgH > 16384U || !pixels.ptr || pixels.len == 0) {
+        return nullptr;
+    }
+
+    auto existing = m_textureCache.constFind(actualGen);
+    if (existing != m_textureCache.constEnd() && existing->imageId == imageId && !existing->premulImage.isNull()) {
+        return &existing.value();
+    }
+
+    QImage premul;
+    const auto w = static_cast<int>(imgW);
+    const auto h = static_cast<int>(imgH);
+    const size_t pixelCount = static_cast<size_t>(imgW) * static_cast<size_t>(imgH);
+
+    switch (fmt) {
+    case GHOSTTY_KITTY_IMAGE_FORMAT_RGBA: {
+        if (pixels.len < pixelCount * 4ULL) {
+            return nullptr;
+        }
+        const QImage view(pixels.ptr, w, h, w * 4, QImage::Format_RGBA8888);
+        premul = view.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        break;
+    }
+    case GHOSTTY_KITTY_IMAGE_FORMAT_RGB: {
+        if (pixels.len < pixelCount * 3ULL) {
+            return nullptr;
+        }
+        const QImage view(pixels.ptr, w, h, w * 3, QImage::Format_RGB888);
+        premul = view.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        break;
+    }
+    case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY: {
+        if (pixels.len < pixelCount) {
+            return nullptr;
+        }
+        const QImage view(pixels.ptr, w, h, w, QImage::Format_Grayscale8);
+        premul = view.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        break;
+    }
+    case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA: {
+        if (pixels.len < pixelCount * 2ULL) {
+            return nullptr;
+        }
+        QImage rgba(w, h, QImage::Format_RGBA8888);
+        for (int y = 0; y < h; ++y) {
+            uint8_t *dstRow = rgba.scanLine(y);
+            const uint8_t *srcRow = pixels.ptr + static_cast<size_t>(y) * static_cast<size_t>(w) * 2ULL;
+            for (int x = 0; x < w; ++x) {
+                const uint8_t lum = srcRow[x * 2];
+                const uint8_t alpha = srcRow[x * 2 + 1];
+                dstRow[x * 4 + 0] = lum;
+                dstRow[x * 4 + 1] = lum;
+                dstRow[x * 4 + 2] = lum;
+                dstRow[x * 4 + 3] = alpha;
+            }
+        }
+        premul = rgba.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        break;
+    }
+    default:
+        return nullptr;
+    }
+
+    if (premul.isNull()) {
+        return nullptr;
+    }
+
+    CachedKittyTexture entry;
+    entry.imageId = imageId;
+    entry.imageGeneration = actualGen;
+    entry.pixelWidth = w;
+    entry.pixelHeight = h;
+    entry.premulImage = std::move(premul);
+    auto inserted = m_textureCache.insert(actualGen, std::move(entry));
+    return &inserted.value();
+}
+
+void TerminalWidget::pruneKittyTextureCache(GhosttyKittyGraphics kg) {
+    if (m_textureCache.isEmpty()) {
+        return;
+    }
+    if (!kg) {
+        m_textureCache.clear();
+        return;
+    }
+    for (auto it = m_textureCache.begin(); it != m_textureCache.end();) {
+        const GhosttyKittyGraphicsImage img = ghostty_kitty_graphics_image(kg, it->imageId);
+        uint64_t liveGen = 0;
+        if (!img ||
+            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, &liveGen) != GHOSTTY_SUCCESS ||
+            liveGen != it->imageGeneration) {
+            it = m_textureCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void TerminalWidget::refreshImagePlacements(bool forceRebuild) {
+    if (!m_terminal || !m_renderState || !m_imageIter) {
+        return;
+    }
+
+    GhosttyKittyGraphics kg = nullptr;
+    uint64_t storageGen = 0;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &kg) == GHOSTTY_SUCCESS && kg) {
+        ghostty_kitty_graphics_get(kg, GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION, &storageGen);
+    }
+
+    uint64_t placementsGen = 0;
+    ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION, &placementsGen);
+
+    const bool storageChanged = (storageGen != m_lastKittyStorageGen);
+    if (storageChanged) {
+        pruneKittyTextureCache(kg);
+        m_lastKittyStorageGen = storageGen;
+    }
+
+    if (placementsGen == 0 && storageGen == 0) {
+        m_visiblePlacements.clear();
+        m_lastPlacementsGen = 0;
+        m_placementsInitialized = true;
+        return;
+    }
+
+    if (!forceRebuild && m_placementsInitialized && !storageChanged && placementsGen == m_lastPlacementsGen) {
+        // Refresh any active textures whose per-image generation updated (e.g. animation frames)
+        if (kg) {
+            for (const VisibleImagePlacement &pl : m_visiblePlacements) {
+                ensureKittyTexture(kg, pl.imageId, pl.imageGeneration);
+            }
+        }
+        return;
+    }
+
+    m_lastPlacementsGen = placementsGen;
+    m_placementsInitialized = true;
+    m_visiblePlacements.clear();
+
+    if (ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR, &m_imageIter) != GHOSTTY_SUCCESS) {
+        return;
+    }
+
+    const qreal scaleX = static_cast<qreal>(m_cellWidth) / static_cast<qreal>(std::max(1, m_appliedVtCellWidth));
+    const qreal scaleY = static_cast<qreal>(m_cellHeight) / static_cast<qreal>(std::max(1, m_appliedVtCellHeight));
+
+    size_t orderIdx = 0;
+    while (ghostty_render_state_image_iterator_next(m_imageIter)) {
+        VisibleImagePlacement pl;
+        pl.orderIndex = orderIdx++;
+
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL, &pl.protocol);
+        if (pl.protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY) {
+            continue;
+        }
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID, &pl.imageId);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION, &pl.imageGeneration);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER, &pl.layer);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_Z, &pl.z);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL, &pl.viewportCol);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW, &pl.viewportRow);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_COLS, &pl.gridCols);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_ROWS, &pl.gridRows);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X, &pl.cellOffsetX);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y, &pl.cellOffsetY);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH, &pl.pixelWidth);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT, &pl.pixelHeight);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X, &pl.sourceX);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y, &pl.sourceY);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH, &pl.sourceWidth);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT, &pl.sourceHeight);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID, &pl.placementId);
+        ghostty_render_state_image_get(m_imageIter, GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND, &pl.kittyKind);
+
+        if (pl.imageId == 0 || pl.pixelWidth == 0 || pl.pixelHeight == 0 ||
+            pl.sourceWidth == 0 || pl.sourceHeight == 0) {
+            continue;
+        }
+
+        const qreal dstX = static_cast<qreal>(kPadX) +
+                           static_cast<qreal>(pl.viewportCol) * static_cast<qreal>(m_cellWidth) +
+                           static_cast<qreal>(pl.cellOffsetX) * scaleX;
+        const qreal dstY = static_cast<qreal>(kPadY) +
+                           static_cast<qreal>(pl.viewportRow) * static_cast<qreal>(m_cellHeight) +
+                           static_cast<qreal>(pl.cellOffsetY) * scaleY;
+        const qreal dstW = static_cast<qreal>(pl.pixelWidth) * scaleX;
+        const qreal dstH = static_cast<qreal>(pl.pixelHeight) * scaleY;
+        pl.dstRect = QRectF(dstX, dstY, dstW, dstH);
+
+        if (pl.kittyKind == GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL &&
+            pl.gridCols > 0 && pl.gridRows > 0) {
+            const QRectF cellBox(
+                static_cast<qreal>(kPadX) + static_cast<qreal>(pl.viewportCol) * static_cast<qreal>(m_cellWidth),
+                static_cast<qreal>(kPadY) + static_cast<qreal>(pl.viewportRow) * static_cast<qreal>(m_cellHeight),
+                static_cast<qreal>(pl.gridCols) * static_cast<qreal>(m_cellWidth),
+                static_cast<qreal>(pl.gridRows) * static_cast<qreal>(m_cellHeight));
+            pl.hitRect = pl.dstRect.united(cellBox);
+        } else {
+            pl.hitRect = pl.dstRect;
+        }
+
+        if (kg) {
+            ensureKittyTexture(kg, pl.imageId, pl.imageGeneration);
+        }
+        m_visiblePlacements.push_back(pl);
+    }
+
+    std::stable_sort(m_visiblePlacements.begin(), m_visiblePlacements.end(),
+                     [](const VisibleImagePlacement &a, const VisibleImagePlacement &b) {
+                         if (a.layer != b.layer) {
+                             return static_cast<int>(a.layer) < static_cast<int>(b.layer);
+                         }
+                         if (a.z != b.z) {
+                             return a.z < b.z;
+                         }
+                         return a.orderIndex < b.orderIndex;
+                     });
+}
+
+void TerminalWidget::scheduleKittyAnimationTick(bool hasActiveAnim, uint64_t nowMs, uint64_t nextAnimMs) {
+    if (!m_terminal || !hasActiveAnim || m_visiblePlacements.empty()) {
+        m_kittyAnimTimer.stop();
+        return;
+    }
+    const qint64 waitMs = std::clamp<qint64>(
+        static_cast<qint64>(nextAnimMs) - static_cast<qint64>(nowMs), 8, 60000);
+    m_kittyAnimTimer.start(static_cast<int>(waitMs));
+}
+
+void TerminalWidget::drawImagePlacementsLayer(QPainter &p, GhosttyImageLayer layer) {
+    if (m_visiblePlacements.empty()) {
+        return;
+    }
+
+    bool anyInLayer = false;
+    for (const VisibleImagePlacement &pl : m_visiblePlacements) {
+        if (pl.layer == layer) {
+            anyInLayer = true;
+            break;
+        }
+    }
+    if (!anyInLayer) {
+        return;
+    }
+
+    const QRectF gridClip = viewportGridRect();
+    const qreal dpr = std::max(1.0, devicePixelRatioF());
+
+    p.save();
+    p.setClipRect(gridClip);
+
+    for (const VisibleImagePlacement &pl : m_visiblePlacements) {
+        if (pl.layer != layer) {
+            continue;
+        }
+        auto texIt = m_textureCache.constFind(pl.imageGeneration);
+        if (texIt == m_textureCache.constEnd()) {
+            continue;
+        }
+        const QImage &tex = texIt->premulImage;
+        if (tex.isNull()) {
+            continue;
+        }
+
+        const QRectF srcRect(static_cast<qreal>(pl.sourceX),
+                             static_cast<qreal>(pl.sourceY),
+                             static_cast<qreal>(pl.sourceWidth),
+                             static_cast<qreal>(pl.sourceHeight));
+        const qreal devDstW = pl.dstRect.width() * dpr;
+        const qreal devDstH = pl.dstRect.height() * dpr;
+        const bool crispPixelArt = (texIt->pixelWidth <= 32 && texIt->pixelHeight <= 32 &&
+                                    devDstW >= srcRect.width() * 2.0 && devDstH >= srcRect.height() * 2.0);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, !crispPixelArt);
+        p.drawImage(pl.dstRect, tex, srcRect);
+    }
+
+    p.restore();
+}
+
+TerminalWidget::HoveredImageInfo TerminalWidget::resolveImageAt(const QPointF &pos) const {
+    if (m_visiblePlacements.empty()) {
+        return {};
+    }
+    const QRectF gridClip = viewportGridRect();
+    if (!gridClip.contains(pos)) {
+        return {};
+    }
+
+    const VisibleImagePlacement *hit = nullptr;
+    for (auto it = m_visiblePlacements.rbegin(); it != m_visiblePlacements.rend(); ++it) {
+        const QRectF clipped = it->hitRect.intersected(gridClip);
+        if (!clipped.isEmpty() && clipped.contains(pos)) {
+            hit = &(*it);
+            break;
+        }
+    }
+    if (!hit) {
+        return {};
+    }
+
+    HoveredImageInfo info;
+    info.imageId = hit->imageId;
+    info.placementId = hit->placementId;
+    info.kittyKind = hit->kittyKind;
+
+    auto texIt = m_textureCache.constFind(hit->imageGeneration);
+    if (texIt != m_textureCache.constEnd()) {
+        info.sourcePixelWidth = texIt->pixelWidth;
+        info.sourcePixelHeight = texIt->pixelHeight;
+    } else {
+        info.sourcePixelWidth = static_cast<int>(hit->sourceWidth);
+        info.sourcePixelHeight = static_cast<int>(hit->sourceHeight);
+    }
+
+    if (hit->kittyKind == GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL) {
+        QRectF united = hit->hitRect.intersected(gridClip);
+        for (const VisibleImagePlacement &pl : m_visiblePlacements) {
+            if (pl.kittyKind != GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL ||
+                pl.imageId != hit->imageId ||
+                pl.placementId != hit->placementId) {
+                continue;
+            }
+            if (hit->placementId == 0 &&
+                (pl.viewportCol != hit->viewportCol || pl.gridCols != hit->gridCols)) {
+                continue;
+            }
+            united = united.united(pl.hitRect.intersected(gridClip));
+        }
+        info.unionRect = united;
+    } else {
+        info.unionRect = hit->dstRect.intersected(gridClip);
+    }
+    return info;
+}
+
+QImage TerminalWidget::kittyImageById(uint32_t imageId) const {
+    if (!m_terminal || imageId == 0) {
+        return {};
+    }
+    for (auto it = m_textureCache.constBegin(); it != m_textureCache.constEnd(); ++it) {
+        if (it->imageId == imageId && !it->premulImage.isNull()) {
+            return it->premulImage.convertToFormat(QImage::Format_RGBA8888);
+        }
+    }
+    GhosttyKittyGraphics kg = nullptr;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &kg) != GHOSTTY_SUCCESS || !kg) {
+        return {};
+    }
+    auto *mutableSelf = const_cast<TerminalWidget *>(this);
+    const CachedKittyTexture *tex = mutableSelf->ensureKittyTexture(kg, imageId, 0);
+    return (tex && !tex->premulImage.isNull())
+               ? tex->premulImage.convertToFormat(QImage::Format_RGBA8888)
+               : QImage();
+}
+
+bool TerminalWidget::copyKittyImageToClipboard(uint32_t imageId) const {
+    const QImage img = kittyImageById(imageId);
+    if (img.isNull()) {
+        return false;
+    }
+    QClipboard *cb = QApplication::clipboard();
+    if (!cb) {
+        return false;
+    }
+    cb->setImage(img, QClipboard::Clipboard);
+    return true;
+}
+
+bool TerminalWidget::saveKittyImageToFile(uint32_t imageId, const QString &filePath) const {
+    if (filePath.isEmpty()) {
+        return false;
+    }
+    const QImage img = kittyImageById(imageId);
+    if (img.isNull()) {
+        return false;
+    }
+    return img.save(filePath);
+}
+
+void TerminalWidget::inspectKittyImage(uint32_t imageId) {
+    const QImage img = kittyImageById(imageId);
+    if (img.isNull()) {
+        return;
+    }
+    QWidget *hostWindow = window();
+    if (!hostWindow) {
+        hostWindow = this;
+    }
+    if (auto *existing = hostWindow->findChild<QWidget *>(QStringLiteral("imagePreviewLightbox"))) {
+        existing->close();
+    }
+    auto *lightbox = new SolarForgeImageLightbox(img, imageId, this, hostWindow);
+    lightbox->show();
+    lightbox->raise();
+    lightbox->setFocus(Qt::PopupFocusReason);
+}
+
+void TerminalWidget::enqueueOsc1337ImageSequence(const uint8_t *content, size_t len) {
+    if (!content || len < 11) {
+        return;
+    }
+    const QByteArray raw = QByteArray::fromRawData(reinterpret_cast<const char *>(content),
+                                                   static_cast<qsizetype>(len));
+    if (!raw.startsWith("1337;")) {
+        return;
+    }
+    const QByteArray afterCode = raw.mid(5);
+    if (afterCode.size() < 6 || afterCode.left(5).toLower() != "file=") {
+        return;
+    }
+
+    const qsizetype colonIdx = afterCode.indexOf(':', 5);
+    if (colonIdx < 5 || colonIdx + 1 >= afterCode.size()) {
+        return;
+    }
+
+    const QByteArray argsPart = afterCode.mid(5, colonIdx - 5);
+    const QByteArray b64Part = afterCode.mid(colonIdx + 1);
+
+    bool isInline = false;
+    bool preserveAspect = true;
+    bool doNotMoveCursor = false;
+    QByteArray widthSpec;
+    QByteArray heightSpec;
+
+    for (const QByteArray &kv : argsPart.split(';')) {
+        const qsizetype eq = kv.indexOf('=');
+        if (eq <= 0) {
+            continue;
+        }
+        const QByteArray k = kv.left(eq).trimmed();
+        const QByteArray v = kv.mid(eq + 1).trimmed();
+        if (k == "inline") {
+            isInline = (v == "1");
+        } else if (k == "width") {
+            widthSpec = v;
+        } else if (k == "height") {
+            heightSpec = v;
+        } else if (k == "preserveAspectRatio") {
+            preserveAspect = (v != "0");
+        } else if (k == "doNotMoveCursor") {
+            doNotMoveCursor = (v == "1");
+        }
+    }
+    if (!isInline) {
+        return;
+    }
+
+    const QByteArray decodedBytes = QByteArray::fromBase64(b64Part);
+    if (decodedBytes.isEmpty()) {
+        return;
+    }
+
+    QBuffer buf;
+    buf.setData(decodedBytes);
+    if (!buf.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    QImageReader reader(&buf);
+    reader.setAllocationLimit(256);
+    QImage img = reader.read();
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0 ||
+        img.width() > 16384 || img.height() > 16384 ||
+        static_cast<uint64_t>(img.width()) * static_cast<uint64_t>(img.height()) > 64ULL * 1024ULL * 1024ULL) {
+        return;
+    }
+    if (img.format() != QImage::Format_RGBA8888) {
+        img = img.convertToFormat(QImage::Format_RGBA8888);
+    }
+    if (img.isNull()) {
+        return;
+    }
+
+    auto parseDimCells = [&](const QByteArray &spec, int gridMax, int devCellPx) -> uint32_t {
+        const QByteArray s = spec.trimmed().toLower();
+        if (s.isEmpty() || s == "auto") {
+            return 0;
+        }
+        if (s.endsWith("px")) {
+            bool ok = false;
+            const int px = s.left(s.size() - 2).toInt(&ok);
+            if (!ok || px <= 0) {
+                return 0;
+            }
+            return static_cast<uint32_t>(std::clamp((px + std::max(1, devCellPx) - 1) / std::max(1, devCellPx), 1, 1000));
+        }
+        if (s.endsWith('%')) {
+            bool ok = false;
+            const int pct = s.left(s.size() - 1).toInt(&ok);
+            if (!ok || pct <= 0) {
+                return 0;
+            }
+            return static_cast<uint32_t>(std::clamp((std::max(1, gridMax) * pct + 99) / 100, 1, 1000));
+        }
+        bool ok = false;
+        const int cells = s.toInt(&ok);
+        return (ok && cells > 0) ? static_cast<uint32_t>(std::clamp(cells, 1, 1000)) : 0U;
+    };
+
+    const int devCw = deviceCellWidth();
+    const int devCh = deviceCellHeight();
+    uint32_t reqCols = parseDimCells(widthSpec, m_cols, devCw);
+    uint32_t reqRows = parseDimCells(heightSpec, m_rows, devCh);
+
+    if (preserveAspect && reqCols > 0 && reqRows > 0) {
+        const double boxPxW = static_cast<double>(reqCols) * static_cast<double>(devCw);
+        const double boxPxH = static_cast<double>(reqRows) * static_cast<double>(devCh);
+        const double imgAspect = static_cast<double>(img.width()) / static_cast<double>(img.height());
+        if (boxPxW / boxPxH > imgAspect) {
+            reqCols = static_cast<uint32_t>(std::max(1, static_cast<int>(std::lround((boxPxH * imgAspect) / devCw))));
+        } else {
+            reqRows = static_cast<uint32_t>(std::max(1, static_cast<int>(std::lround((boxPxW / imgAspect) / devCh))));
+        }
+    }
+
+    const size_t rowBytes = static_cast<size_t>(img.width()) * 4ULL;
+    QByteArray tightRgba(static_cast<qsizetype>(rowBytes * static_cast<size_t>(img.height())), Qt::Uninitialized);
+    if (static_cast<size_t>(img.bytesPerLine()) == rowBytes) {
+        std::memcpy(tightRgba.data(), img.constBits(), static_cast<size_t>(tightRgba.size()));
+    } else {
+        for (int y = 0; y < img.height(); ++y) {
+            std::memcpy(tightRgba.data() + static_cast<qsizetype>(static_cast<size_t>(y) * rowBytes),
+                        img.constScanLine(y),
+                        rowBytes);
+        }
+    }
+
+    const QByteArray rgbaB64 = tightRgba.toBase64();
+    const uint32_t synthId = 0xF0000000U | (++m_nextOsc1337ImageSeq & 0x0FFFFFFFU);
+
+    constexpr qsizetype kChunkSize = 4096;
+    QByteArray apcStream;
+    apcStream.reserve(rgbaB64.size() + 128);
+
+    for (qsizetype offset = 0; offset < rgbaB64.size(); offset += kChunkSize) {
+        const QByteArray slice = rgbaB64.mid(offset, kChunkSize);
+        const bool more = (offset + kChunkSize) < rgbaB64.size();
+        if (offset == 0) {
+            apcStream.append("\x1b_Ga=T,f=32,s=");
+            apcStream.append(QByteArray::number(img.width()));
+            apcStream.append(",v=");
+            apcStream.append(QByteArray::number(img.height()));
+            apcStream.append(",i=");
+            apcStream.append(QByteArray::number(synthId));
+            apcStream.append(",q=2");
+            if (reqCols > 0) {
+                apcStream.append(",c=");
+                apcStream.append(QByteArray::number(reqCols));
+            }
+            if (reqRows > 0) {
+                apcStream.append(",r=");
+                apcStream.append(QByteArray::number(reqRows));
+            }
+            if (doNotMoveCursor) {
+                apcStream.append(",C=1");
+            }
+            apcStream.append(more ? ",m=1;" : ",m=0;");
+        } else {
+            apcStream.append(more ? "\x1b_Gm=1;" : "\x1b_Gm=0;");
+        }
+        apcStream.append(slice);
+        apcStream.append("\x1b\\");
+    }
+    m_pendingOsc1337Seqs.push_back(std::move(apcStream));
+}
+
 // --- Static libghostty-vt C callbacks ---
 
 void TerminalWidget::onWritePty(GhosttyTerminal /*terminal*/, void *userdata, const uint8_t *data, size_t len) {
@@ -3393,8 +4837,8 @@ bool TerminalWidget::onSizeQuery(GhosttyTerminal /*terminal*/, void *userdata, G
     }
     outSize->rows = self->m_rows;
     outSize->columns = self->m_cols;
-    outSize->cell_width = static_cast<uint32_t>(self->m_cellWidth);
-    outSize->cell_height = static_cast<uint32_t>(self->m_cellHeight);
+    outSize->cell_width = static_cast<uint32_t>(self->deviceCellWidth());
+    outSize->cell_height = static_cast<uint32_t>(self->deviceCellHeight());
     return true;
 }
 
@@ -3488,9 +4932,21 @@ void TerminalWidget::onReset(GhosttyTerminal /*terminal*/, void *userdata) {
     }
     self->m_hoveredLink = {};
     self->m_pressedLink = {};
+    self->m_hoveredImage = {};
+    self->m_pressedImage = {};
     self->m_linkClickPending = false;
+    self->m_imageClickPending = false;
     self->m_renderHeld = false;
     self->m_pendingCommandEndSanitize = false;
+    self->m_oscCaptureState = OscCaptureState::Idle;
+    self->m_osc1337Buffer.clear();
+    self->m_pendingOsc1337Seqs.clear();
+    self->m_visiblePlacements.clear();
+    self->m_textureCache.clear();
+    self->m_lastPlacementsGen = 0;
+    self->m_lastKittyStorageGen = 0;
+    self->m_placementsInitialized = false;
+    self->m_kittyAnimTimer.stop();
     self->m_renderHoldTimer.stop();
     self->m_blinkVisible = true;
     self->m_rowCache.clear();

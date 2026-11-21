@@ -1,14 +1,20 @@
 #pragma once
 
+#include <QColor>
 #include <QElapsedTimer>
+#include <QHash>
+#include <QImage>
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPoint>
+#include <QRectF>
 #include <QSize>
 #include <QTimer>
+#include <QVector>
 #include <QWidget>
 
 #include <functional>
+#include <vector>
 #include <ghostty/vt.h>
 
 #include "TerminalLink.h"
@@ -59,6 +65,12 @@ public:
     void zoomReset();
 
     [[nodiscard]] GhosttyUnionLink::ResolvedLink hoveredLink() const { return m_hoveredLink; }
+    [[nodiscard]] int visibleImagePlacementCount() const { return static_cast<int>(m_visiblePlacements.size()); }
+    [[nodiscard]] bool hasHoveredImage() const { return m_hoveredImage.isValid(); }
+    [[nodiscard]] QImage kittyImageById(uint32_t imageId) const;
+    bool copyKittyImageToClipboard(uint32_t imageId) const;
+    bool saveKittyImageToFile(uint32_t imageId, const QString &filePath) const;
+    void inspectKittyImage(uint32_t imageId);
     void setUnfocusedSplitDimmed(bool dimmed);
     [[nodiscard]] bool isUnfocusedSplitDimmed() const { return m_unfocusedSplitDimmed; }
     void setActiveSplitAccent(bool active);
@@ -104,8 +116,15 @@ private Q_SLOTS:
     void onPtyReadable();
     void onRenderHoldTimeout();
     void onCursorBlink();
+    void onKittyAnimationTimer();
 
 private:
+    struct BgRun {
+        int startCol = 0;
+        int endCol = 0; // exclusive
+        QColor color;
+    };
+
     struct CachedRow {
         uint64_t idBits0 = 0;
         uint64_t idBits1 = 0;
@@ -113,7 +132,58 @@ private:
         int selEnd = -1;
         qreal dpr = 0.0;
         bool valid = false;
+        std::vector<BgRun> bgRuns;
         QPixmap pixmap;
+    };
+
+    struct VisibleImagePlacement {
+        GhosttyImageProtocol protocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
+        uint32_t imageId = 0;
+        uint64_t imageGeneration = 0;
+        GhosttyImageLayer layer = GHOSTTY_IMAGE_LAYER_BELOW_TEXT;
+        int32_t z = -1;
+        int32_t viewportCol = 0;
+        int32_t viewportRow = 0;
+        uint32_t gridCols = 0;
+        uint32_t gridRows = 0;
+        uint32_t cellOffsetX = 0;
+        uint32_t cellOffsetY = 0;
+        uint32_t pixelWidth = 0;
+        uint32_t pixelHeight = 0;
+        uint32_t sourceX = 0;
+        uint32_t sourceY = 0;
+        uint32_t sourceWidth = 0;
+        uint32_t sourceHeight = 0;
+        uint32_t placementId = 0;
+        GhosttyRenderStateKittyPlacementKind kittyKind = GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED;
+        size_t orderIndex = 0;
+        QRectF dstRect;
+        QRectF hitRect;
+    };
+
+    struct HoveredImageInfo {
+        uint32_t imageId = 0;
+        uint32_t placementId = 0;
+        GhosttyRenderStateKittyPlacementKind kittyKind = GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED;
+        int sourcePixelWidth = 0;
+        int sourcePixelHeight = 0;
+        QRectF unionRect;
+
+        [[nodiscard]] bool isValid() const { return imageId != 0 && !unionRect.isEmpty(); }
+        [[nodiscard]] bool sameTarget(const HoveredImageInfo &other) const {
+            return imageId == other.imageId &&
+                   placementId == other.placementId &&
+                   kittyKind == other.kittyKind &&
+                   unionRect == other.unionRect;
+        }
+    };
+
+    struct CachedKittyTexture {
+        uint32_t imageId = 0;
+        uint64_t imageGeneration = 0;
+        int pixelWidth = 0;
+        int pixelHeight = 0;
+        QImage premulImage;
     };
 
     bool initGhostty();
@@ -149,6 +219,25 @@ private:
     void animateSplitGrip(qreal target);
     void updateHoveredLink(const QPointF &pos, Qt::KeyboardModifiers mods);
     void clearHoveredLink();
+    [[nodiscard]] HoveredImageInfo resolveImageAt(const QPointF &pos) const;
+    [[nodiscard]] QRectF viewportGridRect() const;
+    [[nodiscard]] int deviceCellWidth() const;
+    [[nodiscard]] int deviceCellHeight() const;
+    void refreshImagePlacements(bool forceRebuild);
+    const CachedKittyTexture *ensureKittyTexture(GhosttyKittyGraphics kg,
+                                                 uint32_t imageId,
+                                                 uint64_t expectedGeneration);
+    enum class OscCaptureState : uint8_t {
+        Idle = 0,
+        CheckingPrefix = 1,
+        Capturing1337File = 2,
+    };
+
+    void pruneKittyTextureCache(GhosttyKittyGraphics kg);
+    void scheduleKittyAnimationTick(bool hasActiveAnim, uint64_t nowMs, uint64_t nextAnimMs);
+    void drawImagePlacementsLayer(QPainter &p, GhosttyImageLayer layer);
+    void appendOscCaptureBytes(const uint8_t *bytes, size_t count);
+    void enqueueOsc1337ImageSequence(const uint8_t *content, size_t len);
     void refreshMouseCursor();
     void activateLink(const GhosttyUnionLink::ResolvedLink &link) const;
     void showContextMenu(const QPointF &localPos, const QPoint &globalPos);
@@ -175,6 +264,7 @@ private:
     GhosttyRenderState m_renderState = nullptr;
     GhosttyRenderStateRowIterator m_rowIter = nullptr;
     GhosttyRenderStateRowCells m_cellsIter = nullptr;
+    GhosttyRenderStateImageIterator m_imageIter = nullptr;
     GhosttyKeyEncoder m_keyEncoder = nullptr;
     GhosttyKeyEvent m_keyEvent = nullptr;
     GhosttyMouseEncoder m_mouseEncoder = nullptr;
@@ -208,6 +298,8 @@ private:
     uint16_t m_appliedPtyRows = 0;
     int m_appliedCellWidth = 0;
     int m_appliedCellHeight = 0;
+    int m_appliedVtCellWidth = 9;
+    int m_appliedVtCellHeight = 19;
     static constexpr int kPadX = 6;
     static constexpr int kPadY = 4;
     static constexpr int kPadRight = 12;
@@ -219,12 +311,22 @@ private:
     QTimer m_renderHoldTimer;
     QTimer m_blinkTimer;
     QTimer m_resizeCoalesceTimer;
+    QTimer m_kittyAnimTimer;
     bool m_blinkVisible = true;
     QElapsedTimer m_clock;
 
     bool m_selecting = false;
     QVector<CachedRow> m_rowCache;
     QHash<uint64_t, QPainterPath> m_puaPathCache;
+    QHash<uint64_t, CachedKittyTexture> m_textureCache;
+    std::vector<VisibleImagePlacement> m_visiblePlacements;
+    QVector<QByteArray> m_pendingOsc1337Seqs;
+    QByteArray m_osc1337Buffer;
+    OscCaptureState m_oscCaptureState = OscCaptureState::Idle;
+    uint32_t m_nextOsc1337ImageSeq = 0;
+    uint64_t m_lastPlacementsGen = 0;
+    uint64_t m_lastKittyStorageGen = 0;
+    bool m_placementsInitialized = false;
     GhosttyRenderStateCursor m_cursor = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
     GhosttyRenderStateColors m_colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
     GhosttyTerminalScrollbar m_scrollbar{};
@@ -241,8 +343,11 @@ private:
     bool m_mouseInside = false;
     GhosttyUnionLink::ResolvedLink m_hoveredLink;
     GhosttyUnionLink::ResolvedLink m_pressedLink;
+    HoveredImageInfo m_hoveredImage;
+    HoveredImageInfo m_pressedImage;
     QPointF m_pressPos;
     bool m_linkClickPending = false;
+    bool m_imageClickPending = false;
     bool m_unfocusedSplitDimmed = false;
     bool m_activeSplitAccent = false;
     bool m_splitRearrangeable = false;

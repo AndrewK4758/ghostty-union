@@ -6,6 +6,10 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 
 ### Terminal Engine (`libghostty-vt 1.0+`)
 - **Full VT & protocol support:** Truecolor (24-bit RGB), Ghostty **Ollie** palette, Kitty Keyboard Protocol & `modifyOtherKeys`, SGR mouse tracking, focus events, bracketed paste, synchronized output holds (mode `2026`), and double/dotted/dashed/curly underlines.
+- **Inline graphics & Solar Forge image inspector (Kitty Graphics + iTerm2 `OSC 1337`):**
+  - Full **Kitty Graphics Protocol** rendering (`320 MB` storage budget, direct `t=d`, local file `t=f`, temp file `t=t`, POSIX shared memory `t=s`, `a=f`/`a=a` animations, fixed/relative placements, and `U+10EEEE` virtual Unicode placeholders for TUI avatars/diagrams) plus **iTerm2 `OSC 1337 ; File=inline=1`** support across all Qt6 image formats (PNG, WebP, JPEG, AVIF, JPEG-XL, SVG, GIF, QOI).
+  - **5-layer z-ordered compositing & native HiDPI:** Reports physical device-pixel cell dimensions (`TIOCSWINSZ` / `XTWINOPS`) for crisp 1:1 HiDPI rasterization, composites `BELOW_BACKGROUND` / cell BGs / `BELOW_TEXT` / foreground text / `ABOVE_TEXT` layers accurately, and strips `U+10EEEE` placeholder diacritics when copying plain-text selections.
+  - **Interactive image UX:** Right-click any inline image for **Inspect Image…**, **Copy Image**, or **Save Image As…**, or `Ctrl+Hover` / `Ctrl+Click` to open the zoomable, pannable **Solar Forge Image Inspector** lightbox.
 - **High-throughput rendering:** Per-row `QPixmap` cache keyed by `libghostty-vt` dirty state and selection range, 50,000-line / 50 MiB scrollback buffer, HiDPI-snapped font metrics (`FiraCode Nerd Font SemBd` with monospace fallback), and an animated interactive scrollbar gutter.
 - **Shell integration & link handling:**
   - Auto-detects `xterm-ghostty` terminfo (`/usr/share/terminfo/x/xterm-ghostty`, falling back to `xterm-256color`) and Ghostty Zsh shell integration (`/usr/share/ghostty/shell-integration/zsh`) when installed.
@@ -57,6 +61,7 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 | Shortcut | Action |
 |---|---|
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection / Paste clipboard |
+| `Ctrl+Click` (on link or image) | Open hyperlink/`file:line:col`, or open Solar Forge Image Inspector |
 | `Ctrl+Shift+K` | Soft reset terminal input & display modes (keeps scrollback) |
 | `Ctrl+Shift+Up` / `Ctrl+Shift+Down` | Jump to previous / next semantic prompt (`OSC 133`) |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll half-page up / down |
