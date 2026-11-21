@@ -2175,6 +2175,19 @@ private Q_SLOTS:
         QTest::keyClick(lightbox, Qt::Key_Escape);
         QTRY_VERIFY_WITH_TIMEOUT(win.findChild<QWidget *>(QStringLiteral("imagePreviewLightbox")) == nullptr, 2000);
     }
+
+    [[maybe_unused]] static void testConfiguredDesktopLauncherAndWaylandIdentity() {
+        const QByteArray desktopPathBytes = qgetenv("GHOSTTY_UNION_BUILD_DESKTOP");
+        QVERIFY(!desktopPathBytes.isEmpty());
+        QFile f(QString::fromLocal8Bit(desktopPathBytes));
+        QVERIFY2(f.open(QIODevice::ReadOnly | QIODevice::Text), "Configured ghostty-union.desktop missing");
+        const QString content = QString::fromUtf8(f.readAll());
+        QVERIFY(!content.contains(QLatin1String("@GHOSTTY_UNION_")));
+        QVERIFY(content.contains(QLatin1String("TryExec=/")));
+        QVERIFY(content.contains(QLatin1String("Exec=/")));
+        QVERIFY(content.contains(QLatin1String("StartupWMClass=ghostty-union")));
+        QVERIFY(content.contains(QLatin1String("X-TerminalArgDir=--working-directory=")));
+    }
 };
 
 #include "smoke_test.moc"
