@@ -22,7 +22,7 @@ class QSocketNotifier;
 class QVariantAnimation;
 
 /**
- * Qt terminal surface widget powered by libghostty-vt (`0.1.0-dev`) and a Linux PTY.
+ * Qt terminal surface widget powered by libghostty-vt (`1.0.1`) and a Linux PTY.
  *
  * Maintains a per-row QPixmap cache keyed by GhosttyRenderStateRowId + selection range,
  * synchronized output holds (mode 2026), Kitty/xterm key encoding, mouse tracking &
@@ -52,6 +52,7 @@ public:
     void pasteText(const QString &text,
                    GhosttyClipboardLocation location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
                    GhosttyPasteSource source = GHOSTTY_PASTE_SOURCE_CLIPBOARD);
+    void softResetTerminalModes();
     void resetTerminal();
     void zoomIn();
     void zoomOut();
@@ -121,6 +122,8 @@ private:
     void ensureShellSpawned();
     void updateFontMetrics();
     void resizeTerminalToWidget();
+    void feedVtStream(const uint8_t *data, size_t len);
+    void applySoftModeSanitization();
     void flushPtyBytes(const uint8_t *data, size_t len) const;
     void updateRenderState(bool forceAllDirty = false);
     void renderRowToCache(int y, GhosttyRenderStateRowIterator rowIter,
@@ -212,6 +215,7 @@ private:
     static constexpr int kScrollbarMarginY = 4;
 
     bool m_renderHeld = false;
+    bool m_pendingCommandEndSanitize = false;
     QTimer m_renderHoldTimer;
     QTimer m_blinkTimer;
     QTimer m_resizeCoalesceTimer;
