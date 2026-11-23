@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "Theme.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -8,6 +9,8 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QStandardPaths>
+#include <QTextStream>
+#include <optional>
 #include <signal.h>
 
 namespace {
@@ -66,10 +69,26 @@ int main(int argc, char *argv[]) {
     const QCommandLineOption cwdOpt(QStringList{QStringLiteral("working-directory"), QStringLiteral("d")},
                               QStringLiteral("Initial working directory"),
                               QStringLiteral("dir"));
+    const QCommandLineOption themeOpt(QStringList{QStringLiteral("theme"), QStringLiteral("t")},
+                              QStringLiteral("Terminal color theme (solar-forge, ollie)"),
+                              QStringLiteral("name"));
     parser.addOption(cwdOpt);
+    parser.addOption(themeOpt);
     parser.process(app);
 
-    MainWindow win(parser.value(cwdOpt));
+    std::optional<GhosttyUnionTheme::TerminalThemeId> themeOverride;
+    if (parser.isSet(themeOpt)) {
+        bool ok = false;
+        const auto parsed = GhosttyUnionTheme::parseTerminalThemeId(parser.value(themeOpt), &ok);
+        if (ok) {
+            themeOverride = parsed;
+        } else {
+            QTextStream(stderr) << "ghostty-union: unknown theme '" << parser.value(themeOpt)
+                                << "' (available: solar-forge, ollie); using default.\n";
+        }
+    }
+
+    MainWindow win(parser.value(cwdOpt), nullptr, themeOverride);
     win.setWindowIcon(appIcon);
     win.show();
     return QApplication::exec();

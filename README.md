@@ -1,11 +1,11 @@
 # Ghostty Union
 
-A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge / Ghostty Ollie** cockpit UI, dynamic nested split trees with drag-and-drop rearrangement, and a mounted **74px live system telemetry bar**.
+A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge** cockpit UI and default terminal palette (with built-in **Ollie** theme switching), dynamic nested split trees with drag-and-drop rearrangement, and a mounted **74px live system telemetry bar**.
 
 ## Features
 
 ### Terminal Engine (`libghostty-vt 1.0+`)
-- **Full VT & protocol support:** Truecolor (24-bit RGB), Ghostty **Ollie** palette, Kitty Keyboard Protocol & `modifyOtherKeys`, SGR mouse tracking, focus events, bracketed paste, synchronized output holds (mode `2026`), and double/dotted/dashed/curly underlines.
+- **Full VT & protocol support:** Truecolor (24-bit RGB), built-in **Solar Forge** (default) and Ghostty **Ollie** palettes (switchable live via right-click **Terminal Theme** menu, persisted in settings, or overridden via `--theme solar-forge|ollie`), Kitty Keyboard Protocol & `modifyOtherKeys`, SGR mouse tracking, focus events, bracketed paste, synchronized output holds (mode `2026`), and double/dotted/dashed/curly underlines.
 - **Inline graphics & Solar Forge image inspector (Kitty Graphics + iTerm2 `OSC 1337`):**
   - Full **Kitty Graphics Protocol** rendering (`320 MB` storage budget, direct `t=d`, local file `t=f`, temp file `t=t`, POSIX shared memory `t=s`, `a=f`/`a=a` animations, fixed/relative placements, and `U+10EEEE` virtual Unicode placeholders for TUI avatars/diagrams) plus **iTerm2 `OSC 1337 ; File=inline=1`** support across all Qt6 image formats (PNG, WebP, JPEG, AVIF, JPEG-XL, SVG, GIF, QOI).
   - **5-layer z-ordered compositing & native HiDPI:** Reports physical device-pixel cell dimensions (`TIOCSWINSZ` / `XTWINOPS`) for crisp 1:1 HiDPI rasterization, composites `BELOW_BACKGROUND` / cell BGs / `BELOW_TEXT` / foreground text / `ABOVE_TEXT` layers accurately, and strips `U+10EEEE` placeholder diacritics when copying plain-text selections.
@@ -104,23 +104,56 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 - `libksysguard` (development headers + `KSysGuard` CMake config) and optionally `ksystemstats` at runtime
 - `libghostty-vt` >= 1.0 (headers + `libghostty-vt.so.1`; discovered via `ghostty-vt-config.cmake` or `/usr[/local]/{include,lib}`)
 
-#### Arch Linux
+#### Arch Linux (Native or WSL2)
 ```bash
 sudo pacman -S --needed cmake base-devel qt6-base libksysguard ksystemstats libghostty-vt
 ```
-*(Optional for shell integration and icons: `ghostty-shell-integration ghostty-terminfo ttf-firacode-nerd`)*
+*(Optional for shell integration and icons: `ghostty-shell-integration ghostty-terminfo ttf-firacode-nerd`. If you prefer to build `libghostty-vt` from source instead of using the repo package, omit `libghostty-vt` and follow the from-source steps below.)*
 
-#### Fedora (41+)
+#### Fedora (41+, Native or WSL2)
 ```bash
-sudo dnf install cmake gcc-c++ qt6-qtbase-devel libksysguard-devel ksystemstats
-# Then build/install libghostty-vt >= 1.0 from ghostty-org/ghostty into /usr/local
+sudo dnf install cmake gcc-c++ git qt6-qtbase-devel libksysguard-devel ksystemstats
+# Install Zig (or use the official Zig tarball matching ghostty's build.zig.zon minimum_zig_version)
+sudo dnf install zig
+```
+Then build and install `libghostty-vt` from source (see below).
+
+#### Debian (13/Trixie+) / Ubuntu (25.04+, Native or WSL2)
+```bash
+sudo apt update
+sudo apt install cmake g++ git qt6-base-dev libksysguard-dev ksystemstats
+```
+Install a Zig toolchain matching `ghostty`'s `build.zig.zon` (`minimum_zig_version`), then build and install `libghostty-vt` from source (see below).
+
+> **Note for Ubuntu 24.04 LTS:** Ubuntu 24.04 ships Qt 6.4, which is below the `Qt6 6.8+` requirement in `CMakeLists.txt`. Use **Ubuntu 25.04+**, **Debian 13 (Trixie)+**, **Fedora 41+**, or **Arch Linux** (native or WSL2).
+
+### Building `libghostty-vt` from Source
+
+Needed on **Fedora**, **Debian**, and **Ubuntu** (and optional on **Arch** if not installing the `libghostty-vt` package). Works identically on native Linux and WSL2:
+
+```bash
+git clone https://github.com/ghostty-org/ghostty.git
+cd ghostty
+# Check required Zig version in build.zig.zon if your distro's zig is older
+zig build -Demit-lib-vt -Doptimize=ReleaseFast --prefix /tmp/libghostty-vt-stage
+sudo cp -a /tmp/libghostty-vt-stage/. /usr/local/
+sudo ldconfig
 ```
 
-#### Debian (13/Trixie+) / Ubuntu (25.04+)
+To install `libghostty-vt` without `sudo` into `~/.local` instead:
 ```bash
-sudo apt install cmake g++ qt6-base-dev libksysguard-dev ksystemstats
-# Then build/install libghostty-vt >= 1.0 from ghostty-org/ghostty into /usr/local
+zig build -Demit-lib-vt -Doptimize=ReleaseFast --prefix "$HOME/.local"
 ```
+Then pass `-DCMAKE_PREFIX_PATH="$HOME/.local"` when configuring `ghostty-union` below (and ensure `~/.local/lib` is in your runtime linker path or `CMAKE_INSTALL_RPATH`).
+
+### WSL2 / WSLg Notes
+
+`ghostty-union` runs inside **WSL2 with no Linux desktop environment** as long as **WSLg** is enabled (default on Windows 11 and modern Windows 10 WSL2):
+
+- **No `zsh`, Ghostty, KDE Plasma, or `ksystemstats` required:** It launches `$SHELL` (falling back to `/bin/bash` → `/bin/zsh` → `/bin/sh` if `$SHELL` is unset) and falls back to `TERM=xterm-256color` when Ghostty terminfo/shell-integration is absent.
+- **Telemetry bar in WSL2:** Without a running `ksystemstats` daemon on session D-Bus, CPU/RAM/GPU/NET throughput cards show `--` while the terminal, clock, and IP readouts work normally. Hardware temperature sensors and `/proc/driver/nvidia/gpus` are typically unavailable inside the WSL2 VM.
+- **Qt backend toggle under WSLg:** If Wayland window decorations or HiDPI scaling look off under WSLg, launch with `QT_QPA_PLATFORM=xcb ghostty-union` (or `QT_QPA_PLATFORM=wayland`).
+- **Opening links in Windows:** Install `wslu` so `xdg-open` delegates `Ctrl+Click` URLs to your Windows browser.
 
 ### Configure, Build, and Test
 
@@ -150,9 +183,11 @@ sudo cmake --install build --prefix /usr/local
 ## CLI Usage
 
 ```bash
-ghostty-union                         # Launch in current working directory
+ghostty-union                         # Launch in current working directory (Solar Forge or saved theme)
 ghostty-union -d /path/to/dir         # Launch in a specific working directory
 ghostty-union --working-directory ~   # Long flag equivalent
+ghostty-union -t solar-forge          # Override terminal theme for this window (solar-forge | ollie)
+ghostty-union --theme ollie           # Long flag equivalent
 ghostty-union --help                  # Show CLI options
 ```
 
@@ -174,7 +209,7 @@ ghostty-union --help                  # Show CLI options
 │   ├── TerminalWidget.{h,cpp}  # libghostty-vt surface, PTY, renderer, OSC 133;D sanitization
 │   ├── TerminalLink.{h,cpp} # OSC 8 & regex URL/file:line:col resolver and opener
 │   ├── KeyMap.{h,cpp}       # Qt QKeyEvent -> GhosttyKeyEvent mapping
-│   └── Theme.h              # Solar Forge chrome & Ghostty Ollie color palette
+│   └── Theme.h              # Solar Forge chrome & terminal palettes (Solar Forge, Ollie)
 └── tests/
     └── smoke_test.cpp       # QtTest suite (offscreen QPA)
 ```

@@ -10,11 +10,30 @@
 #include <QPixmap>
 #include <QPointer>
 #include <QPropertyAnimation>
+#include <QSettings>
 #include <QString>
 #include <array>
 #include <ghostty/vt.h>
 
 namespace GhosttyUnionTheme {
+
+enum class TerminalThemeId {
+    SolarForge,
+    Ollie,
+};
+
+struct TerminalPalette {
+    TerminalThemeId id;
+    const char *key;
+    const char *displayName;
+    GhosttyColorRgb background;
+    GhosttyColorRgb foreground;
+    GhosttyColorRgb cursor;
+    GhosttyColorRgb cursorText;
+    GhosttyColorRgb selectionBg;
+    GhosttyColorRgb selectionFg;
+    std::array<GhosttyColorRgb, 16> ansi16;
+};
 
 // Solar Forge semantic accent colors (aligned with kdeglobals & P10k prompt)
 inline constexpr const char *kGoldHex = "#FFD300";
@@ -33,6 +52,33 @@ inline constexpr const char *kChromeCardTopHex = "#292731";
 inline constexpr const char *kChromeCardBotHex = "#1E1D24";
 inline constexpr const char *kChromeBorderHex = "#3E3B36";
 inline constexpr const char *kChromeTextHex = "#F1F0F6";
+
+// Solar Forge embedded terminal palette (aligned with jetbrains-solar-forge-theme)
+inline constexpr GhosttyColorRgb kSolarForgeBackground{0x18, 0x17, 0x16};
+inline constexpr GhosttyColorRgb kSolarForgeForeground{0xe8, 0xe2, 0xd5};
+inline constexpr GhosttyColorRgb kSolarForgeCursor{0xff, 0xd3, 0x00};
+inline constexpr GhosttyColorRgb kSolarForgeCursorText{0x12, 0x11, 0x10};
+inline constexpr GhosttyColorRgb kSolarForgeSelectionBg{0x33, 0x2d, 0x22};
+inline constexpr GhosttyColorRgb kSolarForgeSelectionFg{0xff, 0xff, 0xff};
+
+inline constexpr std::array<GhosttyColorRgb, 16> kSolarForgeAnsi16{{
+    {0x12, 0x11, 0x10}, // 0 black (Warm Tungsten Ash frame)
+    {0xff, 0x53, 0x70}, // 1 red (ERR_RED / CONSOLE_RED_OUTPUT)
+    {0x98, 0xc3, 0x79}, // 2 green (GIT_GREEN / CONSOLE_GREEN_OUTPUT)
+    {0xc9, 0x96, 0x3b}, // 3 yellow (FG_TYPE burnished gold)
+    {0x7a, 0xa2, 0xf7}, // 4 blue (CONSOLE_BLUE_OUTPUT)
+    {0xd4, 0x6b, 0x66}, // 5 magenta (FG_NUM / CONSOLE_MAGENTA_OUTPUT)
+    {0x80, 0xcb, 0xc4}, // 6 cyan (Solar Forge teal)
+    {0xcf, 0xc6, 0xb8}, // 7 white (FG_PROP muted bone)
+    {0x75, 0x70, 0x67}, // 8 bright black (FG_CMT / CONSOLE_GRAY_OUTPUT)
+    {0xff, 0x3d, 0x00}, // 9 bright red (Vermilion Blaze)
+    {0xc3, 0xe8, 0x8d}, // 10 bright green (FILESTATUS_COPIED)
+    {0xff, 0xd3, 0x00}, // 11 bright yellow (Cyber Gold)
+    {0x9a, 0xb8, 0xff}, // 12 bright blue (lifted Solar Forge blue)
+    {0xe0, 0x89, 0x84}, // 13 bright magenta (lifted FG_NUM)
+    {0x7d, 0xcf, 0xff}, // 14 bright cyan (CONSOLE_CYAN_OUTPUT)
+    {0xe8, 0xe2, 0xd5}, // 15 bright white (FG_BONE)
+}};
 
 // Ghostty "Ollie" color palette (verified via `ghostty +list-colors --theme=Ollie`)
 inline constexpr GhosttyColorRgb kOllieBackground{0x22, 0x21, 0x25};
@@ -61,6 +107,81 @@ inline constexpr std::array<GhosttyColorRgb, 16> kOllieAnsi16{{
     {0x5b, 0x6e, 0xa7}, // 15 bright white
 }};
 
+inline constexpr TerminalPalette kSolarForgeTerminalPalette{
+    TerminalThemeId::SolarForge,
+    "solar-forge",
+    "Solar Forge",
+    kSolarForgeBackground,
+    kSolarForgeForeground,
+    kSolarForgeCursor,
+    kSolarForgeCursorText,
+    kSolarForgeSelectionBg,
+    kSolarForgeSelectionFg,
+    kSolarForgeAnsi16,
+};
+
+inline constexpr TerminalPalette kOllieTerminalPalette{
+    TerminalThemeId::Ollie,
+    "ollie",
+    "Ollie",
+    kOllieBackground,
+    kOllieForeground,
+    kOllieCursor,
+    kOllieCursorText,
+    kOllieSelectionBg,
+    kOllieSelectionFg,
+    kOllieAnsi16,
+};
+
+inline constexpr std::array<const TerminalPalette *, 2> kAllTerminalPalettes{{
+    &kSolarForgeTerminalPalette,
+    &kOllieTerminalPalette,
+}};
+
+inline const TerminalPalette &terminalPaletteFor(TerminalThemeId id) {
+    switch (id) {
+    case TerminalThemeId::SolarForge:
+        return kSolarForgeTerminalPalette;
+    case TerminalThemeId::Ollie:
+        return kOllieTerminalPalette;
+    }
+    return kSolarForgeTerminalPalette;
+}
+
+inline TerminalThemeId parseTerminalThemeId(const QString &name, bool *ok = nullptr) {
+    QString normalized;
+    normalized.reserve(name.size());
+    for (const QChar ch : name.trimmed().toLower()) {
+        if (ch.isLetterOrNumber()) {
+            normalized.append(ch);
+        }
+    }
+    if (normalized == QLatin1String("solarforge")) {
+        if (ok) *ok = true;
+        return TerminalThemeId::SolarForge;
+    }
+    if (normalized == QLatin1String("ollie")) {
+        if (ok) *ok = true;
+        return TerminalThemeId::Ollie;
+    }
+    if (ok) *ok = false;
+    return TerminalThemeId::SolarForge;
+}
+
+inline TerminalThemeId loadSavedTerminalTheme() {
+    const QSettings settings;
+    const QString saved = settings.value(QStringLiteral("terminal/theme")).toString();
+    if (saved.isEmpty()) {
+        return TerminalThemeId::SolarForge;
+    }
+    return parseTerminalThemeId(saved);
+}
+
+inline void saveTerminalTheme(TerminalThemeId id) {
+    QSettings settings;
+    settings.setValue(QStringLiteral("terminal/theme"), QString::fromLatin1(terminalPaletteFor(id).key));
+}
+
 inline QColor toQColor(const GhosttyColorRgb &c) {
     return {c.r, c.g, c.b};
 }
@@ -83,6 +204,7 @@ enum class MenuIcon {
     SplitRight,
     SplitDown,
     Rearrange,
+    Palette,
     ResetTerminal,
     CloseTab,
 };
@@ -194,6 +316,15 @@ inline QIcon makeSolarForgeMenuIcon(MenuIcon kind, const QColor &accent = QColor
         p.drawRoundedRect(QRectF(2.5, 9.0, 4.5, 4.5), 1.0, 1.0);
         p.drawRoundedRect(QRectF(9.0, 9.0, 4.5, 4.5), 1.0, 1.0);
         break;
+    case MenuIcon::Palette:
+        p.drawEllipse(QRectF(2.4, 2.4, 11.2, 11.2));
+        p.setBrush(accent);
+        p.setPen(Qt::NoPen);
+        p.drawEllipse(QPointF(6.2, 6.0), 1.15, 1.15);
+        p.drawEllipse(QPointF(9.8, 5.8), 1.15, 1.15);
+        p.drawEllipse(QPointF(5.8, 9.6), 1.15, 1.15);
+        p.drawEllipse(QPointF(10.0, 9.8), 1.15, 1.15);
+        break;
     case MenuIcon::ResetTerminal:
         p.drawArc(QRectF(2.8, 2.8, 10.4, 10.4), 60 * 16, 260 * 16);
         p.drawLine(QPointF(8.0, 2.0), QPointF(8.0, 5.2));
@@ -238,6 +369,18 @@ inline QString solarForgeMenuStyleSheet() {
         "}"
         "QMenu::icon {"
         "  padding-left: 6px;"
+        "}"
+        "QMenu::indicator {"
+        "  width: 10px;"
+        "  height: 10px;"
+        "  margin-left: 6px;"
+        "  border-radius: 5px;"
+        "  border: 1px solid #57524B;"
+        "  background: transparent;"
+        "}"
+        "QMenu::indicator:checked {"
+        "  background: %1;"
+        "  border: 1px solid %1;"
         "}"
         "QMenu::separator {"
         "  height: 1px;"

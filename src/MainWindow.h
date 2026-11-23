@@ -2,8 +2,10 @@
 
 #include <QMainWindow>
 #include <QPointer>
+#include <optional>
 
 #include "TerminalWidget.h"
+#include "Theme.h"
 
 class QTabWidget;
 class StatsBarWidget;
@@ -17,8 +19,13 @@ class MainWindow final : public QMainWindow {
     Q_OBJECT
 
 public:
-    explicit MainWindow(const QString &initialCwd = {}, QWidget *parent = nullptr);
+    explicit MainWindow(const QString &initialCwd = {},
+                        QWidget *parent = nullptr,
+                        std::optional<GhosttyUnionTheme::TerminalThemeId> themeOverride = std::nullopt);
     ~MainWindow() override = default;
+
+    void setTerminalTheme(GhosttyUnionTheme::TerminalThemeId id, bool persist = true);
+    [[nodiscard]] GhosttyUnionTheme::TerminalThemeId terminalTheme() const { return m_themeId; }
 
 protected:
     void changeEvent(QEvent *event) override;
@@ -56,4 +63,5 @@ private:
     TabRenameModalOverlay *m_renameModal = nullptr;
     QPointer<TerminalTabPane> m_pendingClosePane;
     QPointer<TerminalTabPane> m_pendingRenamePane;
+    GhosttyUnionTheme::TerminalThemeId m_themeId = GhosttyUnionTheme::TerminalThemeId::SolarForge;
 };
