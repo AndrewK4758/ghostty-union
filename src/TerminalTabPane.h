@@ -4,6 +4,8 @@
 #include <QSplitter>
 #include <QWidget>
 
+#include "Theme.h"
+
 class QResizeEvent;
 class TerminalWidget;
 
@@ -56,6 +58,8 @@ public:
     bool detachTerminalToNewTab(TerminalWidget *term);
     void toggleZoom();
     void focusActive();
+    void setTerminalTheme(GhosttyUnionTheme::TerminalThemeId id);
+    [[nodiscard]] GhosttyUnionTheme::TerminalThemeId terminalTheme() const { return m_themeId; }
 
     DropZone previewDropZoneForTesting(TerminalWidget *source, const QPoint &globalPos) const;
 
@@ -64,6 +68,7 @@ Q_SIGNALS:
     void emptied(TerminalTabPane *self);
     void detachToNewTabRequested(TerminalWidget *term);
     void renameTabRequested(TerminalTabPane *self);
+    void terminalThemeRequested(GhosttyUnionTheme::TerminalThemeId id);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -101,5 +106,6 @@ private:
     bool m_suppressFocusTracking = false;
     bool m_zoomed = false;
     QString m_customTitle;
+    GhosttyUnionTheme::TerminalThemeId m_themeId = GhosttyUnionTheme::TerminalThemeId::SolarForge;
     DropOverlayWidget *m_dropOverlay = nullptr;
 };

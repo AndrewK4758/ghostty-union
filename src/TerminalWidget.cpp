@@ -3,6 +3,7 @@
 #include "Theme.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QBuffer>
 #include <QClipboard>
@@ -1396,19 +1397,35 @@ bool TerminalWidget::initGhostty() {
 }
 
 void TerminalWidget::applyTerminalPalette() const {
-    constexpr GhosttyColorRgb bg = GhosttyUnionTheme::kOllieBackground;
-    constexpr GhosttyColorRgb fg = GhosttyUnionTheme::kOllieForeground;
-    constexpr GhosttyColorRgb cur = GhosttyUnionTheme::kOllieCursor;
+    const auto &pal = terminalPalette();
+    const GhosttyColorRgb bg = pal.background;
+    const GhosttyColorRgb fg = pal.foreground;
+    const GhosttyColorRgb cur = pal.cursor;
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg);
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg);
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cur);
 
     GhosttyColorRgb palette[256];
     ghostty_color_palette_default(palette);
-    for (size_t i = 0; i < GhosttyUnionTheme::kOllieAnsi16.size(); ++i) {
-        palette[i] = GhosttyUnionTheme::kOllieAnsi16[i];
+    for (size_t i = 0; i < pal.ansi16.size(); ++i) {
+        palette[i] = pal.ansi16[i];
     }
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, palette);
+}
+
+void TerminalWidget::setTerminalTheme(GhosttyUnionTheme::TerminalThemeId id) {
+    if (m_themeId == id) {
+        return;
+    }
+    m_themeId = id;
+    if (m_terminal) {
+        applyTerminalPalette();
+        for (CachedRow &row : m_rowCache) {
+            row.valid = false;
+        }
+        updateRenderState(true);
+        update();
+    }
 }
 
 void TerminalWidget::destroyGhostty() {
@@ -1469,8 +1486,19 @@ bool TerminalWidget::spawnShell(const QString &workingDirectory) {
     ::fcntl(slaveFd, F_SETFD, FD_CLOEXEC);
 
     const QByteArray cwdBytes = workingDirectory.toUtf8();
-    const QByteArray shellEnv = qgetenv("SHELL");
-    const char *shellPath = shellEnv.isEmpty() ? "/bin/zsh" : shellEnv.constData();
+    QByteArray resolvedShell = qgetenv("SHELL");
+    if (resolvedShell.isEmpty()) {
+        for (const char *candidate : {"/bin/bash", "/bin/zsh", "/bin/sh"}) {
+            if (QFileInfo::exists(QString::fromLatin1(candidate))) {
+                resolvedShell = candidate;
+                break;
+            }
+        }
+        if (resolvedShell.isEmpty()) {
+            resolvedShell = QByteArrayLiteral("/bin/sh");
+        }
+    }
+    const char *shellPath = resolvedShell.constData();
 
     const bool hasGhosttyTerminfo = QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty"));
     const QByteArray termEnv = hasGhosttyTerminfo ? QByteArrayLiteral("xterm-ghostty")
@@ -2070,8 +2098,9 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
     }
 
     const QColor defaultBg = GhosttyUnionTheme::toQColor(colors.background);
-    const QColor selBg = GhosttyUnionTheme::toQColor(GhosttyUnionTheme::kOllieSelectionBg);
-    const QColor selFg = GhosttyUnionTheme::toQColor(GhosttyUnionTheme::kOllieSelectionFg);
+    const auto &pal = terminalPalette();
+    const QColor selBg = GhosttyUnionTheme::toQColor(pal.selectionBg);
+    const QColor selFg = GhosttyUnionTheme::toQColor(pal.selectionFg);
 
     pm.fill(Qt::transparent);
     QPainter p(&pm);
@@ -2422,7 +2451,7 @@ void TerminalWidget::paintEvent(QPaintEvent * /*event*/) {
         const int cy = kPadY + static_cast<int>(m_cursor.viewport_y) * m_cellHeight;
         const QColor curCol = m_colors.cursor_has_value
                                   ? GhosttyUnionTheme::toQColor(m_colors.cursor)
-                                  : GhosttyUnionTheme::toQColor(GhosttyUnionTheme::kOllieCursor);
+                                  : GhosttyUnionTheme::toQColor(terminalPalette().cursor);
 
         if (!hasFocus() || m_cursor.visual_style == GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW) {
             p.setPen(curCol);
@@ -3217,6 +3246,27 @@ void TerminalWidget::showContextMenu(const QPointF &localPos, const QPoint &glob
         connect(eqAct, &QAction::triggered, this, &TerminalWidget::equalizeSplitsRequested);
         QAction *detachAct = rearrangeMenu->addAction(QStringLiteral("Move Split to New Tab"));
         connect(detachAct, &QAction::triggered, this, &TerminalWidget::moveToNewTabRequested);
+    }
+
+    menu->addSeparator();
+
+    QMenu *themeMenu = menu->addMenu(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Palette, goldCol),
+        QStringLiteral("Terminal Theme"));
+    themeMenu->setObjectName(QStringLiteral("terminalThemeMenu"));
+    GhosttyUnionTheme::styleSolarForgeMenu(themeMenu);
+    auto *themeGroup = new QActionGroup(themeMenu);
+    themeGroup->setExclusive(true);
+    for (const auto *pal : GhosttyUnionTheme::kAllTerminalPalettes) {
+        QAction *themeAct = themeMenu->addAction(QString::fromLatin1(pal->displayName));
+        themeAct->setCheckable(true);
+        themeAct->setChecked(pal->id == m_themeId);
+        themeGroup->addAction(themeAct);
+        const auto targetId = pal->id;
+        connect(themeAct, &QAction::triggered, this, [this, targetId]() {
+            setTerminalTheme(targetId);
+            Q_EMIT terminalThemeRequested(targetId);
+        });
     }
 
     menu->addSeparator();

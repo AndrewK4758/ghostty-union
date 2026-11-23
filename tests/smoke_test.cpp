@@ -2188,6 +2188,92 @@ private Q_SLOTS:
         QVERIFY(content.contains(QLatin1String("StartupWMClass=ghostty-union")));
         QVERIFY(content.contains(QLatin1String("X-TerminalArgDir=--working-directory=")));
     }
+
+    [[maybe_unused]] static void testTerminalThemeSolarForgeAndSwitching() {
+        using GhosttyUnionTheme::TerminalThemeId;
+
+        bool ok = false;
+        QCOMPARE(GhosttyUnionTheme::parseTerminalThemeId(QStringLiteral("solar-forge"), &ok), TerminalThemeId::SolarForge);
+        QVERIFY(ok);
+        QCOMPARE(GhosttyUnionTheme::parseTerminalThemeId(QStringLiteral("Solar Forge"), &ok), TerminalThemeId::SolarForge);
+        QVERIFY(ok);
+        QCOMPARE(GhosttyUnionTheme::parseTerminalThemeId(QStringLiteral("Ollie"), &ok), TerminalThemeId::Ollie);
+        QVERIFY(ok);
+        QCOMPARE(GhosttyUnionTheme::parseTerminalThemeId(QStringLiteral("unknown-theme"), &ok), TerminalThemeId::SolarForge);
+        QVERIFY(!ok);
+
+        // Standalone TerminalWidget defaults to Solar Forge palette
+        TerminalWidget term(QString(), nullptr, /*startShell=*/false);
+        term.resize(400, 240);
+        term.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&term));
+        term.feedVtBytes(QByteArrayLiteral("hello\r\n"));
+
+        QCOMPARE(term.terminalTheme(), TerminalThemeId::SolarForge);
+        const auto sfColors = term.renderColorsForTesting();
+        QCOMPARE(sfColors.background.r, GhosttyUnionTheme::kSolarForgeBackground.r);
+        QCOMPARE(sfColors.background.g, GhosttyUnionTheme::kSolarForgeBackground.g);
+        QCOMPARE(sfColors.background.b, GhosttyUnionTheme::kSolarForgeBackground.b);
+        QCOMPARE(sfColors.foreground.r, GhosttyUnionTheme::kSolarForgeForeground.r);
+        QCOMPARE(sfColors.foreground.g, GhosttyUnionTheme::kSolarForgeForeground.g);
+        QCOMPARE(sfColors.foreground.b, GhosttyUnionTheme::kSolarForgeForeground.b);
+        QVERIFY(sfColors.cursor_has_value);
+        QCOMPARE(sfColors.cursor.r, GhosttyUnionTheme::kSolarForgeCursor.r);
+        QCOMPARE(sfColors.cursor.g, GhosttyUnionTheme::kSolarForgeCursor.g);
+        QCOMPARE(sfColors.cursor.b, GhosttyUnionTheme::kSolarForgeCursor.b);
+        QCOMPARE(sfColors.palette[9].r, GhosttyUnionTheme::kSolarForgeAnsi16[9].r);
+        QCOMPARE(sfColors.palette[9].g, GhosttyUnionTheme::kSolarForgeAnsi16[9].g);
+        QCOMPARE(sfColors.palette[9].b, GhosttyUnionTheme::kSolarForgeAnsi16[9].b);
+
+        // Switching to Ollie updates libghostty-vt colors live
+        term.setTerminalTheme(TerminalThemeId::Ollie);
+        QCOMPARE(term.terminalTheme(), TerminalThemeId::Ollie);
+        const auto ollieColors = term.renderColorsForTesting();
+        QCOMPARE(ollieColors.background.r, GhosttyUnionTheme::kOllieBackground.r);
+        QCOMPARE(ollieColors.background.g, GhosttyUnionTheme::kOllieBackground.g);
+        QCOMPARE(ollieColors.background.b, GhosttyUnionTheme::kOllieBackground.b);
+        QCOMPARE(ollieColors.cursor.r, GhosttyUnionTheme::kOllieCursor.r);
+        QCOMPARE(ollieColors.cursor.g, GhosttyUnionTheme::kOllieCursor.g);
+        QCOMPARE(ollieColors.cursor.b, GhosttyUnionTheme::kOllieCursor.b);
+
+        // Context menu exposes Terminal Theme submenu with Solar Forge & Ollie
+        QTest::mouseClick(&term, Qt::RightButton, Qt::NoModifier, QPoint(40, 40));
+        QMenu *ctxMenu = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((ctxMenu = term.findChild<QMenu *>(QStringLiteral("terminalContextMenu"))) != nullptr &&
+                                     ctxMenu->isVisible(),
+                                 2000);
+        auto *themeMenu = ctxMenu->findChild<QMenu *>(QStringLiteral("terminalThemeMenu"));
+        QVERIFY(themeMenu != nullptr);
+        QAction *sfAct = nullptr;
+        QAction *ollieAct = nullptr;
+        for (QAction *act : themeMenu->actions()) {
+            if (act->text() == QLatin1String("Solar Forge")) {
+                sfAct = act;
+            } else if (act->text() == QLatin1String("Ollie")) {
+                ollieAct = act;
+            }
+        }
+        QVERIFY(sfAct != nullptr);
+        QVERIFY(ollieAct != nullptr);
+        QVERIFY(!sfAct->isChecked());
+        QVERIFY(ollieAct->isChecked());
+
+        sfAct->trigger();
+        ctxMenu->close();
+        QCOMPARE(term.terminalTheme(), TerminalThemeId::SolarForge);
+
+        // MainWindow propagates theme across splits without mutating user settings when persist=false
+        MainWindow win(QString(), nullptr, TerminalThemeId::Ollie);
+        QCOMPARE(win.terminalTheme(), TerminalThemeId::Ollie);
+        auto *pane = win.findChild<TerminalTabPane *>();
+        QVERIFY(pane != nullptr);
+        QVERIFY(pane->activeTerminal() != nullptr);
+        QCOMPARE(pane->activeTerminal()->terminalTheme(), TerminalThemeId::Ollie);
+
+        win.setTerminalTheme(TerminalThemeId::SolarForge, /*persist=*/false);
+        QCOMPARE(win.terminalTheme(), TerminalThemeId::SolarForge);
+        QCOMPARE(pane->activeTerminal()->terminalTheme(), TerminalThemeId::SolarForge);
+    }
 };
 
 #include "smoke_test.moc"
