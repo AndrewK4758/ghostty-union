@@ -83,7 +83,7 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 | **Linux (POSIX PTY)** | Required | Uses Linux `<pty.h>` (`openpty`, `fork`, `setsid`, `TIOCSCTTY`). macOS and Windows are not currently supported without porting the PTY and telemetry layers. |
 | **Qt 6.8+** (`Core`, `Gui`, `Widgets`, `Network`, `DBus`, `Test`) | Required | Pure Qt6 Widgets app — no dependency on KWin, Plasma Shell, `KXmlGui`, or `KParts`. Older LTS distros (e.g., Ubuntu 24.04 with Qt 6.4) need a newer Qt6 toolchain (Ubuntu 25.04+/26.04, Fedora 41+, Debian 13/Trixie+, Arch, NixOS). |
 | **`libghostty-vt` >= 1.0** | Required | Packaged directly on Arch (`libghostty-vt`). On other Linux distros, build and install `libghostty-vt` from [`ghostty-org/ghostty`](https://github.com/ghostty-org/ghostty) into `/usr` or `/usr/local`. |
-| **`libksysguard`** (`KSysGuard::SystemStats`, `KSysGuard::Formatter`) | Required at build time | Standalone KDE library packaged on most distros (`libksysguard` on Arch, `libksysguard-devel` on Fedora, `libksysguard-dev` on Debian/Ubuntu) without needing a Plasma session. |
+| **`libksysguard`** (`KSysGuard::SystemStats`, `KSysGuard::Formatter`) | Required at build time | Standalone KDE library packaged on most distros (`libksysguard` on Arch, `libksysguard-devel` + `lm_sensors-devel` on Fedora, `libksysguard-dev` + `libsensors-dev` on Debian/Ubuntu) without needing a Plasma session. `KSysGuard::SystemStats` links `libsensors.so` at build time even on WSL2. |
 | **`ksystemstats` daemon** | Optional at runtime | Provides live CPU, RAM, GPU, and network throughput telemetry over session D-Bus (`org.kde.ksystemstats1`) and can run headless under GNOME/Hyprland/Sway/i3. Without it, the terminal works normally and those sensor cards simply show `--`. |
 | **Ghostty terminfo & shell integration** | Optional | Auto-used if `/usr/share/terminfo/x/xterm-ghostty` and `/usr/share/ghostty/shell-integration/zsh` exist; otherwise cleanly falls back to `TERM=xterm-256color`. |
 | **`kate`** | Optional | Used for `Ctrl+Click` on `file:line:col` links if found in `PATH`; otherwise falls back to `xdg-open` (`QDesktopServices`). |
@@ -101,7 +101,7 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 
 - CMake >= 3.24 and a C++20 compiler (GCC or Clang)
 - Qt 6.8+ (`Core`, `Gui`, `Widgets`, `Network`, `DBus`, `Test`)
-- `libksysguard` (development headers + `KSysGuard` CMake config) and optionally `ksystemstats` at runtime
+- `libksysguard` (development headers + `KSysGuard` CMake config), `libsensors` development files (`libsensors-dev` on Debian/Ubuntu, `lm_sensors-devel` on Fedora — required at link time by `KSysGuard::SystemStats`), and optionally `ksystemstats` at runtime
 - `libghostty-vt` >= 1.0 (headers + `libghostty-vt.so.1`; discovered via `ghostty-vt-config.cmake` or `/usr[/local]/{include,lib}`)
 
 #### Arch Linux (Native or WSL2)
@@ -112,18 +112,17 @@ sudo pacman -S --needed cmake base-devel qt6-base libksysguard ksystemstats libg
 
 #### Fedora (41+, Native or WSL2)
 ```bash
-sudo dnf install cmake gcc-c++ git qt6-qtbase-devel libksysguard-devel ksystemstats
-# Install Zig (or use the official Zig tarball matching ghostty's build.zig.zon minimum_zig_version)
-sudo dnf install zig
+sudo dnf install cmake gcc-c++ make git curl tar xz qt6-qtbase-devel libksysguard-devel lm_sensors-devel ksystemstats
 ```
-Then build and install `libghostty-vt` from source (see below).
+Then build and install `libghostty-vt` from source using the official Zig tarball matching `ghostty`'s `build.zig.zon` (`minimum_zig_version`, currently `0.17.1`) as shown below.
 
 #### Debian (13/Trixie+) / Ubuntu (25.04+, Native or WSL2)
 ```bash
 sudo apt update
-sudo apt install cmake g++ git qt6-base-dev libksysguard-dev ksystemstats
+sudo apt install cmake build-essential git curl xz-utils qt6-base-dev libksysguard-dev libsensors-dev ksystemstats
 ```
-Install a Zig toolchain matching `ghostty`'s `build.zig.zon` (`minimum_zig_version`), then build and install `libghostty-vt` from source (see below).
+- **`libsensors-dev` is required even in WSL2:** `libksysguard-dev`'s `KSysGuard::SystemStats` CMake target links against `libsensors.so` at build time, and Debian/Ubuntu do not always pull `libsensors-dev` in automatically with `libksysguard-dev`.
+- **Do not use `apt install zig`:** Debian/Ubuntu repositories ship older Zig releases (e.g. `0.14.x`), which fail to compile `ghostty` (`main` currently requires Zig `0.17.1`, declared in `build.zig.zon`). Fetch the exact official Zig tarball from `ziglang.org` as shown in the next section.
 
 > **Note for Ubuntu 24.04 LTS:** Ubuntu 24.04 ships Qt 6.4, which is below the `Qt6 6.8+` requirement in `CMakeLists.txt`. Use **Ubuntu 25.04+**, **Debian 13 (Trixie)+**, **Fedora 41+**, or **Arch Linux** (native or WSL2).
 
@@ -134,7 +133,19 @@ Needed on **Fedora**, **Debian**, and **Ubuntu** (and optional on **Arch** if no
 ```bash
 git clone https://github.com/ghostty-org/ghostty.git
 cd ghostty
-# Check required Zig version in build.zig.zon if your distro's zig is older
+
+# Download the exact official Zig tarball matching build.zig.zon (currently 0.17.1).
+# Avoid distro packages such as `apt install zig` (0.14.x), which cannot build ghostty.
+ZIG_VERSION="$(sed -n 's/.*\.minimum_zig_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon | head -n 1)"
+test -n "$ZIG_VERSION"
+ARCH="$(uname -m)" # x86_64 or aarch64
+rm -rf "/tmp/zig-${ZIG_VERSION}" && mkdir -p "/tmp/zig-${ZIG_VERSION}"
+curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+  | tar -xJ --strip-components=1 -C "/tmp/zig-${ZIG_VERSION}"
+export PATH="/tmp/zig-${ZIG_VERSION}:$PATH"
+zig version
+
+rm -rf /tmp/libghostty-vt-stage
 zig build -Demit-lib-vt -Doptimize=ReleaseFast --prefix /tmp/libghostty-vt-stage
 sudo cp -a /tmp/libghostty-vt-stage/. /usr/local/
 sudo ldconfig
@@ -150,6 +161,10 @@ Then pass `-DCMAKE_PREFIX_PATH="$HOME/.local"` when configuring `ghostty-union` 
 
 `ghostty-union` runs inside **WSL2 with no Linux desktop environment** as long as **WSLg** is enabled (default on Windows 11 and modern Windows 10 WSL2):
 
+- **WSL2 Debian/Ubuntu install order (for humans or coding agents):**
+  1. Install the `apt` prerequisites above — specifically including **`libsensors-dev`** (required by `KSysGuard::SystemStats` at link time even though WSL2 lacks hardware temperature sensors) along with `curl` and `xz-utils`.
+  2. Build and install `libghostty-vt` using the **official Zig tarball** matching `ghostty`'s `build.zig.zon` (`minimum_zig_version`, currently **`0.17.1`**) via `https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz` — **do not** run `apt install zig` (installs `0.14.x`, which fails).
+  3. Return to the `ghostty-union` checkout and run **Configure, Build, and Test** followed by **Install Binary & Desktop Entry** below.
 - **No `zsh`, Ghostty, KDE Plasma, or `ksystemstats` required:** It launches `$SHELL` (falling back to `/bin/bash` → `/bin/zsh` → `/bin/sh` if `$SHELL` is unset) and falls back to `TERM=xterm-256color` when Ghostty terminfo/shell-integration is absent.
 - **Telemetry bar in WSL2:** Without a running `ksystemstats` daemon on session D-Bus, CPU/RAM/GPU/NET throughput cards show `--` while the terminal, clock, and IP readouts work normally. Hardware temperature sensors and `/proc/driver/nvidia/gpus` are typically unavailable inside the WSL2 VM.
 - **Qt backend toggle under WSLg:** If Wayland window decorations or HiDPI scaling look off under WSLg, launch with `QT_QPA_PLATFORM=xcb ghostty-union` (or `QT_QPA_PLATFORM=wayland`).
