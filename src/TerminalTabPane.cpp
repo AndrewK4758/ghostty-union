@@ -224,8 +224,23 @@ void TerminalTabPane::resizeEvent(QResizeEvent *event) {
 
 TerminalWidget *TerminalTabPane::createTerminal(const QString &cwd) {
     auto *term = new TerminalWidget(cwd, this);
+    term->setTerminalTheme(m_themeId);
     wireTerminal(term);
     return term;
+}
+
+void TerminalTabPane::setTerminalTheme(GhosttyUnionTheme::TerminalThemeId id) {
+    m_themeId = id;
+    if (!m_rootSplitter) {
+        return;
+    }
+    QList<TerminalWidget *> terms;
+    collectTerminals(m_rootSplitter, terms);
+    for (TerminalWidget *term : terms) {
+        if (term) {
+            term->setTerminalTheme(id);
+        }
+    }
 }
 
 void TerminalTabPane::wireTerminal(TerminalWidget *term) {
@@ -272,6 +287,7 @@ void TerminalTabPane::wireTerminal(TerminalWidget *term) {
     connect(term, &TerminalWidget::renameTabRequested, this, [this]() {
         Q_EMIT renameTabRequested(this);
     });
+    connect(term, &TerminalWidget::terminalThemeRequested, this, &TerminalTabPane::terminalThemeRequested);
 }
 
 void TerminalTabPane::recordFocusedTerminal(TerminalWidget *term) {

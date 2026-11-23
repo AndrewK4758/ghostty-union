@@ -1,11 +1,11 @@
 # Ghostty Union
 
-A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge / Ghostty Ollie** cockpit UI, dynamic nested split trees with drag-and-drop rearrangement, and a mounted **74px live system telemetry bar**.
+A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge** cockpit UI and default terminal palette (with built-in **Ollie** theme switching), dynamic nested split trees with drag-and-drop rearrangement, and a mounted **74px live system telemetry bar**.
 
 ## Features
 
 ### Terminal Engine (`libghostty-vt 1.0+`)
-- **Full VT & protocol support:** Truecolor (24-bit RGB), Ghostty **Ollie** palette, Kitty Keyboard Protocol & `modifyOtherKeys`, SGR mouse tracking, focus events, bracketed paste, synchronized output holds (mode `2026`), and double/dotted/dashed/curly underlines.
+- **Full VT & protocol support:** Truecolor (24-bit RGB), built-in **Solar Forge** (default) and Ghostty **Ollie** palettes (switchable live via right-click **Terminal Theme** menu, persisted in settings, or overridden via `--theme solar-forge|ollie`), Kitty Keyboard Protocol & `modifyOtherKeys`, SGR mouse tracking, focus events, bracketed paste, synchronized output holds (mode `2026`), and double/dotted/dashed/curly underlines.
 - **Inline graphics & Solar Forge image inspector (Kitty Graphics + iTerm2 `OSC 1337`):**
   - Full **Kitty Graphics Protocol** rendering (`320 MB` storage budget, direct `t=d`, local file `t=f`, temp file `t=t`, POSIX shared memory `t=s`, `a=f`/`a=a` animations, fixed/relative placements, and `U+10EEEE` virtual Unicode placeholders for TUI avatars/diagrams) plus **iTerm2 `OSC 1337 ; File=inline=1`** support across all Qt6 image formats (PNG, WebP, JPEG, AVIF, JPEG-XL, SVG, GIF, QOI).
   - **5-layer z-ordered compositing & native HiDPI:** Reports physical device-pixel cell dimensions (`TIOCSWINSZ` / `XTWINOPS`) for crisp 1:1 HiDPI rasterization, composites `BELOW_BACKGROUND` / cell BGs / `BELOW_TEXT` / foreground text / `ABOVE_TEXT` layers accurately, and strips `U+10EEEE` placeholder diacritics when copying plain-text selections.
@@ -174,7 +174,7 @@ ghostty-union --help                  # Show CLI options
 │   ├── TerminalWidget.{h,cpp}  # libghostty-vt surface, PTY, renderer, OSC 133;D sanitization
 │   ├── TerminalLink.{h,cpp} # OSC 8 & regex URL/file:line:col resolver and opener
 │   ├── KeyMap.{h,cpp}       # Qt QKeyEvent -> GhosttyKeyEvent mapping
-│   └── Theme.h              # Solar Forge chrome & Ghostty Ollie color palette
+│   └── Theme.h              # Solar Forge chrome & terminal palettes (Solar Forge, Ollie)
 └── tests/
     └── smoke_test.cpp       # QtTest suite (offscreen QPA)
 ```

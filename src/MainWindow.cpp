@@ -1462,8 +1462,11 @@ private:
     std::function<void()> m_onCancel;
 };
 
-MainWindow::MainWindow(const QString &initialCwd, QWidget *parent)
-    : QMainWindow(parent) {
+MainWindow::MainWindow(const QString &initialCwd,
+                       QWidget *parent,
+                       std::optional<GhosttyUnionTheme::TerminalThemeId> themeOverride)
+    : QMainWindow(parent),
+      m_themeId(themeOverride.value_or(GhosttyUnionTheme::loadSavedTerminalTheme())) {
     setWindowTitle(QStringLiteral("ghostty-union"));
     resize(1220, 780);
     setStyleSheet(QStringLiteral("QMainWindow { background-color: %1; }")
@@ -1651,6 +1654,24 @@ void MainWindow::wirePaneSignals(TerminalTabPane *pane) {
             requestRenameTabAt(tabIdx);
         }
     });
+    connect(pane, &TerminalTabPane::terminalThemeRequested, this, [this](GhosttyUnionTheme::TerminalThemeId id) {
+        setTerminalTheme(id, /*persist=*/true);
+    });
+}
+
+void MainWindow::setTerminalTheme(GhosttyUnionTheme::TerminalThemeId id, bool persist) {
+    m_themeId = id;
+    if (persist) {
+        GhosttyUnionTheme::saveTerminalTheme(id);
+    }
+    if (!m_tabs) {
+        return;
+    }
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        if (auto *pane = qobject_cast<TerminalTabPane *>(m_tabs->widget(i))) {
+            pane->setTerminalTheme(id);
+        }
+    }
 }
 
 void MainWindow::addNewTab(const QString &cwd) {
@@ -1665,6 +1686,7 @@ void MainWindow::addNewTab(const QString &cwd) {
     }
 
     auto *pane = new TerminalTabPane(dir, m_tabs);
+    pane->setTerminalTheme(m_themeId);
     wirePaneSignals(pane);
     const int idx = m_tabs->addTab(pane, pane->title());
     m_tabs->setTabToolTip(idx, pane->title());
@@ -1680,6 +1702,7 @@ void MainWindow::adoptTerminalInNewTab(TerminalWidget *term) {
         return;
     }
     auto *pane = new TerminalTabPane(term, m_tabs);
+    pane->setTerminalTheme(m_themeId);
     wirePaneSignals(pane);
     const int idx = m_tabs->addTab(pane, pane->title());
     m_tabs->setTabToolTip(idx, pane->title());
@@ -1942,7 +1965,7 @@ void MainWindow::wireShortcuts() {
 
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), [this]() {
         const QString cwd = currentPane() ? currentPane()->currentWorkingDirectory() : QDir::homePath();
-        auto *win = new MainWindow(cwd);
+        auto *win = new MainWindow(cwd, nullptr, m_themeId);
         win->setAttribute(Qt::WA_DeleteOnClose);
         win->show();
     });

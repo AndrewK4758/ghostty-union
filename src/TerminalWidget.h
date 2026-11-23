@@ -18,6 +18,7 @@
 #include <ghostty/vt.h>
 
 #include "TerminalLink.h"
+#include "Theme.h"
 
 class QClipboard;
 class QDragEnterEvent;
@@ -77,6 +78,12 @@ public:
     void setSplitRearrangeable(bool rearrangeable);
     [[nodiscard]] bool isSplitRearrangeable() const { return m_splitRearrangeable; }
     [[nodiscard]] QRectF splitGripRect() const;
+    void setTerminalTheme(GhosttyUnionTheme::TerminalThemeId id);
+    [[nodiscard]] GhosttyUnionTheme::TerminalThemeId terminalTheme() const { return m_themeId; }
+    [[nodiscard]] const GhosttyUnionTheme::TerminalPalette &terminalPalette() const {
+        return GhosttyUnionTheme::terminalPaletteFor(m_themeId);
+    }
+    [[nodiscard]] GhosttyRenderStateColors renderColorsForTesting() const { return m_colors; }
     void setLinkOpenHandlerForTesting(LinkOpenHandler handler);
     void setPtyOutputSpyForTesting(std::function<void(const QByteArray &)> spy);
 
@@ -94,6 +101,7 @@ Q_SIGNALS:
     void equalizeSplitsRequested();
     void moveToNewTabRequested();
     void renameTabRequested();
+    void terminalThemeRequested(GhosttyUnionTheme::TerminalThemeId id);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -358,6 +366,7 @@ private:
     QPointF m_splitDragStartPos;
     QVariantAnimation *m_splitGripAnim = nullptr;
     qreal m_splitGripProgress = 0.0;
+    GhosttyUnionTheme::TerminalThemeId m_themeId = GhosttyUnionTheme::TerminalThemeId::SolarForge;
     LinkOpenHandler m_linkOpenHandler;
     std::function<void(const QByteArray &)> m_ptyOutputSpy;
 };
