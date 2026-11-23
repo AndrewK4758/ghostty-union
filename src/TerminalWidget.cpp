@@ -1486,8 +1486,19 @@ bool TerminalWidget::spawnShell(const QString &workingDirectory) {
     ::fcntl(slaveFd, F_SETFD, FD_CLOEXEC);
 
     const QByteArray cwdBytes = workingDirectory.toUtf8();
-    const QByteArray shellEnv = qgetenv("SHELL");
-    const char *shellPath = shellEnv.isEmpty() ? "/bin/zsh" : shellEnv.constData();
+    QByteArray resolvedShell = qgetenv("SHELL");
+    if (resolvedShell.isEmpty()) {
+        for (const char *candidate : {"/bin/bash", "/bin/zsh", "/bin/sh"}) {
+            if (QFileInfo::exists(QString::fromLatin1(candidate))) {
+                resolvedShell = candidate;
+                break;
+            }
+        }
+        if (resolvedShell.isEmpty()) {
+            resolvedShell = QByteArrayLiteral("/bin/sh");
+        }
+    }
+    const char *shellPath = resolvedShell.constData();
 
     const bool hasGhosttyTerminfo = QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty"));
     const QByteArray termEnv = hasGhosttyTerminfo ? QByteArrayLiteral("xterm-ghostty")
