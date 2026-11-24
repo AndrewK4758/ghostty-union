@@ -12,7 +12,9 @@
 #include <QStandardPaths>
 #include <QTextStream>
 #include <optional>
+#if !defined(Q_OS_WIN)
 #include <signal.h>
+#endif
 
 namespace {
 
@@ -52,7 +54,9 @@ QIcon resolveAppWindowIcon() {
 } // namespace
 
 int main(int argc, char *argv[]) {
+#if !defined(Q_OS_WIN)
     ::signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Set application & desktop identity BEFORE constructing QApplication so Qt6 Wayland
     // binds xdg_toplevel app_id = "ghostty-union" cleanly on the initial surface commit.

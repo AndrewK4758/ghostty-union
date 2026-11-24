@@ -3,7 +3,9 @@
 #include <QPointer>
 #include <QWidget>
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
 #include <systemstats/SensorInfo.h>
+#endif
 
 class ClockPillWidget;
 class EvenDeltaRowLayout;
@@ -13,9 +15,11 @@ class QPaintEvent;
 class QTimer;
 class StatsCardWidget;
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
 namespace KSysGuard::SystemStats {
 class DBusInterface;
 }
+#endif
 
 /**
  * Visual single-row telemetry bar (`74px`) mounted directly above the terminal tabs.
@@ -80,7 +84,9 @@ protected:
     void paintEvent(QPaintEvent *event) override;
 
 private Q_SLOTS:
+#if GHOSTTY_UNION_USE_KSYSGUARD
     void onNewSensorData(const KSysGuard::SensorDataList &updates);
+#endif
     void refreshDisplay();
     void refreshVpnAndClock();
     void refreshPublicIp();
@@ -102,6 +108,9 @@ private:
     void discoverGpusFromDbus();
     void applyGpuDescriptors(const QList<GpuDescriptor> &gpus);
     void syncSensorSubscriptions();
+#if !GHOSTTY_UNION_USE_KSYSGUARD
+    void pollNativeSensors();
+#endif
     void pushHistorySample();
     void requestPublicIpEndpoint(int endpointIndex);
     void schedulePublicIpRefresh();
@@ -111,7 +120,17 @@ private:
     [[nodiscard]] QString formatRateCompact(const QString &sensorId) const;
     static QString queryIpv4ForInterface(const QString &ifName);
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
     KSysGuard::SystemStats::DBusInterface *m_dbus = nullptr;
+#else
+    quint64 m_prevCpuIdle = 0;
+    quint64 m_prevCpuTotal = 0;
+    bool m_hasPrevCpu = false;
+    quint64 m_prevNetRxBytes = 0;
+    quint64 m_prevNetTxBytes = 0;
+    qint64 m_prevNetSampleMs = 0;
+    bool m_hasPrevNet = false;
+#endif
     QStringList m_baseSensorIds;
     QStringList m_subscribedSensorIds;
     QHash<QString, QVariant> m_values;

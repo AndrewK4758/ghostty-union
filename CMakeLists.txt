@@ -7,19 +7,37 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Network DBus Test)
-find_package(KSysGuard CONFIG REQUIRED)
+if(UNIX AND NOT APPLE)
+    set(GHOSTTY_UNION_LINUX TRUE)
+else()
+    set(GHOSTTY_UNION_LINUX FALSE)
+endif()
+
+if(GHOSTTY_UNION_LINUX)
+    find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Network DBus Test)
+    find_package(KSysGuard CONFIG REQUIRED)
+else()
+    find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Network Test)
+endif()
 
 find_package(ghostty-vt 1.0 CONFIG QUIET)
 if(NOT TARGET ghostty-vt::ghostty-vt)
     find_path(GHOSTTY_VT_INCLUDE_DIR
         NAMES ghostty/vt.h
-        PATHS /usr/include /usr/local/include
+        PATHS
+            "$ENV{GHOSTTY_VT_PREFIX}/include"
+            /usr/include
+            /usr/local/include
+            /opt/homebrew/include
         REQUIRED
     )
     find_library(GHOSTTY_VT_LIBRARY
-        NAMES ghostty-vt
-        PATHS /usr/lib /usr/local/lib
+        NAMES ghostty-vt libghostty-vt
+        PATHS
+            "$ENV{GHOSTTY_VT_PREFIX}/lib"
+            /usr/lib
+            /usr/local/lib
+            /opt/homebrew/lib
         REQUIRED
     )
 endif()
@@ -51,10 +69,34 @@ target_link_libraries(ghostty-union-core PUBLIC
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
-    Qt6::DBus
-    KSysGuard::SystemStats
-    KSysGuard::Formatter
 )
+if(GHOSTTY_UNION_LINUX)
+    target_link_libraries(ghostty-union-core PUBLIC
+        Qt6::DBus
+        KSysGuard::SystemStats
+        KSysGuard::Formatter
+    )
+    target_compile_definitions(ghostty-union-core PUBLIC
+        GHOSTTY_UNION_USE_KSYSGUARD=1
+        GHOSTTY_UNION_USE_DBUS=1
+    )
+else()
+    target_compile_definitions(ghostty-union-core PUBLIC
+        GHOSTTY_UNION_USE_KSYSGUARD=0
+        GHOSTTY_UNION_USE_DBUS=0
+    )
+endif()
+if(WIN32)
+    target_link_libraries(ghostty-union-core PUBLIC
+        iphlpapi
+        kernel32
+    )
+    target_compile_definitions(ghostty-union-core PUBLIC
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _WIN32_WINNT=0x0A00
+    )
+endif()
 if(TARGET ghostty-vt::ghostty-vt)
     target_link_libraries(ghostty-union-core PUBLIC ghostty-vt::ghostty-vt)
 else()
@@ -66,66 +108,80 @@ target_compile_definitions(ghostty-union-core PUBLIC
     QT_NO_KEYWORDS
 )
 
-target_compile_options(ghostty-union-core PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-)
+if(MSVC)
+    set(GHOSTTY_UNION_WARN_FLAGS /W4 /permissive- /Zc:__cplusplus)
+else()
+    set(GHOSTTY_UNION_WARN_FLAGS -Wall -Wextra -Wpedantic)
+endif()
+
+target_compile_options(ghostty-union-core PRIVATE ${GHOSTTY_UNION_WARN_FLAGS})
 
 add_executable(ghostty-union
     src/main.cpp
 )
+if(WIN32)
+    set_target_properties(ghostty-union PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
 target_link_libraries(ghostty-union PRIVATE ghostty-union-core)
-target_compile_options(ghostty-union PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(ghostty-union PRIVATE ${GHOSTTY_UNION_WARN_FLAGS})
 
 enable_testing()
 add_executable(ghostty-union-tests
     tests/smoke_test.cpp
 )
 target_link_libraries(ghostty-union-tests PRIVATE ghostty-union-core Qt6::Test)
-target_compile_options(ghostty-union-tests PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(ghostty-union-tests PRIVATE ${GHOSTTY_UNION_WARN_FLAGS})
 
 include(GNUInstallDirs)
 
 add_test(NAME ghostty_union_smoke COMMAND ghostty-union-tests)
-set_tests_properties(ghostty_union_smoke PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;GHOSTTY_UNION_BUILD_DESKTOP=${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.desktop"
-)
-
-set(GHOSTTY_UNION_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/ghostty-union")
-set(GHOSTTY_UNION_ICON "com.mitchellh.ghostty")
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/ghostty-union.desktop.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.desktop"
-    @ONLY
-)
+if(GHOSTTY_UNION_LINUX)
+    set_tests_properties(ghostty_union_smoke PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;GHOSTTY_UNION_BUILD_DESKTOP=${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.desktop"
+    )
+else()
+    set_tests_properties(ghostty_union_smoke PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+    )
+endif()
 
 install(TARGETS ghostty-union RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghostty-union.svg"
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
 
-# Configure ghostty-union.desktop at `cmake --install` time so `--prefix ~/.local`
-# (which is often absent from KDE Plasma / systemd user session PATH) always embeds
-# the exact absolute binary path in TryExec= and Exec=.
-install(CODE "
-    set(GHOSTTY_UNION_EXEC \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/ghostty-union\")
-    set(GHOSTTY_UNION_ICON \"ghostty-union\")
-    if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
-        if(EXISTS \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/icons/candy-icons/apps/scalable/com.mitchellh.ghostty.svg\"
-           OR EXISTS \"/usr/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png\"
-           OR EXISTS \"/usr/share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png\")
-            set(GHOSTTY_UNION_ICON \"com.mitchellh.ghostty\")
-        endif()
-    endif()
+if(GHOSTTY_UNION_LINUX)
+    set(GHOSTTY_UNION_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/ghostty-union")
+    set(GHOSTTY_UNION_ICON "com.mitchellh.ghostty")
     configure_file(
-        \"${CMAKE_CURRENT_SOURCE_DIR}/ghostty-union.desktop.in\"
-        \"${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.install.desktop\"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ghostty-union.desktop.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.desktop"
         @ONLY
     )
-    file(INSTALL
-        DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/applications\"
-        TYPE FILE
-        RENAME \"ghostty-union.desktop\"
-        FILES \"${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.install.desktop\"
-    )
-")
+
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/ghostty-union.svg"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps")
+
+    # Configure ghostty-union.desktop at `cmake --install` time so `--prefix ~/.local`
+    # (which is often absent from KDE Plasma / systemd user session PATH) always embeds
+    # the exact absolute binary path in TryExec= and Exec=.
+    install(CODE "
+        set(GHOSTTY_UNION_EXEC \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/ghostty-union\")
+        set(GHOSTTY_UNION_ICON \"ghostty-union\")
+        if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
+            if(EXISTS \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/icons/candy-icons/apps/scalable/com.mitchellh.ghostty.svg\"
+               OR EXISTS \"/usr/share/icons/hicolor/512x512/apps/com.mitchellh.ghostty.png\"
+               OR EXISTS \"/usr/share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png\")
+                set(GHOSTTY_UNION_ICON \"com.mitchellh.ghostty\")
+            endif()
+        endif()
+        configure_file(
+            \"${CMAKE_CURRENT_SOURCE_DIR}/ghostty-union.desktop.in\"
+            \"${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.install.desktop\"
+            @ONLY
+        )
+        file(INSTALL
+            DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/applications\"
+            TYPE FILE
+            RENAME \"ghostty-union.desktop\"
+            FILES \"${CMAKE_CURRENT_BINARY_DIR}/ghostty-union.install.desktop\"
+        )
+    ")
+endif()

@@ -15,6 +15,10 @@
 
 #include <functional>
 #include <vector>
+#ifdef Q_OS_WIN
+#include <atomic>
+#include <thread>
+#endif
 #include <ghostty/vt.h>
 
 #include "TerminalLink.h"
@@ -122,7 +126,9 @@ protected:
     bool focusNextPrevChild(bool next) override;
 
 private Q_SLOTS:
+#ifndef Q_OS_WIN
     void onPtyReadable();
+#endif
     void onRenderHoldTimeout();
     void onCursorBlink();
     void onKittyAnimationTimer();
@@ -197,8 +203,13 @@ private:
 
     bool initGhostty();
     void destroyGhostty();
+    [[nodiscard]] bool hasActivePty() const;
     bool spawnShell(const QString &workingDirectory);
     void ensureShellSpawned();
+#ifdef Q_OS_WIN
+    void onWindowsPtyData(const QByteArray &data);
+    void onWindowsPtyExited(int exitCode);
+#endif
     void updateFontMetrics();
     void resizeTerminalToWidget();
     void feedVtStream(const uint8_t *data, size_t len);
@@ -283,9 +294,18 @@ private:
     GhosttySelectionGestureEvent m_dragEvent = nullptr;
     GhosttySelectionGestureEvent m_releaseEvent = nullptr;
 
+#ifdef Q_OS_WIN
+    void *m_conpty = nullptr;
+    void *m_ptyInWrite = nullptr;
+    void *m_ptyOutRead = nullptr;
+    void *m_childProcess = nullptr;
+    std::thread m_ptyReadThread;
+    std::atomic<bool> m_ptyStopRequested{false};
+#else
     int m_ptyMasterFd = -1;
     pid_t m_childPid = -1;
     QSocketNotifier *m_ptyNotifier = nullptr;
+#endif
     bool m_exitedEmitted = false;
     bool m_startShellPending = false;
 
