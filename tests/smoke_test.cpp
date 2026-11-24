@@ -2274,6 +2274,206 @@ private Q_SLOTS:
         QCOMPARE(win.terminalTheme(), TerminalThemeId::SolarForge);
         QCOMPARE(pane->activeTerminal()->terminalTheme(), TerminalThemeId::SolarForge);
     }
+
+    [[maybe_unused]] static void testSessionStateJsonAndSplitTreeRestore() {
+        using namespace GhosttyUnionSession;
+
+        QTemporaryDir rootTmp;
+        QVERIFY(rootTmp.isValid());
+        const QString dirA = QDir(rootTmp.path()).filePath(QStringLiteral("alpha"));
+        const QString dirB = QDir(rootTmp.path()).filePath(QStringLiteral("beta"));
+        const QString dirC = QDir(rootTmp.path()).filePath(QStringLiteral("gamma"));
+        QVERIFY(QDir().mkpath(dirA));
+        QVERIFY(QDir().mkpath(dirB));
+        QVERIFY(QDir().mkpath(dirC));
+
+        // Missing directory falls back to home
+        const QString missingDir = QDir(rootTmp.path()).filePath(QStringLiteral("does-not-exist"));
+        QCOMPARE(resolveRestoredCwd(missingDir), QDir::homePath());
+        QCOMPARE(resolveRestoredCwd(dirA), QFileInfo(dirA).absoluteFilePath());
+
+        // Build nested horizontal + vertical split tree across 2 tabs
+        SessionSplitNode leafA{SessionSplitNode::Type::Terminal, dirA, false, Qt::Horizontal, {}, {}};
+        SessionSplitNode leafB{SessionSplitNode::Type::Terminal, dirB, true, Qt::Horizontal, {}, {}};
+        SessionSplitNode leafC{SessionSplitNode::Type::Terminal, dirC, false, Qt::Horizontal, {}, {}};
+
+        SessionSplitNode rightVert;
+        rightVert.type = SessionSplitNode::Type::Split;
+        rightVert.orientation = Qt::Vertical;
+        rightVert.ratios = {0.35, 0.65};
+        rightVert.children = {leafB, leafC};
+
+        SessionSplitNode tab0Root;
+        tab0Root.type = SessionSplitNode::Type::Split;
+        tab0Root.orientation = Qt::Horizontal;
+        tab0Root.ratios = {0.4, 0.6};
+        tab0Root.children = {leafA, rightVert};
+
+        SessionTabState tab0;
+        tab0.customTitle = QStringLiteral("Workspace");
+        tab0.zoomed = false;
+        tab0.root = tab0Root;
+
+        SessionTabState tab1;
+        tab1.customTitle = QStringLiteral("Logs");
+        tab1.root = SessionSplitNode{SessionSplitNode::Type::Terminal, dirC, true, Qt::Horizontal, {}, {}};
+
+        SessionWindowState winState;
+        winState.activeTabIndex = 0;
+        winState.tabs = {tab0, tab1};
+
+        SessionState session;
+        session.version = 1;
+        session.windows = {winState};
+
+        const QString sessionPath = QDir(rootTmp.path()).filePath(QStringLiteral("session.json"));
+        QVERIFY(saveToFile(session, sessionPath));
+
+        const auto loaded = loadFromFile(sessionPath);
+        QVERIFY(loaded.has_value());
+        QCOMPARE(loaded->windows.size(), 1);
+        QCOMPARE(loaded->windows[0].tabs.size(), 2);
+        QCOMPARE(loaded->windows[0].tabs[0].customTitle, QStringLiteral("Workspace"));
+        QCOMPARE(loaded->windows[0].tabs[0].terminalCount(), 3);
+        QCOMPARE(loaded->windows[0].tabs[0].root.orientation, Qt::Horizontal);
+        QCOMPARE(loaded->windows[0].tabs[0].root.children.size(), 2);
+        QCOMPARE(loaded->windows[0].tabs[0].root.children[1].orientation, Qt::Vertical);
+
+        // Restore into a real MainWindow and verify tabs, splits, custom titles, active pane, and CWDs
+        MainWindow restoredWin(loaded->windows[0], nullptr, GhosttyUnionTheme::TerminalThemeId::SolarForge);
+        restoredWin.resize(1000, 700);
+        restoredWin.show();
+        QCoreApplication::processEvents();
+
+        auto *tabs = restoredWin.findChild<QTabWidget *>();
+        QVERIFY(tabs != nullptr);
+        QCOMPARE(tabs->count(), 2);
+        QCOMPARE(tabs->currentIndex(), 0);
+        QCOMPARE(tabs->tabText(0), QStringLiteral("Workspace"));
+        QCOMPARE(tabs->tabText(1), QStringLiteral("Logs"));
+
+        auto *pane0 = qobject_cast<TerminalTabPane *>(tabs->widget(0));
+        QVERIFY(pane0 != nullptr);
+        QCOMPARE(pane0->terminalCount(), 3);
+        QVERIFY(pane0->activeTerminal() != nullptr);
+        QCOMPARE(pane0->activeTerminal()->currentWorkingDirectory(), QFileInfo(dirB).absoluteFilePath());
+
+        // Capture back and verify round-trip topology
+        const SessionWindowState recaptured = restoredWin.captureSessionState();
+        QCOMPARE(recaptured.tabs.size(), 2);
+        QCOMPARE(recaptured.tabs[0].customTitle, QStringLiteral("Workspace"));
+        QCOMPARE(recaptured.tabs[0].terminalCount(), 3);
+        QCOMPARE(recaptured.tabs[0].root.type, SessionSplitNode::Type::Split);
+        QCOMPARE(recaptured.tabs[0].root.orientation, Qt::Horizontal);
+        QCOMPARE(recaptured.tabs[0].root.children[1].type, SessionSplitNode::Type::Split);
+        QCOMPARE(recaptured.tabs[0].root.children[1].orientation, Qt::Vertical);
+        QCOMPARE(recaptured.tabs[1].customTitle, QStringLiteral("Logs"));
+    }
+
+    [[maybe_unused]] static void testSessionSaveModalSingleAndMultiWindowArray() {
+        using namespace GhosttyUnionSession;
+
+        QTemporaryDir rootTmp;
+        QVERIFY(rootTmp.isValid());
+        const QString dir1 = QDir(rootTmp.path()).filePath(QStringLiteral("win1"));
+        const QString dir2 = QDir(rootTmp.path()).filePath(QStringLiteral("win2"));
+        QVERIFY(QDir().mkpath(dir1));
+        QVERIFY(QDir().mkpath(dir2));
+
+        const QString sessionPath = QDir(rootTmp.path()).filePath(QStringLiteral("session.json"));
+        const QByteArray prevEnv = qgetenv("GHOSTTY_UNION_SESSION_PATH");
+        qputenv("GHOSTTY_UNION_SESSION_PATH", sessionPath.toUtf8());
+        auto restoreEnv = qScopeGuard([&prevEnv]() {
+            if (prevEnv.isEmpty()) {
+                qunsetenv("GHOSTTY_UNION_SESSION_PATH");
+            } else {
+                qputenv("GHOSTTY_UNION_SESSION_PATH", prevEnv);
+            }
+            MainWindow::resetMultiWindowSessionSavedFlagForTesting();
+        });
+        MainWindow::resetMultiWindowSessionSavedFlagForTesting();
+
+        // 1. Single window: Cancel keeps window open and does not create session file
+        {
+            MainWindow win(dir1, nullptr, GhosttyUnionTheme::TerminalThemeId::SolarForge);
+            win.show();
+            QCoreApplication::processEvents();
+
+            win.requestCloseWithSessionPrompt();
+            auto *modal = win.findChild<QWidget *>(QStringLiteral("sessionSaveModal"));
+            QVERIFY(modal != nullptr);
+            QVERIFY(modal->isVisible());
+
+            auto *cancelBtn = modal->findChild<QPushButton *>(QStringLiteral("sessionSaveCancelButton"));
+            QVERIFY(cancelBtn != nullptr);
+            cancelBtn->click();
+            QCoreApplication::processEvents();
+
+            QVERIFY(!modal->isVisible());
+            QVERIFY(win.isVisible());
+            QVERIFY(!QFile::exists(sessionPath));
+
+            // 2. Single window: Save & Close writes 1-window session and closes
+            win.requestCloseWithSessionPrompt();
+            QVERIFY(modal->isVisible());
+            auto *saveBtn = modal->findChild<QPushButton *>(QStringLiteral("sessionSaveConfirmButton"));
+            QVERIFY(saveBtn != nullptr);
+            QCOMPARE(saveBtn->text(), QStringLiteral("Save && Close"));
+            saveBtn->click();
+            QCoreApplication::processEvents();
+
+            QVERIFY(!win.isVisible());
+            const auto saved = loadFromFile(sessionPath);
+            QVERIFY(saved.has_value());
+            QCOMPARE(saved->windows.size(), 1);
+            QCOMPARE(saved->windows[0].tabs.size(), 1);
+            QCOMPARE(saved->windows[0].tabs[0].root.cwd, QFileInfo(dir1).absoluteFilePath());
+        }
+
+        // 3. Multiple open windows: prompt offers Save All (2) and writes a 2-window array
+        QVERIFY(clearSessionFile(sessionPath));
+        MainWindow::resetMultiWindowSessionSavedFlagForTesting();
+        {
+            MainWindow win1(dir1, nullptr, GhosttyUnionTheme::TerminalThemeId::SolarForge);
+            MainWindow win2(dir2, nullptr, GhosttyUnionTheme::TerminalThemeId::SolarForge);
+            win1.show();
+            win2.show();
+            QCoreApplication::processEvents();
+
+            QCOMPARE(MainWindow::openWindows().size(), 2);
+
+            win1.requestCloseWithSessionPrompt();
+            auto *modal1 = win1.findChild<QWidget *>(QStringLiteral("sessionSaveModal"));
+            QVERIFY(modal1 != nullptr);
+            QVERIFY(modal1->isVisible());
+
+            auto *saveAllBtn = modal1->findChild<QPushButton *>(QStringLiteral("sessionSaveConfirmButton"));
+            QVERIFY(saveAllBtn != nullptr);
+            QCOMPARE(saveAllBtn->text(), QStringLiteral("Save All (2)"));
+            saveAllBtn->click();
+            QCoreApplication::processEvents();
+
+            QVERIFY(!win1.isVisible());
+            const auto saved = loadFromFile(sessionPath);
+            QVERIFY(saved.has_value());
+            QCOMPARE(saved->windows.size(), 2);
+
+            // Closing win2 with Don't Save preserves the 2-window array
+            win2.requestCloseWithSessionPrompt();
+            auto *modal2 = win2.findChild<QWidget *>(QStringLiteral("sessionSaveModal"));
+            QVERIFY(modal2 != nullptr);
+            QVERIFY(modal2->isVisible());
+            auto *skipBtn = modal2->findChild<QPushButton *>(QStringLiteral("sessionSaveSkipButton"));
+            QVERIFY(skipBtn != nullptr);
+            skipBtn->click();
+            QCoreApplication::processEvents();
+
+            QVERIFY(!win2.isVisible());
+            const auto afterSkip = loadFromFile(sessionPath);
+            QVERIFY(afterSkip.has_value());
+            QCOMPARE(afterSkip->windows.size(), 2);
+        }
+    }
 };
 
 #include "smoke_test.moc"

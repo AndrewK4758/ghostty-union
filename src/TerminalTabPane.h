@@ -4,6 +4,7 @@
 #include <QSplitter>
 #include <QWidget>
 
+#include "SessionState.h"
 #include "Theme.h"
 
 class QResizeEvent;
@@ -36,7 +37,13 @@ public:
 
     explicit TerminalTabPane(const QString &workingDirectory = {}, QWidget *parent = nullptr);
     explicit TerminalTabPane(TerminalWidget *adoptedTerminal, QWidget *parent = nullptr);
+    explicit TerminalTabPane(const GhosttyUnionSession::SessionTabState &sessionState,
+                             GhosttyUnionTheme::TerminalThemeId themeId,
+                             QWidget *parent = nullptr);
     ~TerminalTabPane() override = default;
+
+    [[nodiscard]] GhosttyUnionSession::SessionTabState captureSessionState() const;
+    [[nodiscard]] bool isZoomed() const { return m_zoomed; }
 
     [[nodiscard]] TerminalWidget *activeTerminal() const { return m_active; }
     [[nodiscard]] int terminalCount() const;
