@@ -2177,6 +2177,9 @@ private Q_SLOTS:
     }
 
     [[maybe_unused]] static void testConfiguredDesktopLauncherAndWaylandIdentity() {
+#if !defined(Q_OS_LINUX)
+        QSKIP("FreeDesktop .desktop launcher check is Linux-only");
+#endif
         const QByteArray desktopPathBytes = qgetenv("GHOSTTY_UNION_BUILD_DESKTOP");
         QVERIFY(!desktopPathBytes.isEmpty());
         QFile f(QString::fromLocal8Bit(desktopPathBytes));

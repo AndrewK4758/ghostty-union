@@ -8,7 +8,9 @@
 #include <QBuffer>
 #include <QClipboard>
 #include <QCursor>
+#if GHOSTTY_UNION_USE_DBUS
 #include <QDBusInterface>
+#endif
 #include <QDir>
 #include <QDragEnterEvent> // IWYU pragma: keep
 #include <QDropEvent> // IWYU pragma: keep
@@ -29,6 +31,8 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
+#include <QProcess>
+#include <QProcessEnvironment>
 #include <QPushButton>
 #include <QSocketNotifier>
 #include <QStandardPaths>
@@ -44,15 +48,25 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <fcntl.h>
 #include <limits>
 #include <mutex>
+#include <string>
+#include <vector>
+#if defined(Q_OS_WIN)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#if defined(Q_OS_MACOS)
+#include <libproc.h>
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <vector>
+#endif
 
 namespace {
 
@@ -1244,6 +1258,29 @@ TerminalWidget::TerminalWidget(const QString &workingDirectory, QWidget *parent,
 }
 
 TerminalWidget::~TerminalWidget() {
+#ifdef Q_OS_WIN
+    m_ptyStopRequested.store(true);
+    if (m_conpty) {
+        ::ClosePseudoConsole(static_cast<HPCON>(m_conpty));
+        m_conpty = nullptr;
+    }
+    if (m_ptyInWrite) {
+        ::CloseHandle(static_cast<HANDLE>(m_ptyInWrite));
+        m_ptyInWrite = nullptr;
+    }
+    if (m_ptyOutRead) {
+        ::CancelIoEx(static_cast<HANDLE>(m_ptyOutRead), nullptr);
+        ::CloseHandle(static_cast<HANDLE>(m_ptyOutRead));
+        m_ptyOutRead = nullptr;
+    }
+    if (m_ptyReadThread.joinable()) {
+        m_ptyReadThread.join();
+    }
+    if (m_childProcess) {
+        ::CloseHandle(static_cast<HANDLE>(m_childProcess));
+        m_childProcess = nullptr;
+    }
+#else
     if (m_ptyNotifier) {
         m_ptyNotifier->setEnabled(false);
         delete m_ptyNotifier;
@@ -1259,6 +1296,7 @@ TerminalWidget::~TerminalWidget() {
         ::waitpid(m_childPid, &status, WNOHANG);
         m_childPid = -1;
     }
+#endif
     destroyGhostty();
 }
 
@@ -1376,10 +1414,14 @@ bool TerminalWidget::initGhostty() {
     if (!tempDirBytes.isEmpty()) {
         ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, &tempDirStr);
     }
+#ifndef Q_OS_WIN
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &enableMedium);
+#endif
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES_KITTY, &maxKittyApcBytes);
 
-    const bool hasGhosttyTerminfo = QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty"));
+    const bool hasGhosttyTerminfo =
+        QFileInfo::exists(QStringLiteral("/usr/share/terminfo/x/xterm-ghostty")) ||
+        QFileInfo::exists(QStringLiteral("/Applications/Ghostty.app/Contents/Resources/terminfo/78/xterm-ghostty"));
     const char *terminfoName = hasGhosttyTerminfo ? "xterm-ghostty" : "xterm-256color";
     const GhosttyString ti{reinterpret_cast<const uint8_t *>(terminfoName), std::strlen(terminfoName)};
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &ti);
@@ -1466,7 +1508,166 @@ void TerminalWidget::destroyGhostty() {
     m_terminal = nullptr;
 }
 
+bool TerminalWidget::hasActivePty() const {
+#ifdef Q_OS_WIN
+    return m_conpty != nullptr && m_ptyInWrite != nullptr;
+#else
+    return m_ptyMasterFd >= 0;
+#endif
+}
+
 bool TerminalWidget::spawnShell(const QString &workingDirectory) {
+#ifdef Q_OS_WIN
+    HANDLE ptyInRead = INVALID_HANDLE_VALUE;
+    HANDLE ptyInWrite = INVALID_HANDLE_VALUE;
+    HANDLE ptyOutRead = INVALID_HANDLE_VALUE;
+    HANDLE ptyOutWrite = INVALID_HANDLE_VALUE;
+
+    if (!::CreatePipe(&ptyInRead, &ptyInWrite, nullptr, 0)) {
+        return false;
+    }
+    if (!::CreatePipe(&ptyOutRead, &ptyOutWrite, nullptr, 0)) {
+        ::CloseHandle(ptyInRead);
+        ::CloseHandle(ptyInWrite);
+        return false;
+    }
+
+    COORD conSize{};
+    conSize.X = static_cast<SHORT>(std::clamp<int>(m_cols, 1, 32767));
+    conSize.Y = static_cast<SHORT>(std::clamp<int>(m_rows, 1, 32767));
+    HPCON hPC = nullptr;
+    const HRESULT hr = ::CreatePseudoConsole(conSize, ptyInRead, ptyOutWrite, 0, &hPC);
+    ::CloseHandle(ptyInRead);
+    ::CloseHandle(ptyOutWrite);
+    if (FAILED(hr) || !hPC) {
+        ::CloseHandle(ptyInWrite);
+        ::CloseHandle(ptyOutRead);
+        return false;
+    }
+
+    // Resolve PowerShell 7 (`pwsh.exe`), then Windows PowerShell (`powershell.exe`), then `%COMSPEC%` / `cmd.exe`
+    QString shellExe = QStandardPaths::findExecutable(QStringLiteral("pwsh.exe"));
+    if (shellExe.isEmpty()) {
+        shellExe = QStandardPaths::findExecutable(QStringLiteral("powershell.exe"));
+    }
+    if (shellExe.isEmpty()) {
+        shellExe = qEnvironmentVariable("COMSPEC");
+    }
+    if (shellExe.isEmpty()) {
+        shellExe = QStringLiteral("cmd.exe");
+    }
+    QString cmdLineStr = QStringLiteral("\"%1\"").arg(shellExe);
+    std::wstring cmdLineW = cmdLineStr.toStdWString();
+    cmdLineW.push_back(L'\0');
+
+    // Build child-only UTF-16 environment block with truecolor + Ghostty hints
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    env.insert(QStringLiteral("COLORTERM"), QStringLiteral("truecolor"));
+    env.insert(QStringLiteral("TERM_PROGRAM"), QStringLiteral("ghostty"));
+    env.insert(QStringLiteral("TERM_PROGRAM_VERSION"), QStringLiteral("1.4.0"));
+    env.insert(QStringLiteral("WT_SESSION"), QStringLiteral("ghostty-union"));
+    const QStringList envList = env.toStringList();
+    std::vector<wchar_t> envBlock;
+    for (const QString &entry : envList) {
+        const std::wstring w = entry.toStdWString();
+        envBlock.insert(envBlock.end(), w.begin(), w.end());
+        envBlock.push_back(L'\0');
+    }
+    envBlock.push_back(L'\0');
+
+    SIZE_T attrListSize = 0;
+    ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attrListSize);
+    std::vector<uint8_t> attrStorage(attrListSize);
+    auto *attrList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrStorage.data());
+    if (!::InitializeProcThreadAttributeList(attrList, 1, 0, &attrListSize) ||
+        !::UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                     hPC, sizeof(hPC), nullptr, nullptr)) {
+        ::ClosePseudoConsole(hPC);
+        ::CloseHandle(ptyInWrite);
+        ::CloseHandle(ptyOutRead);
+        return false;
+    }
+
+    STARTUPINFOEXW siEx{};
+    siEx.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+    siEx.lpAttributeList = attrList;
+
+    std::wstring cwdW;
+    LPCWSTR cwdPtr = nullptr;
+    if (!workingDirectory.isEmpty() && QDir(workingDirectory).exists()) {
+        cwdW = QDir::toNativeSeparators(workingDirectory).toStdWString();
+        cwdPtr = cwdW.c_str();
+    }
+
+    PROCESS_INFORMATION pi{};
+    const BOOL created = ::CreateProcessW(
+        nullptr,
+        cmdLineW.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        envBlock.data(),
+        cwdPtr,
+        &siEx.StartupInfo,
+        &pi);
+    ::DeleteProcThreadAttributeList(attrList);
+
+    if (!created) {
+        ::ClosePseudoConsole(hPC);
+        ::CloseHandle(ptyInWrite);
+        ::CloseHandle(ptyOutRead);
+        return false;
+    }
+
+    ::CloseHandle(pi.hThread);
+    m_conpty = hPC;
+    m_ptyInWrite = ptyInWrite;
+    m_ptyOutRead = ptyOutRead;
+    m_childProcess = pi.hProcess;
+    m_appliedPtyCols = m_cols;
+    m_appliedPtyRows = m_rows;
+    m_appliedCellWidth = m_cellWidth;
+    m_appliedCellHeight = m_cellHeight;
+    m_ptyStopRequested.store(false);
+
+    const QPointer<TerminalWidget> guard(this);
+    HANDLE outReadHandle = ptyOutRead;
+    HANDLE childProcHandle = pi.hProcess;
+    m_ptyReadThread = std::thread([this, guard, outReadHandle, childProcHandle]() {
+        char buf[32768];
+        DWORD bytesRead = 0;
+        while (!m_ptyStopRequested.load()) {
+            if (!::ReadFile(outReadHandle, buf, sizeof(buf), &bytesRead, nullptr) || bytesRead == 0) {
+                break;
+            }
+            QByteArray chunk(buf, static_cast<qsizetype>(bytesRead));
+            QMetaObject::invokeMethod(
+                this,
+                [guard, chunk = std::move(chunk)]() {
+                    if (guard) {
+                        guard->onWindowsPtyData(chunk);
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+        if (!m_ptyStopRequested.load()) {
+            DWORD exitCode = 0;
+            ::WaitForSingleObject(childProcHandle, 250);
+            ::GetExitCodeProcess(childProcHandle, &exitCode);
+            QMetaObject::invokeMethod(
+                this,
+                [guard, code = static_cast<int>(exitCode)]() {
+                    if (guard) {
+                        guard->onWindowsPtyExited(code);
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+    });
+    return true;
+#else
     const int devCw = deviceCellWidth();
     const int devCh = deviceCellHeight();
     winsize ws{
@@ -1581,8 +1782,29 @@ bool TerminalWidget::spawnShell(const QString &workingDirectory) {
     m_ptyNotifier = new QSocketNotifier(m_ptyMasterFd, QSocketNotifier::Read, this);
     connect(m_ptyNotifier, &QSocketNotifier::activated, this, &TerminalWidget::onPtyReadable);
     return true;
+#endif
 }
 
+#ifdef Q_OS_WIN
+void TerminalWidget::onWindowsPtyData(const QByteArray &data) {
+    if (!m_terminal || data.isEmpty()) {
+        return;
+    }
+    feedVtStream(reinterpret_cast<const uint8_t *>(data.constData()), static_cast<size_t>(data.size()));
+    m_blinkVisible = true;
+    if (!m_renderHeld) {
+        updateRenderState(false);
+    }
+    update();
+}
+
+void TerminalWidget::onWindowsPtyExited(int exitCode) {
+    if (!m_exitedEmitted) {
+        m_exitedEmitted = true;
+        Q_EMIT exited(this, exitCode);
+    }
+}
+#else
 void TerminalWidget::onPtyReadable() {
     if (m_ptyMasterFd < 0 || !m_terminal) {
         return;
@@ -1643,6 +1865,7 @@ void TerminalWidget::onPtyReadable() {
         update();
     }
 }
+#endif
 
 void TerminalWidget::flushPtyBytes(const uint8_t *data, size_t len) const {
     if (!data || len == 0) {
@@ -1651,6 +1874,20 @@ void TerminalWidget::flushPtyBytes(const uint8_t *data, size_t len) const {
     if (m_ptyOutputSpy) {
         m_ptyOutputSpy(QByteArray(reinterpret_cast<const char *>(data), static_cast<qsizetype>(len)));
     }
+#ifdef Q_OS_WIN
+    if (!m_ptyInWrite) {
+        return;
+    }
+    size_t sent = 0;
+    while (sent < len) {
+        DWORD written = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(len - sent, 65536));
+        if (!::WriteFile(static_cast<HANDLE>(m_ptyInWrite), data + sent, chunk, &written, nullptr) || written == 0) {
+            break;
+        }
+        sent += static_cast<size_t>(written);
+    }
+#else
     if (m_ptyMasterFd < 0) {
         return;
     }
@@ -1667,19 +1904,20 @@ void TerminalWidget::flushPtyBytes(const uint8_t *data, size_t len) const {
             break;
         }
     }
+#endif
 }
 
 void TerminalWidget::showEvent(QShowEvent *event) {
     QWidget::showEvent(event);
-    if (m_startShellPending && m_ptyMasterFd < 0) {
+    if (m_startShellPending && !hasActivePty()) {
         QTimer::singleShot(0, this, &TerminalWidget::ensureShellSpawned);
-    } else if (m_ptyMasterFd >= 0) {
+    } else if (hasActivePty()) {
         m_resizeCoalesceTimer.start();
     }
 }
 
 void TerminalWidget::ensureShellSpawned() {
-    if (!m_startShellPending || m_ptyMasterFd >= 0 || !m_terminal) {
+    if (!m_startShellPending || hasActivePty() || !m_terminal) {
         return;
     }
     m_startShellPending = false;
@@ -1929,8 +2167,14 @@ void TerminalWidget::resizeTerminalToWidget() {
         m_appliedVtCellHeight = devCh;
     }
 
-    if (m_ptyMasterFd >= 0 &&
+    if (hasActivePty() &&
         (m_cols != m_appliedPtyCols || m_rows != m_appliedPtyRows || cellMetricsChanged)) {
+#ifdef Q_OS_WIN
+        COORD conSize{};
+        conSize.X = static_cast<SHORT>(std::clamp<int>(m_cols, 1, 32767));
+        conSize.Y = static_cast<SHORT>(std::clamp<int>(m_rows, 1, 32767));
+        ::ResizePseudoConsole(static_cast<HPCON>(m_conpty), conSize);
+#else
         winsize ws{
             .ws_row = m_rows,
             .ws_col = m_cols,
@@ -1938,6 +2182,7 @@ void TerminalWidget::resizeTerminalToWidget() {
             .ws_ypixel = static_cast<unsigned short>(std::min<int>(65535, static_cast<int>(m_rows) * devCh)),
         };
         ::ioctl(m_ptyMasterFd, TIOCSWINSZ, &ws);
+#endif
         m_appliedPtyCols = m_cols;
         m_appliedPtyRows = m_rows;
     }
@@ -4050,10 +4295,26 @@ void TerminalWidget::copySelection() const {
 }
 
 QString TerminalWidget::liveWorkingDirectory() const {
+#ifdef Q_OS_WIN
+    return m_pwd;
+#else
     auto readProcCwd = [](pid_t pid) -> QString {
         if (pid <= 0) {
             return {};
         }
+#if defined(Q_OS_MACOS)
+        proc_vnodepathinfo vpi{};
+        if (::proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof(vpi)) == static_cast<int>(sizeof(vpi))) {
+            const QString target = QString::fromUtf8(vpi.pvi_cdir.vip_path);
+            if (!target.isEmpty()) {
+                const QFileInfo fi(target);
+                if (fi.exists() && fi.isDir()) {
+                    return fi.absoluteFilePath();
+                }
+            }
+        }
+        return {};
+#else
         const QString target = QFileInfo(QStringLiteral("/proc/%1/cwd").arg(pid)).symLinkTarget();
         if (!target.isEmpty()) {
             const QFileInfo fi(target);
@@ -4062,6 +4323,7 @@ QString TerminalWidget::liveWorkingDirectory() const {
             }
         }
         return {};
+#endif
     };
 
     QString procCwd;
@@ -4088,6 +4350,7 @@ QString TerminalWidget::liveWorkingDirectory() const {
     }
 
     return m_pwd;
+#endif
 }
 
 QString TerminalWidget::plainTextSnapshot() const {
@@ -5075,6 +5338,7 @@ void TerminalWidget::onDesktopNotification(GhosttyTerminal /*terminal*/,
         return;
     }
 
+#if GHOSTTY_UNION_USE_DBUS
     QDBusInterface notifyInterface(QStringLiteral("org.freedesktop.Notifications"),
                                    QStringLiteral("/org/freedesktop/Notifications"),
                                    QStringLiteral("org.freedesktop.Notifications"),
@@ -5092,4 +5356,16 @@ void TerminalWidget::onDesktopNotification(GhosttyTerminal /*terminal*/,
                          QStringList{},
                          QVariantMap{},
                          static_cast<qint32>(-1));
+#elif defined(Q_OS_MACOS)
+    auto escapeAppleScript = [](QString s) {
+        s.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
+        s.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+        return s;
+    };
+    const QString script = QStringLiteral("display notification \"%1\" with title \"%2\"")
+                               .arg(escapeAppleScript(body), escapeAppleScript(title));
+    QProcess::startDetached(QStringLiteral("/usr/bin/osascript"), {QStringLiteral("-e"), script});
+#else
+    QApplication::beep();
+#endif
 }
