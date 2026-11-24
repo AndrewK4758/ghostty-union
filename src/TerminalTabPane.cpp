@@ -2,6 +2,7 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 
+#include <QDir>
 #include <QEasingCurve>
 #include <QLayout>
 #include <QLinearGradient>
@@ -14,7 +15,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <utility>
 
 namespace {
 
@@ -185,6 +188,188 @@ TerminalTabPane::TerminalTabPane(TerminalWidget *adoptedTerminal, QWidget *paren
         wireTerminal(adoptedTerminal);
     }
     initLayout(first);
+}
+
+TerminalTabPane::TerminalTabPane(const GhosttyUnionSession::SessionTabState &sessionState,
+                                 GhosttyUnionTheme::TerminalThemeId themeId,
+                                 QWidget *parent)
+    : QWidget(parent),
+      m_customTitle(sessionState.customTitle.trimmed()),
+      m_themeId(themeId) {
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+
+    const QString splitterCss = QStringLiteral(
+        "QSplitter::handle { background: %1; }"
+        "QSplitter::handle:hover { background: %2; }")
+        .arg(QString::fromLatin1(GhosttyUnionTheme::kDividerHex),
+             QString::fromLatin1(GhosttyUnionTheme::kGoldHex));
+
+    auto configureSplitter = [&splitterCss](QSplitter *splitter) {
+        splitter->setHandleWidth(2);
+        splitter->setChildrenCollapsible(false);
+        splitter->setFocusPolicy(Qt::NoFocus);
+        splitter->setStyleSheet(splitterCss);
+    };
+
+    m_rootSplitter = new QSplitter(Qt::Horizontal, this);
+    configureSplitter(m_rootSplitter);
+    layout->addWidget(m_rootSplitter);
+
+    TerminalWidget *firstTerminal = nullptr;
+    TerminalWidget *restoredActive = nullptr;
+    QList<std::pair<QPointer<QSplitter>, QList<double>>> pendingRatios;
+
+    auto applyRatios = [](QSplitter *splitter, const QList<double> &ratios) {
+        if (!splitter || splitter->count() <= 1 || ratios.size() != splitter->count()) {
+            return;
+        }
+        const int dim = (splitter->orientation() == Qt::Horizontal) ? splitter->width() : splitter->height();
+        const int span = (dim > splitter->count() * 40) ? dim : 10000;
+        QList<int> sizes;
+        sizes.reserve(ratios.size());
+        for (double r : ratios) {
+            sizes.append(std::max(1, static_cast<int>(std::lround(span * r))));
+        }
+        splitter->setSizes(sizes);
+    };
+
+    std::function<void(QSplitter *, const GhosttyUnionSession::SessionSplitNode &)> buildSplitChildren;
+    buildSplitChildren = [&](QSplitter *targetSplitter, const GhosttyUnionSession::SessionSplitNode &splitNode) {
+        targetSplitter->setOrientation(splitNode.orientation);
+        for (const GhosttyUnionSession::SessionSplitNode &child : splitNode.children) {
+            if (child.type == GhosttyUnionSession::SessionSplitNode::Type::Terminal) {
+                TerminalWidget *term = createTerminal(GhosttyUnionSession::resolveRestoredCwd(child.cwd));
+                targetSplitter->addWidget(term);
+                term->show();
+                if (!firstTerminal) {
+                    firstTerminal = term;
+                }
+                if (child.active && !restoredActive) {
+                    restoredActive = term;
+                }
+            } else if (!child.children.isEmpty()) {
+                auto *nested = new QSplitter(child.orientation, targetSplitter);
+                configureSplitter(nested);
+                targetSplitter->addWidget(nested);
+                buildSplitChildren(nested, child);
+                nested->show();
+            }
+        }
+        if (targetSplitter->count() > 1 && splitNode.ratios.size() == targetSplitter->count()) {
+            pendingRatios.append({QPointer<QSplitter>(targetSplitter), splitNode.ratios});
+        }
+    };
+
+    m_suppressFocusTracking = true;
+    if (sessionState.root.type == GhosttyUnionSession::SessionSplitNode::Type::Split &&
+        !sessionState.root.children.isEmpty()) {
+        buildSplitChildren(m_rootSplitter, sessionState.root);
+    } else {
+        TerminalWidget *term = createTerminal(GhosttyUnionSession::resolveRestoredCwd(sessionState.root.cwd));
+        m_rootSplitter->addWidget(term);
+        term->show();
+        firstTerminal = term;
+        restoredActive = term;
+    }
+
+    if (!firstTerminal) {
+        TerminalWidget *fallback = createTerminal(QDir::homePath());
+        m_rootSplitter->addWidget(fallback);
+        fallback->show();
+        firstTerminal = fallback;
+        restoredActive = fallback;
+    }
+    m_suppressFocusTracking = false;
+
+    for (const auto &[splitterPtr, ratios] : pendingRatios) {
+        applyRatios(splitterPtr.data(), ratios);
+    }
+    if (!pendingRatios.isEmpty()) {
+        QTimer::singleShot(0, this, [pendingRatios, applyRatios]() {
+            for (const auto &[splitterPtr, ratios] : pendingRatios) {
+                applyRatios(splitterPtr.data(), ratios);
+            }
+        });
+    }
+
+    m_dropOverlay = new DropOverlayWidget(this);
+    m_dropOverlay->setGeometry(rect());
+
+    m_active = restoredActive ? restoredActive : firstTerminal;
+    recordFocusedTerminal(m_active);
+    updateSplitDimming();
+
+    if (sessionState.zoomed && terminalCount() > 1) {
+        m_zoomed = true;
+        setSplitTreeVisibility(m_rootSplitter, false);
+    }
+}
+
+GhosttyUnionSession::SessionTabState TerminalTabPane::captureSessionState() const {
+    GhosttyUnionSession::SessionTabState state;
+    state.customTitle = m_customTitle;
+    state.zoomed = m_zoomed;
+
+    std::function<GhosttyUnionSession::SessionSplitNode(const QWidget *)> captureNode;
+    captureNode = [&](const QWidget *widget) -> GhosttyUnionSession::SessionSplitNode {
+        if (const auto *term = qobject_cast<const TerminalWidget *>(widget)) {
+            GhosttyUnionSession::SessionSplitNode leaf;
+            leaf.type = GhosttyUnionSession::SessionSplitNode::Type::Terminal;
+            leaf.cwd = term->liveWorkingDirectory();
+            leaf.active = (term == m_active);
+            return leaf;
+        }
+        if (const auto *splitter = qobject_cast<const QSplitter *>(widget)) {
+            if (splitter->count() == 1) {
+                return captureNode(splitter->widget(0));
+            }
+            GhosttyUnionSession::SessionSplitNode node;
+            node.type = GhosttyUnionSession::SessionSplitNode::Type::Split;
+            node.orientation = splitter->orientation();
+
+            const QList<int> sizes = splitter->sizes();
+            double sum = 0.0;
+            bool allPositive = (!m_zoomed && sizes.size() == splitter->count());
+            if (allPositive) {
+                for (int s : sizes) {
+                    if (s <= 0) {
+                        allPositive = false;
+                        break;
+                    }
+                    sum += static_cast<double>(s);
+                }
+            }
+
+            const int count = splitter->count();
+            node.ratios.reserve(count);
+            node.children.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                if (allPositive && sum > 0.0) {
+                    node.ratios.append(static_cast<double>(sizes[i]) / sum);
+                } else {
+                    node.ratios.append(1.0 / static_cast<double>(std::max(1, count)));
+                }
+                node.children.append(captureNode(splitter->widget(i)));
+            }
+            return node;
+        }
+        GhosttyUnionSession::SessionSplitNode fallback;
+        fallback.type = GhosttyUnionSession::SessionSplitNode::Type::Terminal;
+        fallback.cwd = currentWorkingDirectory();
+        fallback.active = true;
+        return fallback;
+    };
+
+    if (m_rootSplitter && m_rootSplitter->count() > 0) {
+        state.root = captureNode(m_rootSplitter);
+    } else {
+        state.root.type = GhosttyUnionSession::SessionSplitNode::Type::Terminal;
+        state.root.cwd = currentWorkingDirectory();
+        state.root.active = true;
+    }
+    return state;
 }
 
 void TerminalTabPane::initLayout(TerminalWidget *firstTerminal) {

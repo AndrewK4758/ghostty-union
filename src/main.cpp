@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "SessionState.h"
 #include "Theme.h"
 
 #include <QApplication>
@@ -72,8 +73,11 @@ int main(int argc, char *argv[]) {
     const QCommandLineOption themeOpt(QStringList{QStringLiteral("theme"), QStringLiteral("t")},
                               QStringLiteral("Terminal color theme (solar-forge, ollie)"),
                               QStringLiteral("name"));
+    const QCommandLineOption noRestoreOpt(QStringLiteral("no-restore"),
+                              QStringLiteral("Start fresh without restoring the saved session layout"));
     parser.addOption(cwdOpt);
     parser.addOption(themeOpt);
+    parser.addOption(noRestoreOpt);
     parser.process(app);
 
     std::optional<GhosttyUnionTheme::TerminalThemeId> themeOverride;
@@ -85,6 +89,22 @@ int main(int argc, char *argv[]) {
         } else {
             QTextStream(stderr) << "ghostty-union: unknown theme '" << parser.value(themeOpt)
                                 << "' (available: solar-forge, ollie); using default.\n";
+        }
+    }
+
+    if (!parser.isSet(cwdOpt) && !parser.isSet(noRestoreOpt)) {
+        if (const auto savedSession = GhosttyUnionSession::loadFromFile(); savedSession && savedSession->isValid()) {
+            for (const GhosttyUnionSession::SessionWindowState &winState : savedSession->windows) {
+                auto *win = new MainWindow(winState, nullptr, themeOverride);
+                win->setAttribute(Qt::WA_DeleteOnClose);
+                win->setWindowIcon(appIcon);
+                if (winState.maximized) {
+                    win->showMaximized();
+                } else {
+                    win->show();
+                }
+            }
+            return QApplication::exec();
         }
     }
 
