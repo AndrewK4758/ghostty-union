@@ -2263,16 +2263,17 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
     }
 
     // Pass 2: procedural box/shade/Powerline geometry, constrained Nerd Font PUA icons, text, decorations
-    auto buildFittedPath = [&](const QFont &f, const QString &glyph, int cellSpanW) -> QPainterPath {
+    auto buildFittedPath = [&](const QFont &f, const QString &glyph, int cellSpanW, bool allowUpscale) -> QPainterPath {
         QPainterPath raw;
         raw.addText(0.0, 0.0, f, glyph);
         const QRectF br = raw.boundingRect();
         if (br.isEmpty()) {
             return {};
         }
-        const qreal maxW = std::max(1.0, static_cast<qreal>(cellSpanW) - 0.5);
+        const qreal maxW = std::max(1.0, static_cast<qreal>(cellSpanW) - (allowUpscale ? 1.0 : 0.5));
         const qreal maxH = std::max(1.0, static_cast<qreal>(rowPxH) - 2.0);
-        const qreal scale = std::min({1.0, maxW / br.width(), maxH / br.height()});
+        const qreal maxScale = allowUpscale ? 1.35 : 1.0;
+        const qreal scale = std::min({maxScale, maxW / br.width(), maxH / br.height()});
         const qreal scaledW = br.width() * scale;
         const qreal scaledH = br.height() * scale;
         const qreal targetX = (cellSpanW - scaledW) * 0.5 - br.left() * scale;
@@ -2289,7 +2290,8 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
         return xf.map(raw);
     };
 
-    for (const CellDrawItem &item : fgItems) {
+    for (size_t idx = 0; idx < fgItems.size(); ++idx) {
+        const CellDrawItem &item = fgItems[idx];
         const int cellX = item.col * m_cellWidth;
         const int cellSpanW = item.spanCols * m_cellWidth;
         const bool itemInvisible = (item.style.flags & GHOSTTY_STYLE_FLAG_INVISIBLE) != 0;
@@ -2311,7 +2313,8 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
                 const QFontMetricsF fm(f);
                 const qreal adv = fm.horizontalAdvance(item.glyph);
 
-                bool useFittedPath = isNerdFontPua(item.cp);
+                const bool isPuaIcon = isNerdFontPua(item.cp);
+                bool useFittedPath = isPuaIcon;
                 if (!useFittedPath && item.cp >= 0x2000U) {
                     const QRectF br = fm.boundingRect(item.glyph);
                     const qreal shift = (cellSpanW - adv) * 0.5;
@@ -2324,21 +2327,30 @@ void TerminalWidget::renderRowToCache(int y, GhosttyRenderStateRowIterator rowIt
                 }
 
                 if (useFittedPath) {
+                    const bool nextColInBounds = (item.col + 1 < m_cols);
+                    const bool nextColEmpty = nextColInBounds &&
+                                              (idx + 1 >= fgItems.size() || fgItems[idx + 1].col > item.col + 1);
+                    const bool nextColSameBg = nextColInBounds && (colBgs[item.col + 1] == colBgs[item.col]);
+                    const bool expandPuaToTwoCols = isPuaIcon && !item.hasCluster && item.spanCols == 1 &&
+                                                    nextColEmpty && nextColSameBg;
+                    const int effectiveSpanCols = expandPuaToTwoCols ? 2 : item.spanCols;
+                    const int effectiveSpanW = effectiveSpanCols * m_cellWidth;
+
                     QPainterPath norm;
                     if (!item.hasCluster) {
                         const uint64_t key = (static_cast<uint64_t>(item.cp) << 4) |
-                                             (static_cast<uint64_t>(item.spanCols & 0x3) << 2) |
+                                             (static_cast<uint64_t>(effectiveSpanCols & 0x3) << 2) |
                                              (itemBold ? 2ULL : 0ULL) |
                                              (itemItalic ? 1ULL : 0ULL);
                         auto it = m_puaPathCache.constFind(key);
                         if (it != m_puaPathCache.constEnd()) {
                             norm = it.value();
                         } else {
-                            norm = buildFittedPath(f, item.glyph, cellSpanW);
+                            norm = buildFittedPath(f, item.glyph, effectiveSpanW, expandPuaToTwoCols);
                             m_puaPathCache.insert(key, norm);
                         }
                     } else {
-                        norm = buildFittedPath(f, item.glyph, cellSpanW);
+                        norm = buildFittedPath(f, item.glyph, effectiveSpanW, false);
                     }
                     if (!norm.isEmpty()) {
                         p.setRenderHint(QPainter::Antialiasing, true);

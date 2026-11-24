@@ -695,10 +695,11 @@ private Q_SLOTS:
         QVERIFY2(cellMaxDistFromBg(10, 0, seg2Bg, 0, 0) > 80, "U+F489 icon did not render visible ink");
         QVERIFY2(cellMaxDistFromBg(35, 0, seg2Bg, 0, 0) > 40, "U+F10FE Supplementary PUA-A icon did not render visible ink");
 
-        // Adjacent right space cells (col 7, col 11, col 36) must stay pure segment background (zero overflow)
-        QVERIFY2(cellMaxDistFromBg(7, 0, seg1Bg, 1, 1) <= 4, "U+F303 overflowed into right space padding cell");
-        QVERIFY2(cellMaxDistFromBg(11, 0, seg2Bg, 1, 1) <= 4, "U+F489 overflowed into right space padding cell");
-        QVERIFY2(cellMaxDistFromBg(36, 0, seg2Bg, 1, 1) <= 4, "U+F10FE overflowed into right space padding cell");
+        // Nerd Font PUA icons followed by a same-background space cell expand into the 2-cell box
+        // (cols 6..7, 10..11, 35..36) so icons render larger without scaling regular text
+        QVERIFY2(cellMaxDistFromBg(7, 0, seg1Bg, 0, 0) > 40, "U+F303 did not expand into adjacent space cell");
+        QVERIFY2(cellMaxDistFromBg(11, 0, seg2Bg, 0, 0) > 40, "U+F489 did not expand into adjacent space cell");
+        QVERIFY2(cellMaxDistFromBg(36, 0, seg2Bg, 0, 0) > 20, "U+F10FE did not expand into adjacent space cell");
 
         // Horizontal box-drawing filler dashes (cols 28..30, U+2500) must connect with zero gaps
         constexpr QColor gapLineCol(118, 131, 144);
