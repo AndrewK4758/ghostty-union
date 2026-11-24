@@ -1,6 +1,9 @@
 # Ghostty Union
 
-A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge** cockpit UI and default terminal palette (with built-in **Ollie** theme switching), dynamic nested split trees with drag-and-drop rearrangement, and a mounted **74px live system telemetry bar**.
+A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge** cockpit UI and default terminal palette (with built-in **Ollie** theme switching), dynamic nested split trees with drag-and-drop rearrangement, native session & layout persistence, and a mounted **74px live system telemetry bar**.
+
+> **Looking for WSL2 & macOS Testers!**
+> With the `v1.0.0` release, we are actively looking for community testers on **WSL2 / WSLg** (Windows 10/11) and **macOS** (Apple Silicon & Intel) to help verify build instructions, HiDPI/display behavior, `libghostty-vt` integration, and platform-specific edge cases (macOS will need PTY/telemetry portability feedback). If you can test on WSL2 or macOS, please open an issue or PR with your OS/distro version, Qt6 version, and any build or runtime logs!
 
 ## Features
 
@@ -27,7 +30,8 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 ### Tabs & Dynamic Splits
 - Nested horizontal and vertical split trees per tab with directional focus navigation, resizing, split zoom, orientation rotation, equalization, and MRU focus restoration when panes close.
 - Live drag-and-drop pane rearrangement: swap panes, dock to any edge or root edge, or detach a split into its own tab.
-- Custom Solar Forge modals for tab renaming and tab close confirmation, plus adaptive tab bar sizing.
+- Custom Solar Forge modals for tab renaming, tab close confirmation, and window session save prompts, plus adaptive tab bar sizing.
+- **Native session & layout persistence:** Save tabs, custom tab titles, nested split trees (orientations & ratios), pane working directories (`OSC 7` + Linux `/proc/<pid>/cwd`), and window geometry to `~/.config/ghostty-union/session.json`. Prompts on manual window close (with single-window **Save & Close** or multi-window **Save All (N)** array support), or save anytime via `Ctrl+Shift+S` / tab bar context menu. Restores automatically on launch unless `-d` or `--no-restore` is passed.
 
 ---
 
@@ -37,6 +41,7 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 | Shortcut | Action |
 |---|---|
 | `Ctrl+Shift+N` | New window (inherits active working directory) |
+| `Ctrl+Shift+S` | Save current window(s), tabs, splits, and working directories to session layout |
 | `Ctrl+Shift+T` | New tab |
 | `Ctrl+Shift+A` | Rename current tab |
 | `Ctrl+Shift+W` | Close active split (or prompt to close tab if last split) |
@@ -198,8 +203,9 @@ sudo cmake --install build --prefix /usr/local
 ## CLI Usage
 
 ```bash
-ghostty-union                         # Launch in current working directory (Solar Forge or saved theme)
-ghostty-union -d /path/to/dir         # Launch in a specific working directory
+ghostty-union                         # Launch and restore saved session layout (or open in current dir)
+ghostty-union --no-restore            # Launch a fresh window without restoring saved session layout
+ghostty-union -d /path/to/dir         # Launch fresh in a specific working directory
 ghostty-union --working-directory ~   # Long flag equivalent
 ghostty-union -t solar-forge          # Override terminal theme for this window (solar-forge | ollie)
 ghostty-union --theme ollie           # Long flag equivalent

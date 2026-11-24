@@ -46,6 +46,7 @@ public:
 
     [[nodiscard]] QString title() const { return m_title; }
     [[nodiscard]] QString currentWorkingDirectory() const { return m_pwd; }
+    [[nodiscard]] QString liveWorkingDirectory() const;
     [[nodiscard]] QString plainTextSnapshot() const;
     void feedVtBytes(const QByteArray &bytes);
     [[nodiscard]] QSize cellSize() const { return {m_cellWidth, m_cellHeight}; }

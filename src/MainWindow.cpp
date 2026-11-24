@@ -5,6 +5,8 @@
 #include "Theme.h"
 
 #include <QAbstractButton>
+#include <QApplication>
+#include <QCloseEvent>
 #include <QContextMenuEvent>
 #include <QCoreApplication>
 #include <QDir>
@@ -1462,11 +1464,481 @@ private:
     std::function<void()> m_onCancel;
 };
 
+namespace {
+
+bool g_multiWindowLayoutSavedThisSession = false;
+
+class ModalSessionBadge final : public QWidget {
+public:
+    explicit ModalSessionBadge(QWidget *parent = nullptr)
+        : QWidget(parent) {
+        setFixedSize(56, 56);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+
+protected:
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const QPointF center(width() * 0.5, height() * 0.5);
+        const QColor gold(GhosttyUnionTheme::kGoldHex);
+        const QColor amber(GhosttyUnionTheme::kAmberHex);
+
+        QRadialGradient halo(center, 27.0);
+        halo.setColorAt(0.0, QColor(255, 211, 0, 72));
+        halo.setColorAt(0.68, QColor(255, 152, 0, 22));
+        halo.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.setPen(Qt::NoPen);
+        p.setBrush(halo);
+        p.drawEllipse(center, 27.0, 27.0);
+
+        const QRectF medallion(center.x() - 21.0, center.y() - 21.0, 42.0, 42.0);
+        QLinearGradient fillGrad(medallion.topLeft(), medallion.bottomRight());
+        fillGrad.setColorAt(0.0, QColor(0x3B, 0x32, 0x22, 238));
+        fillGrad.setColorAt(1.0, QColor(0x21, 0x1F, 0x27, 245));
+
+        QLinearGradient ringGrad(medallion.topLeft(), medallion.bottomRight());
+        ringGrad.setColorAt(0.0, gold);
+        ringGrad.setColorAt(1.0, amber);
+
+        p.setBrush(fillGrad);
+        p.setPen(QPen(ringGrad, 1.4));
+        p.drawEllipse(medallion);
+
+        // Crisp vector split-pane layout glyph inside medallion
+        const QRectF frame(center.x() - 8.5, center.y() - 7.5, 17.0, 15.0);
+        p.setPen(QPen(gold, 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setBrush(QColor(255, 211, 0, 28));
+        p.drawRoundedRect(frame, 2.5, 2.5);
+        // Vertical split divider + horizontal sub-split divider
+        p.drawLine(QPointF(center.x() - 0.5, frame.top() + 1.0),
+                   QPointF(center.x() - 0.5, frame.bottom() - 1.0));
+        p.drawLine(QPointF(center.x() - 0.5, center.y() + 0.5),
+                   QPointF(frame.right() - 1.0, center.y() + 0.5));
+    }
+};
+
+} // namespace
+
+class MainWindow::SessionSaveModalOverlay final : public QWidget {
+public:
+    explicit SessionSaveModalOverlay(QWidget *parent)
+        : QWidget(parent) {
+        setObjectName(QStringLiteral("sessionSaveModal"));
+        setAttribute(Qt::WA_NoSystemBackground);
+        setFocusPolicy(Qt::StrongFocus);
+        hide();
+
+        auto *outerLayout = new QVBoxLayout(this);
+        outerLayout->setContentsMargins(24, 24, 24, 24);
+        outerLayout->addStretch(1);
+
+        auto *centerRow = new QHBoxLayout();
+        centerRow->addStretch(1);
+
+        m_card = new ModalCardWidget(this);
+        m_card->setObjectName(QStringLiteral("sessionSaveCard"));
+        m_card->setFixedWidth(452);
+        m_card->setDangerMode(false);
+        m_card->setStyleSheet(QStringLiteral(
+            "QLabel#sessionSaveTitle {"
+            "  color: #F6F7FB;"
+            "  font-size: 16.5px;"
+            "  font-weight: 700;"
+            "  background: transparent;"
+            "}"
+            "QFrame#sessionSaveSummaryPill {"
+            "  background-color: rgba(255, 255, 255, 12);"
+            "  border: 1px solid rgba(255, 255, 255, 22);"
+            "  border-radius: 10px;"
+            "}"
+            "QLabel#sessionSaveSummaryDot {"
+            "  color: %1;"
+            "  font-size: 9px;"
+            "  background: transparent;"
+            "}"
+            "QLabel#sessionSaveSummaryText {"
+            "  color: #E7E9F4;"
+            "  font-size: 12.5px;"
+            "  font-weight: 600;"
+            "  background: transparent;"
+            "}"
+            "QLabel#sessionSaveBody {"
+            "  color: #A9ACC0;"
+            "  font-size: 12.5px;"
+            "  background: transparent;"
+            "}"
+            "QLabel#sessionSaveKeyHint {"
+            "  color: #787B90;"
+            "  font-size: 11px;"
+            "  background: transparent;"
+            "}"
+            "QPushButton#sessionSaveCancelButton, QPushButton#sessionSaveSkipButton {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A3945, stop:1 #2F2E38);"
+            "  color: #F0EFF6;"
+            "  border: 1px solid rgba(255, 255, 255, 32);"
+            "  border-radius: 10px;"
+            "  padding: 8px 14px;"
+            "  font-size: 13px;"
+            "  font-weight: 600;"
+            "  min-height: 22px;"
+            "}"
+            "QPushButton#sessionSaveCancelButton:hover, QPushButton#sessionSaveSkipButton:hover {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #464554, stop:1 #383743);"
+            "  border: 1px solid rgba(255, 255, 255, 48);"
+            "}"
+            "QPushButton#sessionSaveCancelButton:pressed, QPushButton#sessionSaveSkipButton:pressed {"
+            "  background-color: #2A2932;"
+            "}"
+            "QPushButton#sessionSaveCancelButton:focus, QPushButton#sessionSaveSkipButton:focus {"
+            "  border: 2px solid %1;"
+            "}"
+            "QPushButton#sessionSaveConfirmButton {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F3B321, stop:1 #D97917);"
+            "  color: #17161B;"
+            "  border: 1px solid rgba(255, 230, 140, 145);"
+            "  border-radius: 10px;"
+            "  padding: 8px 14px;"
+            "  font-size: 13px;"
+            "  font-weight: 700;"
+            "  min-height: 22px;"
+            "}"
+            "QPushButton#sessionSaveConfirmButton:hover {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FFC63B, stop:1 #E88721);"
+            "  border: 1px solid rgba(255, 240, 175, 190);"
+            "}"
+            "QPushButton#sessionSaveConfirmButton:pressed {"
+            "  background-color: #C36912;"
+            "}"
+            "QPushButton#sessionSaveConfirmButton:focus {"
+            "  border: 2px solid #FFFFFF;"
+            "}"
+        ).arg(QString::fromLatin1(GhosttyUnionTheme::kGoldHex)));
+
+        auto *shadow = new QGraphicsDropShadowEffect(m_card);
+        shadow->setBlurRadius(46.0);
+        shadow->setOffset(0.0, 14.0);
+        shadow->setColor(QColor(0, 0, 0, 195));
+        m_card->setGraphicsEffect(shadow);
+
+        auto *cardLayout = new QVBoxLayout(m_card);
+        cardLayout->setContentsMargins(24, 24, 24, 18);
+        cardLayout->setSpacing(10);
+
+        auto *badgeRow = new QHBoxLayout();
+        badgeRow->addStretch(1);
+        badgeRow->addWidget(new ModalSessionBadge(m_card));
+        badgeRow->addStretch(1);
+        cardLayout->addLayout(badgeRow);
+
+        m_titleLabel = new QLabel(QStringLiteral("Save Layout Before Closing?"), m_card);
+        m_titleLabel->setObjectName(QStringLiteral("sessionSaveTitle"));
+        m_titleLabel->setAlignment(Qt::AlignHCenter);
+        cardLayout->addWidget(m_titleLabel);
+
+        auto *pillWrap = new QHBoxLayout();
+        pillWrap->addStretch(1);
+        auto *summaryPill = new QFrame(m_card);
+        summaryPill->setObjectName(QStringLiteral("sessionSaveSummaryPill"));
+        auto *pillLayout = new QHBoxLayout(summaryPill);
+        pillLayout->setContentsMargins(10, 5, 10, 5);
+        pillLayout->setSpacing(7);
+
+        auto *summaryDot = new QLabel(QStringLiteral("●"), summaryPill);
+        summaryDot->setObjectName(QStringLiteral("sessionSaveSummaryDot"));
+        pillLayout->addWidget(summaryDot);
+
+        m_summaryLabel = new QLabel(summaryPill);
+        m_summaryLabel->setObjectName(QStringLiteral("sessionSaveSummaryText"));
+        pillLayout->addWidget(m_summaryLabel);
+
+        pillWrap->addWidget(summaryPill);
+        pillWrap->addStretch(1);
+        cardLayout->addLayout(pillWrap);
+
+        m_bodyLabel = new QLabel(m_card);
+        m_bodyLabel->setObjectName(QStringLiteral("sessionSaveBody"));
+        m_bodyLabel->setAlignment(Qt::AlignHCenter);
+        m_bodyLabel->setWordWrap(true);
+        cardLayout->addWidget(m_bodyLabel);
+
+        cardLayout->addSpacing(8);
+
+        auto *btnRow = new QHBoxLayout();
+        btnRow->setSpacing(10);
+
+        m_cancelBtn = new QPushButton(QStringLiteral("Cancel"), m_card);
+        m_cancelBtn->setObjectName(QStringLiteral("sessionSaveCancelButton"));
+        m_cancelBtn->setAutoDefault(false);
+        m_cancelBtn->setDefault(false);
+        m_cancelBtn->setCursor(Qt::PointingHandCursor);
+
+        m_skipBtn = new QPushButton(QStringLiteral("Don't Save"), m_card);
+        m_skipBtn->setObjectName(QStringLiteral("sessionSaveSkipButton"));
+        m_skipBtn->setAutoDefault(false);
+        m_skipBtn->setDefault(false);
+        m_skipBtn->setCursor(Qt::PointingHandCursor);
+
+        m_saveBtn = new QPushButton(QStringLiteral("Save && Close"), m_card);
+        m_saveBtn->setObjectName(QStringLiteral("sessionSaveConfirmButton"));
+        m_saveBtn->setAutoDefault(false);
+        m_saveBtn->setDefault(false);
+        m_saveBtn->setCursor(Qt::PointingHandCursor);
+
+        connect(m_cancelBtn, &QPushButton::clicked, this, [this]() { triggerCancel(); });
+        connect(m_skipBtn, &QPushButton::clicked, this, [this]() { triggerSkip(); });
+        connect(m_saveBtn, &QPushButton::clicked, this, [this]() { triggerSave(); });
+
+        btnRow->addWidget(m_cancelBtn, 1);
+        btnRow->addWidget(m_skipBtn, 1);
+        btnRow->addWidget(m_saveBtn, 1);
+        cardLayout->addLayout(btnRow);
+
+        cardLayout->addSpacing(2);
+        auto *hintLabel = new QLabel(QStringLiteral("Esc  Cancel   ·   ← →  Switch   ·   Enter  Confirm"), m_card);
+        hintLabel->setObjectName(QStringLiteral("sessionSaveKeyHint"));
+        hintLabel->setAlignment(Qt::AlignHCenter);
+        cardLayout->addWidget(hintLabel);
+
+        centerRow->addWidget(m_card);
+        centerRow->addStretch(1);
+        outerLayout->addLayout(centerRow);
+        outerLayout->addStretch(1);
+
+        m_revealAnim = new QVariantAnimation(this);
+        m_revealAnim->setDuration(140);
+        m_revealAnim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_revealAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
+            m_revealProgress = v.toReal();
+            if (m_card) {
+                m_card->setRevealProgress(m_revealProgress);
+            }
+            update();
+        });
+    }
+
+    void present(int openWindowCount,
+                 int totalTabs,
+                 int totalPanes,
+                 bool multiWindowAlreadySaved,
+                 std::function<void()> onSave,
+                 std::function<void()> onSkip,
+                 std::function<void()> onCancel) {
+        m_onSave = std::move(onSave);
+        m_onSkip = std::move(onSkip);
+        m_onCancel = std::move(onCancel);
+
+        const QString tabWord = (totalTabs == 1) ? QStringLiteral("tab") : QStringLiteral("tabs");
+        const QString paneWord = (totalPanes == 1) ? QStringLiteral("pane") : QStringLiteral("panes");
+        if (openWindowCount > 1) {
+            m_summaryLabel->setText(QStringLiteral("%1 open windows · %2 %3 · %4 %5")
+                                        .arg(openWindowCount)
+                                        .arg(totalTabs)
+                                        .arg(tabWord)
+                                        .arg(totalPanes)
+                                        .arg(paneWord));
+            m_saveBtn->setText(QStringLiteral("Save All (%1)").arg(openWindowCount));
+            if (multiWindowAlreadySaved) {
+                m_bodyLabel->setText(QStringLiteral(
+                    "All open windows were already saved this session. Choose Don't Save to keep that layout, or Save All to update it."));
+            } else {
+                m_bodyLabel->setText(QStringLiteral(
+                    "Save all %1 open windows to reopen together next time, or close without saving to decide on the last window.")
+                                         .arg(openWindowCount));
+            }
+        } else {
+            m_summaryLabel->setText(QStringLiteral("%1 %2 · %3 %4")
+                                        .arg(totalTabs)
+                                        .arg(tabWord)
+                                        .arg(totalPanes)
+                                        .arg(paneWord));
+            m_saveBtn->setText(QStringLiteral("Save && Close"));
+            if (multiWindowAlreadySaved) {
+                m_bodyLabel->setText(QStringLiteral(
+                    "A multi-window layout was already saved this session. Choose Don't Save to keep it, or Save & Close to replace it with just this window."));
+            } else {
+                m_bodyLabel->setText(QStringLiteral(
+                    "Save your tabs, split layout, and working directories so ghostty-union restores this layout next time."));
+            }
+        }
+
+        m_frostedBackdrop = {};
+        if (QWidget *pw = parentWidget()) {
+            setGeometry(pw->rect());
+            m_frostedBackdrop = createFrostedBackdrop(pw->grab());
+        }
+
+        m_revealProgress = 0.0;
+        if (m_card) {
+            m_card->setRevealProgress(0.0);
+        }
+        raise();
+        show();
+        if (multiWindowAlreadySaved) {
+            m_skipBtn->setFocus(Qt::PopupFocusReason);
+        } else {
+            m_saveBtn->setFocus(Qt::PopupFocusReason);
+        }
+
+        m_revealAnim->stop();
+        m_revealAnim->setStartValue(0.0);
+        m_revealAnim->setEndValue(1.0);
+        m_revealAnim->start();
+        update();
+    }
+
+    void dismiss() {
+        m_revealAnim->stop();
+        m_frostedBackdrop = {};
+        m_onSave = nullptr;
+        m_onSkip = nullptr;
+        m_onCancel = nullptr;
+        hide();
+    }
+
+protected:
+    void paintEvent(QPaintEvent * /*event*/) override {
+        QPainter p(this);
+        const qreal t = std::clamp(m_revealProgress, 0.25, 1.0);
+
+        if (!m_frostedBackdrop.isNull()) {
+            p.save();
+            p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            p.setOpacity(0.92 * t);
+            p.drawPixmap(rect(), m_frostedBackdrop);
+            p.restore();
+        }
+
+        const QPointF center(width() * 0.5, height() * 0.5);
+        const qreal rad = std::max(width(), height()) * 0.72;
+        QRadialGradient scrim(center, std::max(1.0, rad));
+        scrim.setColorAt(0.0, QColor(0x11, 0x10, 0x16, static_cast<int>(155.0 * t)));
+        scrim.setColorAt(1.0, QColor(0x09, 0x08, 0x0C, static_cast<int>(222.0 * t)));
+        p.fillRect(rect(), scrim);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override {
+        if (m_card && !m_card->geometry().contains(event->position().toPoint())) {
+            triggerCancel();
+        }
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override { event->accept(); }
+    void mouseMoveEvent(QMouseEvent *event) override { event->accept(); }
+    void wheelEvent(QWheelEvent *event) override { event->accept(); }
+
+    bool focusNextPrevChild(bool next) override {
+        return stepFocus(next ? 1 : -1);
+    }
+
+    void keyPressEvent(QKeyEvent *event) override {
+        if (event->key() == Qt::Key_Escape) {
+            triggerCancel();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Left) {
+            stepFocus(-1);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Right) {
+            stepFocus(1);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            if (m_cancelBtn && m_cancelBtn->hasFocus()) {
+                triggerCancel();
+            } else if (m_skipBtn && m_skipBtn->hasFocus()) {
+                triggerSkip();
+            } else {
+                triggerSave();
+            }
+            event->accept();
+            return;
+        }
+        event->accept();
+    }
+
+private:
+    bool stepFocus(int delta) {
+        const QList<QPushButton *> ring = {m_cancelBtn, m_skipBtn, m_saveBtn};
+        int cur = -1;
+        for (int i = 0; i < ring.size(); ++i) {
+            if (ring[i] && ring[i]->hasFocus()) {
+                cur = i;
+                break;
+            }
+        }
+        const int target = (cur < 0) ? 0 : (cur + delta + ring.size()) % ring.size();
+        if (ring[target]) {
+            ring[target]->setFocus(Qt::TabFocusReason);
+            return true;
+        }
+        return false;
+    }
+
+    void triggerSave() {
+        auto cb = std::move(m_onSave);
+        dismiss();
+        if (cb) {
+            cb();
+        }
+    }
+
+    void triggerSkip() {
+        auto cb = std::move(m_onSkip);
+        dismiss();
+        if (cb) {
+            cb();
+        }
+    }
+
+    void triggerCancel() {
+        auto cb = std::move(m_onCancel);
+        dismiss();
+        if (cb) {
+            cb();
+        }
+    }
+
+    ModalCardWidget *m_card = nullptr;
+    QLabel *m_titleLabel = nullptr;
+    QLabel *m_summaryLabel = nullptr;
+    QLabel *m_bodyLabel = nullptr;
+    QPushButton *m_cancelBtn = nullptr;
+    QPushButton *m_skipBtn = nullptr;
+    QPushButton *m_saveBtn = nullptr;
+    QVariantAnimation *m_revealAnim = nullptr;
+    QPixmap m_frostedBackdrop;
+    qreal m_revealProgress = 1.0;
+    std::function<void()> m_onSave;
+    std::function<void()> m_onSkip;
+    std::function<void()> m_onCancel;
+};
+
 MainWindow::MainWindow(const QString &initialCwd,
                        QWidget *parent,
                        std::optional<GhosttyUnionTheme::TerminalThemeId> themeOverride)
     : QMainWindow(parent),
       m_themeId(themeOverride.value_or(GhosttyUnionTheme::loadSavedTerminalTheme())) {
+    initWindowChrome();
+    addNewTab(initialCwd.isEmpty() ? QDir::currentPath() : initialCwd);
+}
+
+MainWindow::MainWindow(const GhosttyUnionSession::SessionWindowState &sessionState,
+                       QWidget *parent,
+                       std::optional<GhosttyUnionTheme::TerminalThemeId> themeOverride)
+    : QMainWindow(parent),
+      m_themeId(themeOverride.value_or(GhosttyUnionTheme::loadSavedTerminalTheme())) {
+    initWindowChrome();
+    restoreSessionWindowState(sessionState);
+}
+
+void MainWindow::initWindowChrome() {
     setWindowTitle(QStringLiteral("ghostty-union"));
     resize(1220, 780);
     setStyleSheet(QStringLiteral("QMainWindow { background-color: %1; }")
@@ -1601,8 +2073,106 @@ MainWindow::MainWindow(const QString &initialCwd,
     m_renameModal = new TabRenameModalOverlay(this);
     m_renameModal->setGeometry(rect());
 
+    m_sessionSaveModal = new SessionSaveModalOverlay(this);
+    m_sessionSaveModal->setGeometry(rect());
+
     wireShortcuts();
-    addNewTab(initialCwd.isEmpty() ? QDir::currentPath() : initialCwd);
+}
+
+void MainWindow::restoreSessionWindowState(const GhosttyUnionSession::SessionWindowState &sessionState) {
+    if (!sessionState.geometry.isEmpty()) {
+        restoreGeometry(sessionState.geometry);
+    }
+
+    if (sessionState.tabs.isEmpty()) {
+        addNewTab(QDir::currentPath());
+        return;
+    }
+
+    {
+        const QSignalBlocker blocker(m_tabs);
+        for (const GhosttyUnionSession::SessionTabState &tabState : sessionState.tabs) {
+            if (!tabState.isValid()) {
+                continue;
+            }
+            auto *pane = new TerminalTabPane(tabState, m_themeId, m_tabs);
+            wirePaneSignals(pane);
+            const int idx = m_tabs->addTab(pane, pane->title());
+            m_tabs->setTabToolTip(idx, pane->title());
+        }
+    }
+
+    if (m_tabs->count() == 0) {
+        addNewTab(QDir::currentPath());
+        return;
+    }
+
+    const int activeIdx = std::clamp(sessionState.activeTabIndex, 0, m_tabs->count() - 1);
+    m_tabs->setCurrentIndex(activeIdx);
+    if (auto *active = currentPane()) {
+        recordTabVisit(active);
+        active->focusActive();
+    }
+    updateWindowTitle();
+}
+
+GhosttyUnionSession::SessionWindowState MainWindow::captureSessionState() const {
+    GhosttyUnionSession::SessionWindowState winState;
+    winState.geometry = saveGeometry();
+    winState.maximized = isMaximized();
+    winState.activeTabIndex = m_tabs ? std::max(0, m_tabs->currentIndex()) : 0;
+
+    if (m_tabs) {
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (const auto *pane = qobject_cast<TerminalTabPane *>(m_tabs->widget(i))) {
+                winState.tabs.append(pane->captureSessionState());
+            }
+        }
+    }
+    return winState;
+}
+
+QList<MainWindow *> MainWindow::openWindows() {
+    QList<MainWindow *> result;
+    const QWidgetList topLevels = QApplication::topLevelWidgets();
+    for (QWidget *w : topLevels) {
+        auto *mw = qobject_cast<MainWindow *>(w);
+        if (mw && mw->m_tabs && mw->m_tabs->count() > 0) {
+            result.append(mw);
+        }
+    }
+    return result;
+}
+
+void MainWindow::resetMultiWindowSessionSavedFlagForTesting() {
+    g_multiWindowLayoutSavedThisSession = false;
+}
+
+bool MainWindow::saveSessionLayout(bool includeAllWindows, const QString &filePath) const {
+    GhosttyUnionSession::SessionState session;
+    session.version = 1;
+
+    if (includeAllWindows) {
+        const QList<MainWindow *> wins = openWindows();
+        for (const MainWindow *mw : wins) {
+            const auto state = mw->captureSessionState();
+            if (state.isValid()) {
+                session.windows.append(state);
+            }
+        }
+    }
+    if (session.windows.isEmpty()) {
+        const auto selfState = captureSessionState();
+        if (selfState.isValid()) {
+            session.windows.append(selfState);
+        }
+    }
+
+    const bool ok = GhosttyUnionSession::saveToFile(session, filePath);
+    if (ok) {
+        g_multiWindowLayoutSavedThisSession = (session.windows.size() > 1);
+    }
+    return ok;
 }
 
 TerminalTabPane *MainWindow::currentPane() const {
@@ -1617,8 +2187,12 @@ bool MainWindow::isTabRenameModalVisible() const {
     return m_renameModal != nullptr && m_renameModal->isVisible();
 }
 
+bool MainWindow::isSessionSaveModalVisible() const {
+    return m_sessionSaveModal != nullptr && m_sessionSaveModal->isVisible();
+}
+
 bool MainWindow::isAnyModalVisible() const {
-    return isTabCloseModalVisible() || isTabRenameModalVisible();
+    return isTabCloseModalVisible() || isTabRenameModalVisible() || isSessionSaveModalVisible();
 }
 
 void MainWindow::recordTabVisit(TerminalTabPane *pane) {
@@ -1771,6 +2345,23 @@ void MainWindow::showTabContextMenu(int index, const QPoint &globalPos) {
 
     menu->addSeparator();
 
+    QAction *saveLayoutAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::Duplicate, goldCol),
+        QStringLiteral("Save Layout Now\tCtrl+Shift+S"));
+    connect(saveLayoutAct, &QAction::triggered, this, [this]() {
+        saveSessionLayout(/*includeAllWindows=*/openWindows().size() > 1);
+    });
+
+    QAction *clearLayoutAct = menu->addAction(
+        GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::ResetName, cyanCol),
+        QStringLiteral("Clear Saved Layout"));
+    connect(clearLayoutAct, &QAction::triggered, this, []() {
+        GhosttyUnionSession::clearSessionFile();
+        g_multiWindowLayoutSavedThisSession = false;
+    });
+
+    menu->addSeparator();
+
     QAction *closeAct = menu->addAction(
         GhosttyUnionTheme::makeSolarForgeMenuIcon(GhosttyUnionTheme::MenuIcon::CloseTab, redCol),
         QStringLiteral("Close Tab\tCtrl+Shift+W"));
@@ -1876,6 +2467,77 @@ void MainWindow::confirmPendingTabClose() {
     }
 }
 
+void MainWindow::requestCloseWithSessionPrompt() {
+    if (!m_tabs || m_tabs->count() == 0 || !m_sessionSaveModal) {
+        m_bypassSavePrompt = true;
+        close();
+        return;
+    }
+    if (isSessionSaveModalVisible()) {
+        return;
+    }
+    if (isTabCloseModalVisible()) {
+        dismissTabCloseModal(/*restoreFocus=*/false);
+    }
+    if (isTabRenameModalVisible()) {
+        dismissTabRenameModal(/*restoreFocus=*/false);
+    }
+
+    const QList<MainWindow *> wins = openWindows();
+    const int winCount = std::max(1, static_cast<int>(wins.size()));
+    const bool includeAll = (winCount > 1);
+    int totalTabs = 0;
+    int totalPanes = 0;
+    if (includeAll) {
+        for (const MainWindow *mw : wins) {
+            if (!mw || !mw->m_tabs) {
+                continue;
+            }
+            totalTabs += mw->m_tabs->count();
+            for (int i = 0; i < mw->m_tabs->count(); ++i) {
+                if (const auto *p = qobject_cast<TerminalTabPane *>(mw->m_tabs->widget(i))) {
+                    totalPanes += p->terminalCount();
+                }
+            }
+        }
+    } else {
+        totalTabs = m_tabs->count();
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            if (const auto *p = qobject_cast<TerminalTabPane *>(m_tabs->widget(i))) {
+                totalPanes += p->terminalCount();
+            }
+        }
+    }
+
+    m_sessionSaveModal->present(
+        winCount,
+        std::max(1, totalTabs),
+        std::max(1, totalPanes),
+        g_multiWindowLayoutSavedThisSession,
+        [this, includeAll]() { finishCloseAfterPrompt(/*saveLayout=*/true, includeAll); },
+        [this]() { finishCloseAfterPrompt(/*saveLayout=*/false, /*includeAllWindows=*/false); },
+        [this]() { dismissSessionSaveModal(/*restoreFocus=*/true); });
+}
+
+void MainWindow::dismissSessionSaveModal(bool restoreFocus) {
+    if (m_sessionSaveModal && m_sessionSaveModal->isVisible()) {
+        m_sessionSaveModal->dismiss();
+    }
+    if (restoreFocus) {
+        if (auto *active = currentPane()) {
+            active->focusActive();
+        }
+    }
+}
+
+void MainWindow::finishCloseAfterPrompt(bool saveLayout, bool includeAllWindows) {
+    if (saveLayout) {
+        saveSessionLayout(includeAllWindows);
+    }
+    m_bypassSavePrompt = true;
+    close();
+}
+
 void MainWindow::closeTabAt(int index) {
     if (index < 0 || index >= m_tabs->count()) {
         return;
@@ -1964,10 +2626,15 @@ void MainWindow::wireShortcuts() {
     };
 
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N), [this]() {
+        g_multiWindowLayoutSavedThisSession = false;
         const QString cwd = currentPane() ? currentPane()->currentWorkingDirectory() : QDir::homePath();
         auto *win = new MainWindow(cwd, nullptr, m_themeId);
         win->setAttribute(Qt::WA_DeleteOnClose);
         win->show();
+    });
+
+    addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S), [this]() {
+        saveSessionLayout(/*includeAllWindows=*/openWindows().size() > 1);
     });
 
     addBind(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T), [this]() { addNewTab(); });
@@ -2102,6 +2769,15 @@ void MainWindow::changeEvent(QEvent *event) {
     }
 }
 
+void MainWindow::closeEvent(QCloseEvent *event) {
+    if (!m_bypassSavePrompt && event && event->spontaneous() && m_tabs && m_tabs->count() > 0) {
+        requestCloseWithSessionPrompt();
+        event->ignore();
+        return;
+    }
+    QMainWindow::closeEvent(event);
+}
+
 void MainWindow::hideEvent(QHideEvent *event) {
     QMainWindow::hideEvent(event);
     if (m_statsBar) {
@@ -2123,5 +2799,8 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
     }
     if (m_renameModal) {
         m_renameModal->setGeometry(rect());
+    }
+    if (m_sessionSaveModal) {
+        m_sessionSaveModal->setGeometry(rect());
     }
 }

@@ -4049,6 +4049,47 @@ void TerminalWidget::copySelection() const {
     copySelectionToClipboard(m_terminal, QClipboard::Clipboard);
 }
 
+QString TerminalWidget::liveWorkingDirectory() const {
+    auto readProcCwd = [](pid_t pid) -> QString {
+        if (pid <= 0) {
+            return {};
+        }
+        const QString target = QFileInfo(QStringLiteral("/proc/%1/cwd").arg(pid)).symLinkTarget();
+        if (!target.isEmpty()) {
+            const QFileInfo fi(target);
+            if (fi.exists() && fi.isDir()) {
+                return fi.absoluteFilePath();
+            }
+        }
+        return {};
+    };
+
+    QString procCwd;
+    if (m_ptyMasterFd >= 0) {
+        const pid_t fgPid = ::tcgetpgrp(m_ptyMasterFd);
+        if (fgPid > 0) {
+            procCwd = readProcCwd(fgPid);
+        }
+    }
+    if (procCwd.isEmpty() && m_childPid > 0) {
+        procCwd = readProcCwd(m_childPid);
+    }
+
+    if (!procCwd.isEmpty()) {
+        if (!m_pwd.isEmpty()) {
+            const QFileInfo pwdInfo(m_pwd);
+            const QFileInfo procInfo(procCwd);
+            if (pwdInfo.exists() && pwdInfo.isDir() &&
+                pwdInfo.canonicalFilePath() == procInfo.canonicalFilePath()) {
+                return m_pwd;
+            }
+        }
+        return procCwd;
+    }
+
+    return m_pwd;
+}
+
 QString TerminalWidget::plainTextSnapshot() const {
     if (!m_terminal) {
         return {};
@@ -4920,7 +4961,7 @@ bool TerminalWidget::onDeviceAttributesQuery(GhosttyTerminal /*terminal*/, void 
 }
 
 GhosttyString TerminalWidget::onXtversionQuery(GhosttyTerminal /*terminal*/, void * /*userdata*/) {
-    static constexpr const char kVer[] = "ghostty-union 0.1.0";
+    static constexpr const char kVer[] = "ghostty-union 1.0.0";
     return GhosttyString{reinterpret_cast<const uint8_t *>(kVer), sizeof(kVer) - 1};
 }
 
