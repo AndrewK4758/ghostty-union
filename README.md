@@ -1,9 +1,9 @@
 # Ghostty Union
 
-A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge** cockpit UI and default terminal palette (with built-in **Ollie** theme switching), dynamic nested split trees with drag-and-drop rearrangement, native session & layout persistence, and a mounted **74px live system telemetry bar**.
+A native Qt6 Widgets cross-platform terminal emulator (**Linux**, **WSL2**, **macOS**, and **Windows PowerShell/ConPTY**) powered by **`libghostty-vt` (1.0+)**, featuring a **Solar Forge** cockpit UI and default terminal palette (with built-in **Ollie** theme switching), dynamic nested split trees with drag-and-drop rearrangement, native session & layout persistence, and a mounted **74px live system telemetry bar**.
 
-> **Looking for WSL2 & macOS Testers!**
-> With the `v1.0.0` release, we are actively looking for community testers on **WSL2 / WSLg** (Windows 10/11) and **macOS** (Apple Silicon & Intel) to help verify build instructions, HiDPI/display behavior, `libghostty-vt` integration, and platform-specific edge cases (macOS will need PTY/telemetry portability feedback). If you can test on WSL2 or macOS, please open an issue or PR with your OS/distro version, Qt6 version, and any build or runtime logs!
+> **Looking for WSL2, macOS & Windows Testers!**
+> With the `v1.0.0` release, native **macOS** (POSIX PTY + Mach/BSD telemetry) and **Windows** (ConPTY + PowerShell 7/5.1 + Win32 telemetry) backends are now included alongside Linux/WSL2. We are actively looking for community testers on **WSL2 / WSLg**, **macOS** (Apple Silicon & Intel), and **Windows 10/11 (PowerShell)** to verify builds, HiDPI rendering, and platform edge cases. Please open an issue or PR with your OS version, Qt6 version, and any build or runtime logs!
 
 ## Features
 
@@ -79,17 +79,16 @@ A native Qt6 Widgets Linux terminal emulator powered by **`libghostty-vt` (1.0+)
 
 ## Platform & Desktop Environment Support
 
-**Short answer:** Yes — `ghostty-union` runs on **any modern Linux distribution** and **any X11 or Wayland desktop environment or window manager** (GNOME, Hyprland, Sway, i3, Cosmic, XFCE, Cinnamon, KDE Plasma, etc.). It is **not** locked to Arch Linux or KDE Plasma.
+**Short answer:** `ghostty-union` runs natively on **Linux** (any modern distro and X11/Wayland DE/WM, plus **WSL2/WSLg**), **macOS** (Apple Silicon & Intel), and **Windows 10/11** (native **ConPTY** with PowerShell 7 `pwsh.exe` / Windows PowerShell `powershell.exe` / `cmd.exe`). It is **not** locked to Arch Linux or KDE Plasma.
 
 ### What Is Required vs. Optional
 
 | Component | Scope | Notes |
 |---|---|---|
-| **Linux (POSIX PTY)** | Required | Uses Linux `<pty.h>` (`openpty`, `fork`, `setsid`, `TIOCSCTTY`). macOS and Windows are not currently supported without porting the PTY and telemetry layers. |
-| **Qt 6.8+** (`Core`, `Gui`, `Widgets`, `Network`, `DBus`, `Test`) | Required | Pure Qt6 Widgets app — no dependency on KWin, Plasma Shell, `KXmlGui`, or `KParts`. Older LTS distros (e.g., Ubuntu 24.04 with Qt 6.4) need a newer Qt6 toolchain (Ubuntu 25.04+/26.04, Fedora 41+, Debian 13/Trixie+, Arch, NixOS). |
-| **`libghostty-vt` >= 1.0** | Required | Packaged directly on Arch (`libghostty-vt`). On other Linux distros, build and install `libghostty-vt` from [`ghostty-org/ghostty`](https://github.com/ghostty-org/ghostty) into `/usr` or `/usr/local`. |
-| **`libksysguard`** (`KSysGuard::SystemStats`, `KSysGuard::Formatter`) | Required at build time | Standalone KDE library packaged on most distros (`libksysguard` on Arch, `libksysguard-devel` + `lm_sensors-devel` on Fedora, `libksysguard-dev` + `libsensors-dev` on Debian/Ubuntu) without needing a Plasma session. `KSysGuard::SystemStats` links `libsensors.so` at build time even on WSL2. |
-| **`ksystemstats` daemon** | Optional at runtime | Provides live CPU, RAM, GPU, and network throughput telemetry over session D-Bus (`org.kde.ksystemstats1`) and can run headless under GNOME/Hyprland/Sway/i3. Without it, the terminal works normally and those sensor cards simply show `--`. |
+| **Terminal Backend (PTY)** | Built-in per OS | **Linux:** POSIX `<pty.h>` + `/proc/<pid>/cwd`. **macOS:** POSIX `<util.h>` + `libproc` (`proc_pidinfo`). **Windows 10/11:** Native **ConPTY** (`CreatePseudoConsole`) launching `pwsh.exe` → `powershell.exe` → `%COMSPEC%`. |
+| **Qt 6.8+** (`Core`, `Gui`, `Widgets`, `Network`, `Test`, + `DBus` on Linux) | Required | Pure Qt6 Widgets app — no dependency on KWin, Plasma Shell, `KXmlGui`, or `KParts`. Older LTS Linux distros (e.g., Ubuntu 24.04 with Qt 6.4) need a newer Qt6 toolchain. |
+| **`libghostty-vt` >= 1.0** | Required | Packaged directly on Arch (`libghostty-vt`). On other Linux distros, macOS, and Windows, build from [`ghostty-org/ghostty`](https://github.com/ghostty-org/ghostty) via `zig build -Demit-lib-vt -Doptimize=ReleaseFast`. |
+| **System Telemetry Bar** | Built-in per OS | **Linux:** Uses `libksysguard` (`ksystemstats` over D-Bus, optional at runtime). **macOS:** Native Mach/BSD (`host_statistics`, `sysctl`, `getifaddrs`) — no KDE dependencies. **Windows:** Native Win32 (`GetSystemTimes`, `GlobalMemoryStatusEx`, `GetIfTable2`) — no KDE dependencies. |
 | **Ghostty terminfo & shell integration** | Optional | Auto-used if `/usr/share/terminfo/x/xterm-ghostty` and `/usr/share/ghostty/shell-integration/zsh` exist; otherwise cleanly falls back to `TERM=xterm-256color`. |
 | **`kate`** | Optional | Used for `Ctrl+Click` on `file:line:col` links if found in `PATH`; otherwise falls back to `xdg-open` (`QDesktopServices`). |
 | **FiraCode Nerd Font** | Optional | Preferred font (`FiraCode Nerd Font SemBd`); falls back to the system monospace font if not installed. |
@@ -130,6 +129,36 @@ sudo apt install cmake build-essential git curl xz-utils qt6-base-dev libksysgua
 - **Do not use `apt install zig`:** Debian/Ubuntu repositories ship older Zig releases (e.g. `0.14.x`), which fail to compile `ghostty` (`main` currently requires Zig `0.17.1`, declared in `build.zig.zon`). Fetch the exact official Zig tarball from `ziglang.org` as shown in the next section.
 
 > **Note for Ubuntu 24.04 LTS:** Ubuntu 24.04 ships Qt 6.4, which is below the `Qt6 6.8+` requirement in `CMakeLists.txt`. Use **Ubuntu 25.04+**, **Debian 13 (Trixie)+**, **Fedora 41+**, or **Arch Linux** (native or WSL2).
+
+#### macOS (Apple Silicon & Intel)
+```bash
+brew install cmake qt@6
+```
+Build `libghostty-vt` from `ghostty-org/ghostty` using the official Zig tarball matching `build.zig.zon`:
+```bash
+zig build -Demit-lib-vt -Doptimize=ReleaseFast --prefix "$HOME/.local"
+```
+Then configure and build `ghostty-union` (no KDE / `libksysguard` required):
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$HOME/.local"
+cmake --build build -j"$(sysctl -n hw.ncpu)"
+ctest --test-dir build --output-on-failure
+```
+
+#### Windows 10/11 (Native PowerShell / ConPTY)
+Requires **Visual Studio 2022** (C++20 workload) or **MinGW-w64**, **CMake >= 3.24**, **Qt 6.8+** (installed via Qt Online Installer or `aqtinstall`), and **`libghostty-vt`** built from `ghostty-org/ghostty` with the official Zig release matching `build.zig.zon`:
+```powershell
+# In ghostty checkout (builds libghostty-vt into C:\ghostty-vt):
+zig build -Demit-lib-vt -Doptimize=ReleaseFast --prefix C:\ghostty-vt
+
+# In ghostty-union checkout (no KDE / libksysguard required):
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="C:\Qt\6.8.3\msvc2022_64;C:\ghostty-vt"
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
+```
+On launch, `ghostty-union.exe` automatically spawns **PowerShell 7** (`pwsh.exe`) if installed, falling back to **Windows PowerShell** (`powershell.exe`) and then `%COMSPEC%` (`cmd.exe`) over native Windows **ConPTY**.
 
 ### Building `libghostty-vt` from Source
 

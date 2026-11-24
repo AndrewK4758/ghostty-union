@@ -1,13 +1,25 @@
 #include "StatsBarWidget.h"
 #include "Theme.h"
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
 #include <systemstats/DBusInterface.h>
-
-#include <QApplication>
-#include <QClipboard>
 #include <QDBusMetaType>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
+#elif defined(Q_OS_WIN)
+#include <winsock2.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#elif defined(Q_OS_MACOS)
+#include <ifaddrs.h>
+#include <mach/mach.h>
+#include <net/if.h>
+#include <sys/sysctl.h>
+#endif
+
+#include <QApplication>
+#include <QClipboard>
 #include <QDateTime>
 #include <QDir>
 #include <QEasingCurve>
@@ -1508,6 +1520,7 @@ StatsBarWidget::StatsBarWidget(QWidget *parent)
     setFixedHeight(kBarHeightPx);
     buildUi();
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
     qDBusRegisterMetaType<KSysGuard::SensorInfo>();
     qDBusRegisterMetaType<KSysGuard::SensorInfoMap>();
     qDBusRegisterMetaType<KSysGuard::SensorData>();
@@ -1532,6 +1545,7 @@ StatsBarWidget::StatsBarWidget(QWidget *parent)
                     discoverGpusFromDbus();
                 }
             });
+#endif
 
     m_netAccess = new QNetworkAccessManager(this);
 
@@ -1560,10 +1574,12 @@ StatsBarWidget::~StatsBarWidget() {
         m_publicIpReply->deleteLater();
         m_publicIpReply.clear();
     }
+#if GHOSTTY_UNION_USE_KSYSGUARD
     if (m_dbus && !m_subscribedSensorIds.isEmpty()) {
         m_dbus->unsubscribe(m_subscribedSensorIds);
         m_subscribedSensorIds.clear();
     }
+#endif
 }
 
 void StatsBarWidget::paintEvent(QPaintEvent *event) {
@@ -1765,6 +1781,9 @@ void StatsBarWidget::applyGpuDescriptors(const QList<GpuDescriptor> &gpus) {
 }
 
 void StatsBarWidget::syncSensorSubscriptions() {
+#if !GHOSTTY_UNION_USE_KSYSGUARD
+    return;
+#else
     QStringList desired = m_baseSensorIds;
     for (const GpuCardEntry &g : m_gpuEntries) {
         if (!g.usageId.isEmpty()) {
@@ -1819,9 +1838,13 @@ void StatsBarWidget::syncSensorSubscriptions() {
         });
     }
     m_subscribedSensorIds = desired;
+#endif
 }
 
 void StatsBarWidget::discoverGpusFromDbus() {
+#if !GHOSTTY_UNION_USE_KSYSGUARD
+    return;
+#else
     if (!m_dbus || m_testingGpusOverride) {
         return;
     }
@@ -1973,6 +1996,7 @@ void StatsBarWidget::discoverGpusFromDbus() {
             }
         });
     });
+#endif
 }
 
 void StatsBarWidget::setGpusForTesting(const QList<GpuDescriptor> &gpus) {
@@ -2014,6 +2038,7 @@ void StatsBarWidget::setSensorsEnabled(bool enabled) {
     }
 }
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
 void StatsBarWidget::onNewSensorData(const KSysGuard::SensorDataList &updates) {
     auto isTrackedSensor = [this](const QString &id) {
         if (m_baseSensorIds.contains(id) || m_subscribedSensorIds.contains(id)) {
@@ -2038,6 +2063,174 @@ void StatsBarWidget::onNewSensorData(const KSysGuard::SensorDataList &updates) {
         refreshDisplay();
     }
 }
+#else
+void StatsBarWidget::pollNativeSensors() {
+    bool touched = false;
+
+#if defined(Q_OS_WIN)
+    // CPU utilization via GetSystemTimes delta
+    FILETIME idleFt{}, kernelFt{}, userFt{};
+    if (::GetSystemTimes(&idleFt, &kernelFt, &userFt)) {
+        auto toU64 = [](const FILETIME &ft) -> quint64 {
+            return (static_cast<quint64>(ft.dwHighDateTime) << 32) | static_cast<quint64>(ft.dwLowDateTime);
+        };
+        const quint64 idle = toU64(idleFt);
+        const quint64 total = toU64(kernelFt) + toU64(userFt);
+        if (m_hasPrevCpu && total > m_prevCpuTotal) {
+            const quint64 dIdle = idle - m_prevCpuIdle;
+            const quint64 dTotal = total - m_prevCpuTotal;
+            const double busyPct = std::clamp(100.0 * static_cast<double>(dTotal - dIdle) / static_cast<double>(dTotal),
+                                              0.0, 100.0);
+            m_values.insert(kCpuUsageId, busyPct);
+            touched = true;
+        }
+        m_prevCpuIdle = idle;
+        m_prevCpuTotal = total;
+        m_hasPrevCpu = true;
+    }
+
+    // RAM via GlobalMemoryStatusEx
+    MEMORYSTATUSEX mem{};
+    mem.dwLength = sizeof(mem);
+    if (::GlobalMemoryStatusEx(&mem) && mem.ullTotalPhys > 0) {
+        const quint64 totalBytes = static_cast<quint64>(mem.ullTotalPhys);
+        const quint64 usedBytes = totalBytes - static_cast<quint64>(mem.ullAvailPhys);
+        const double pct = std::clamp(100.0 * static_cast<double>(usedBytes) / static_cast<double>(totalBytes),
+                                      0.0, 100.0);
+        m_values.insert(kMemTotalId, static_cast<double>(totalBytes));
+        m_values.insert(kMemUsedId, static_cast<double>(usedBytes));
+        m_values.insert(kMemPercentId, pct);
+        touched = true;
+    }
+
+    // Network throughput via GetIfTable2
+    PMIB_IF_TABLE2 ifTable = nullptr;
+    if (::GetIfTable2(&ifTable) == NO_ERROR && ifTable) {
+        quint64 rxBytes = 0;
+        quint64 txBytes = 0;
+        for (ULONG i = 0; i < ifTable->NumEntries; ++i) {
+            const MIB_IF_ROW2 &row = ifTable->Table[i];
+            if (row.OperStatus != IfOperStatusUp || row.Type == IF_TYPE_SOFTWARE_LOOPBACK) {
+                continue;
+            }
+            if (!row.InterfaceAndOperStatusFlags.HardwareInterface) {
+                continue;
+            }
+            rxBytes += static_cast<quint64>(row.InOctets);
+            txBytes += static_cast<quint64>(row.OutOctets);
+        }
+        ::FreeMibTable(ifTable);
+
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        if (m_hasPrevNet && nowMs > m_prevNetSampleMs) {
+            const double dtSec = static_cast<double>(nowMs - m_prevNetSampleMs) / 1000.0;
+            const double downBps = (rxBytes >= m_prevNetRxBytes)
+                                       ? static_cast<double>(rxBytes - m_prevNetRxBytes) / dtSec
+                                       : 0.0;
+            const double upBps = (txBytes >= m_prevNetTxBytes)
+                                     ? static_cast<double>(txBytes - m_prevNetTxBytes) / dtSec
+                                     : 0.0;
+            m_values.insert(kNetDownId, downBps);
+            m_values.insert(kNetUpId, upBps);
+            touched = true;
+        }
+        m_prevNetRxBytes = rxBytes;
+        m_prevNetTxBytes = txBytes;
+        m_prevNetSampleMs = nowMs;
+        m_hasPrevNet = true;
+    }
+#elif defined(Q_OS_MACOS)
+    // CPU utilization via Mach host_statistics delta
+    host_cpu_load_info_data_t cpuInfo{};
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    if (::host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
+                          reinterpret_cast<host_info_t>(&cpuInfo), &count) == KERN_SUCCESS) {
+        const quint64 idle = static_cast<quint64>(cpuInfo.cpu_ticks[CPU_STATE_IDLE]);
+        const quint64 total = static_cast<quint64>(cpuInfo.cpu_ticks[CPU_STATE_USER]) +
+                              static_cast<quint64>(cpuInfo.cpu_ticks[CPU_STATE_SYSTEM]) +
+                              static_cast<quint64>(cpuInfo.cpu_ticks[CPU_STATE_NICE]) +
+                              idle;
+        if (m_hasPrevCpu && total > m_prevCpuTotal) {
+            const quint64 dIdle = idle - m_prevCpuIdle;
+            const quint64 dTotal = total - m_prevCpuTotal;
+            const double busyPct = std::clamp(100.0 * static_cast<double>(dTotal - dIdle) / static_cast<double>(dTotal),
+                                              0.0, 100.0);
+            m_values.insert(kCpuUsageId, busyPct);
+            touched = true;
+        }
+        m_prevCpuIdle = idle;
+        m_prevCpuTotal = total;
+        m_hasPrevCpu = true;
+    }
+
+    // RAM via sysctl hw.memsize + Mach VM statistics
+    uint64_t totalMem = 0;
+    size_t memLen = sizeof(totalMem);
+    vm_statistics64_data_t vmStats{};
+    mach_msg_type_number_t vmCount = HOST_VM_INFO64_COUNT;
+    if (::sysctlbyname("hw.memsize", &totalMem, &memLen, nullptr, 0) == 0 && totalMem > 0 &&
+        ::host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                            reinterpret_cast<host_info64_t>(&vmStats), &vmCount) == KERN_SUCCESS) {
+        const quint64 pageSize = static_cast<quint64>(vm_page_size);
+        const quint64 usedBytes = (static_cast<quint64>(vmStats.active_count) +
+                                   static_cast<quint64>(vmStats.wire_count) +
+                                   static_cast<quint64>(vmStats.compressor_page_count)) * pageSize;
+        const quint64 clampedUsed = std::min<quint64>(usedBytes, static_cast<quint64>(totalMem));
+        const double pct = std::clamp(100.0 * static_cast<double>(clampedUsed) / static_cast<double>(totalMem),
+                                      0.0, 100.0);
+        m_values.insert(kMemTotalId, static_cast<double>(totalMem));
+        m_values.insert(kMemUsedId, static_cast<double>(clampedUsed));
+        m_values.insert(kMemPercentId, pct);
+        touched = true;
+    }
+
+    // Network throughput via getifaddrs AF_LINK counters
+    struct ifaddrs *ifap = nullptr;
+    if (::getifaddrs(&ifap) == 0 && ifap) {
+        quint64 rxBytes = 0;
+        quint64 txBytes = 0;
+        for (struct ifaddrs *ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK || !ifa->ifa_data) {
+                continue;
+            }
+            if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+                continue;
+            }
+            const QString ifName = QString::fromLatin1(ifa->ifa_name);
+            if (isVirtualOrTunnelInterface(ifName)) {
+                continue;
+            }
+            const auto *ifData = static_cast<const struct if_data *>(ifa->ifa_data);
+            rxBytes += static_cast<quint64>(ifData->ifi_ibytes);
+            txBytes += static_cast<quint64>(ifData->ifi_obytes);
+        }
+        ::freeifaddrs(ifap);
+
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        if (m_hasPrevNet && nowMs > m_prevNetSampleMs) {
+            const double dtSec = static_cast<double>(nowMs - m_prevNetSampleMs) / 1000.0;
+            const double downBps = (rxBytes >= m_prevNetRxBytes)
+                                       ? static_cast<double>(rxBytes - m_prevNetRxBytes) / dtSec
+                                       : 0.0;
+            const double upBps = (txBytes >= m_prevNetTxBytes)
+                                     ? static_cast<double>(txBytes - m_prevNetTxBytes) / dtSec
+                                     : 0.0;
+            m_values.insert(kNetDownId, downBps);
+            m_values.insert(kNetUpId, upBps);
+            touched = true;
+        }
+        m_prevNetRxBytes = rxBytes;
+        m_prevNetTxBytes = txBytes;
+        m_prevNetSampleMs = nowMs;
+        m_hasPrevNet = true;
+    }
+#endif
+
+    if (touched) {
+        refreshDisplay();
+    }
+}
+#endif
 
 void StatsBarWidget::pushHistorySample() {
     const double cpuPct = m_values.value(kCpuUsageId).toDouble();
@@ -2294,6 +2487,7 @@ void StatsBarWidget::refreshVpnAndClock() {
     }
     schedulePublicIpRefresh();
 
+#if GHOSTTY_UNION_USE_KSYSGUARD
     if (!m_testingGpusOverride && QDir(QStringLiteral("/proc/driver/nvidia/gpus")).exists()) {
         const QStringList curNvidia = readConnectedNvidiaModelsFromProc();
         if (curNvidia != m_lastProcNvidiaModels) {
@@ -2301,6 +2495,11 @@ void StatsBarWidget::refreshVpnAndClock() {
             discoverGpusFromDbus();
         }
     }
+#else
+    if (m_sensorsEnabled) {
+        pollNativeSensors();
+    }
+#endif
 
     if (!m_values.isEmpty()) {
         pushHistorySample();
